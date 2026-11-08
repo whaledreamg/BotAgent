@@ -1,0 +1,10 @@
+# Agnes API Key (含真实密钥, 不要提交到版本库)
+.env
+
+# 录音输出
+recordings/
+*.wav
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,56 @@
+# 语音链路 (ASR -> Agent -> TTS -> 扬声器) 配置
+
+asr:
+  # 服务自身监听端口 (标准库 http.server 提供 /health 与 /state)
+  health_port: 8801
+
+  # 唤醒词。可自定义, 支持两种写法:
+  #   1) 逗号分隔字符串: "你好助手,小助手"
+  #   2) YAML 列表:      ["你好助手", "小助手"]
+  # 注意: 唤醒词必须能被 vosk 模型词表切分, 否则启动时会提示并忽略该词。
+  wake_words: "小助手"
+
+  # 识别模型目录, 留空则自动在 ~/.cache/vosk 下查找
+  model_path: ""
+  # 麦克风设备索引, 留空则自动挑选原生 16kHz 设备
+  device: ""
+  # 单次录音最长秒数
+  max_duration: 30.0
+  # 静音多少秒后结束录音
+  silence_timeout: 1.2
+  # 语音活动检测阈值 (dBFS)
+  vad_threshold: -45.0
+  # 会话 id, 固定则多轮对话共享上下文
+  session_id: "robot-01"
+
+  # 没识别到内容时的播报文案 (会经 TTS 播报出来)。
+  # 这句话同时用于 /state 的 errors 记录, 保证日志与播报内容一致。
+  # 留空表示不播报, 只在日志里记录。
+  empty_result_prompt: "没听清内容，请再说一遍"
+
+  # 连续对话窗口 (秒)。
+  # 一轮对话结束后, 在这个时间内再次说话不需要说唤醒词, 直接开始录音。
+  # 超时则回到等待唤醒的状态, 需要重新唤醒。
+  # 从「本轮播报结束」开始计时, 机器人自己说话的时间不计入。
+  # 设为 0 关闭连续对话 (每轮都要唤醒)。
+  continuous_timeout: 30.0
+
+agent:
+  base_url: http://127.0.0.1:8800
+  # 分流接口
+  dispatch_path: /v1/dispatch
+  timeout: 90
+  max_retries: 2
+
+tts:
+  ws_url: ws://127.0.0.1:8000/ws
+  voice: "Default"
+  speed: 5
+  # 播放采样率, 与 ChatTTS 服务端一致
+  sample_rate: 24000
+  # 收到 TTS "done" 事件后的最长等待秒数
+  timeout: 120
+
+server:
+  host: 127.0.0.1
+  port: 8801

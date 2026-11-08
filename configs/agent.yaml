@@ -1,0 +1,80 @@
+# Agent 服务配置
+# 密钥在 configs/.env (不入库), 这里只放非敏感配置
+
+llm:
+  base_url: https://api.agnes-ai.cn/v1
+  # agnes-3.0-flash 实测首字延迟在 1.5s~33s 之间剧烈波动 (三次抽样),
+  # agnes-2.5-flash 实测稳定在 TTFT ~450ms / 总耗时 ~700ms。
+  # 语音场景对延迟极敏感, 因此默认用 2.5-flash。
+  model: agnes-2.5-flash
+  timeout: 20
+  max_retries: 2
+  temperature: 0.7
+  # 语音回复要短, 限制生成长度直接降低 TTFT 和 TTS 合成时间
+  max_tokens: 256
+
+# 语义识别 / 意图分流
+router:
+  mode: hybrid                 # rules | llm | hybrid
+  # 兜底分类用最快的模型: 分类只需几十个 token, 延迟直接决定体感
+  llm_fallback_model: agnes-2.5-flash
+  default_route: chat
+  # LLM 兜底分类的超时秒数; 语音场景对延迟敏感, 超时直接回落 default_route
+  llm_timeout: 1.2
+  # 规则命中后是否直接相信 (跳过 LLM 二次确认)。规则是纯关键词匹配,
+  # 命中即返回, 不再花时间做 LLM 校验 —— 这是省掉整段 LLM 延迟的关键。
+  # 需要更保守时置 false。
+  trust_rules: true
+  rules:
+    - intent: tool
+      keywords: ["打开", "关闭", "设置", "播放", "查询", "查一下", "开灯", "关灯", "开空调", "关空调", "启动", "调大", "调小", "几点", "几号", "现在时间"]
+      # 排除词: 命中则这条规则不生效 (区分闲聊与动作)
+      exclude: ["怎么样", "怎么样?", "如何", "为什么", "什么是", "是什么", "多少", "介绍"]
+    - intent: device
+      keywords: ["走", "停下", "拍照", "抬起", "放下", "回到", "前进", "后退", "转身"]
+      exclude: ["为什么", "怎么走"]
+
+# 各分支处理器 (新增分支 = 加一个 handlers/xxx.py + 这里一段)
+handlers:
+  chat:
+    module: handlers.chat_handler
+    class: ChatHandler
+    enabled: true
+    speak: true
+  tool:
+    module: handlers.tool_handler
+    class: ToolHandler
+    enabled: true
+    speak: false
+    # 哪些工具是"输出型" (结果需要经 TTS 播报给用户听)。
+    # 不填则按代码内置判定: kind=query 的算输出型, kind=action 的只执行不朗读。
+    # 显式列出可以覆盖内置判定, 例如把某个动作也改成要播报:
+    #   speak_tools: ["weather", "time", "date"]
+    options:
+      speak_tools: ["weather", "time", "date"]
+  device:
+    module: handlers.device_handler
+    class: DeviceHandler
+    enabled: false
+    speak: false
+
+# 会话历史
+session:
+  max_turns: 6
+  ttl_seconds: 1800
+
+# 语音助手的系统提示词 (chat 分支使用)
+# 长度直接决定 TTS 合成耗时 (CPU 上约 1 字 ≈ 0.19s 音频), 因此要严格限制。
+system_prompt: |
+  你是一个中文语音助手。用户通过语音与你对话,
+  请用简洁、口语化的中文回答, **总长度不超过 40 个字**。
+  通常只说一到两句话, 直接给答案, 不要铺垫和解释。
+  不要使用 markdown 语法、列表或表情符号, 只输出要说出口的话。
+
+# 语义识别用的提示词 (router LLM 兜底时使用)
+router_prompt: |
+  你是一个语音指令分类器。请判断用户这句话的意图, 只输出 JSON:
+  {"intent": "chat" | "tool" | "device"}
+  chat: 闲聊、问答、知识性提问
+  tool: 需要执行动作或查询信息的指令, 例如打开设备、播放音乐、查询信息、查天气、查时间
+  device: 控制机器人本体, 例如移动、拍照、关节动作

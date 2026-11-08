@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -218,3 +219,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+=======
+# 通用产物
+__pycache__/
+*.pyc
+*.wav
+*.mp3
+
+# 密钥
+.env
+configs/.env
+
+# 运行期日志与状态
+logs/
+*.log
+services/asr_service/recordings/
+services/tts_service/output/
+>>>>>>> 992cab2 (feat: first commit)
