@@ -1,0 +1,6 @@
+[submodule "services/asr_service/vosk-api"]
+	path = services/asr_service/vosk-api
+	url = git@github.com:whaledreamg/vosk-api.git
+[submodule "services/tts_service"]
+	path = services/tts_service
+	url = git@github.com:whaledreamg/ChatTTS.git
