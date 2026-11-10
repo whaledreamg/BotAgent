@@ -4,6 +4,7 @@
 - chat():  普通对话, 返回文本
 - stream(): 流式对话, 逐块 yield 增量
 - json_completion(): 要求模型输出 JSON (用于语义识别的意图分类)
+- tool_call(): 带 tools 的原生 function calling, 返回结构化的工具调用
 
 实现只用 httpx, 不依赖 openai SDK, 便于在轻量环境里运行。
 """
@@ -15,6 +16,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -26,6 +28,39 @@ logger = logging.getLogger("agent.llm")
 
 class LLMError(RuntimeError):
     """LLM 调用失败。"""
+
+
+@dataclass
+class ToolCall:
+    """一次工具调用。"""
+
+    #: 模型给的调用 id (回灌结果时要用)
+    id: str = ""
+    #: function 名
+    name: str = ""
+    #: 已解析的参数 (模型给的是 JSON 字符串)
+    arguments: Dict[str, Any] = field(default_factory=dict)
+    #: 原始的 arguments 字符串 (解析失败时保留, 便于排查)
+    raw_arguments: str = ""
+
+
+@dataclass
+class ToolCallResult:
+    """带 tools 的一次调用结果。"""
+
+    #: 模型生成的文本 (没有调工具时就是回复正文)
+    content: str = ""
+    #: 模型请求调用的工具
+    calls: List[ToolCall] = field(default_factory=list)
+    #: finish_reason
+    finish_reason: str = ""
+    #: 用量统计
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def has_calls(self) -> bool:
+        return bool(self.calls)
 
 
 #: httpx 不认识的代理协议 (如 socks://)。出现这类环境变量时 httpx 会直接抛
@@ -181,6 +216,8 @@ class LLMClient:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ) -> str:
         payload = {
             "model": model or self.cfg.model,
@@ -188,6 +225,10 @@ class LLMClient:
             "max_tokens": max_tokens or self.cfg.max_tokens,
             "temperature": self.cfg.temperature if temperature is None else temperature,
         }
+        if tools:
+            payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
         t0 = time.time()
         data = await self._post("/chat/completions", payload)
         elapsed_ms = int((time.time() - t0) * 1000)
@@ -204,6 +245,91 @@ class LLMClient:
             usage.get("completion_tokens", "?"),
         )
         return content
+
+    async def tool_call(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: Optional[Any] = "auto",
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> ToolCallResult:
+        """带 tools 的原生 function calling。
+
+        模型要么返回 `tool_calls` (要执行动作), 要么返回普通文本
+        (就是闲聊回复)。两种结果都在这里解析好, 调用方只看
+        `has_calls` 决定走哪条路。
+        """
+        if not tools:
+            raise LLMError("tool_call 需要至少一个 tool 定义")
+
+        payload: Dict[str, Any] = {
+            "model": model or self.cfg.model,
+            "messages": messages,
+            "max_tokens": max_tokens or self.cfg.max_tokens,
+            "temperature": self.cfg.temperature if temperature is None else temperature,
+            "tools": tools,
+        }
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+
+        t0 = time.time()
+        data = await self._post("/chat/completions", payload)
+        elapsed_ms = int((time.time() - t0) * 1000)
+
+        try:
+            choice = data["choices"][0]
+            message = choice.get("message") or {}
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"响应格式异常: {exc}") from exc
+
+        content = str(message.get("content") or "")
+        finish_reason = str(choice.get("finish_reason") or "")
+
+        calls: List[ToolCall] = []
+        for raw in message.get("tool_calls") or []:
+            fn = raw.get("function") or {}
+            raw_args = fn.get("arguments") or ""
+            args: Dict[str, Any] = {}
+            if isinstance(raw_args, dict):
+                args = dict(raw_args)
+            elif raw_args:
+                try:
+                    parsed = json.loads(raw_args)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except json.JSONDecodeError:
+                    # 参数不是合法 JSON —— 交给上层校验时拦住, 这里只记日志
+                    logger.warning("[LLM] 工具参数不是合法 JSON: %r", raw_args[:200])
+            calls.append(
+                ToolCall(
+                    id=str(raw.get("id") or ""),
+                    name=str(fn.get("name") or ""),
+                    arguments=args,
+                    raw_arguments=str(raw_args),
+                )
+            )
+
+        usage = data.get("usage") or {}
+        result = ToolCallResult(
+            content=content,
+            calls=calls,
+            finish_reason=finish_reason,
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+        )
+        logger.info(
+            "[LLM] %dms model=%s tools=%d calls=%d finish=%s tokens=%s/%s",
+            elapsed_ms,
+            payload["model"],
+            len(tools),
+            len(calls),
+            finish_reason,
+            result.prompt_tokens,
+            result.completion_tokens,
+        )
+        return result
 
     async def stream(
         self,
@@ -298,6 +424,93 @@ class LLMClient:
             parts.append(piece)
         return _extract_json("".join(parts))
 
+    async def complete_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        executor: Any,
+        tool_choice: Optional[Any] = "auto",
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        max_rounds: int = 2,
+    ) -> ToolCallResult:
+        """带 tools 的多轮调用。
+
+        `executor` 是 async 可调用对象, 签名 `executor(call: ToolCall) -> str`,
+        返回值作为 `tool` role 消息回灌给模型。
+
+        **多轮的成本**: 每多一轮就多一次完整往返 (实测 ~850ms)。语音场景
+        对延迟极敏感, 所以默认 `max_rounds=1` (只调一轮, 不回灌) ——
+        工具执行完用本地固定文案回复即可, 又快又稳定。
+
+        `max_rounds` 是硬上限, 防模型反复调同一个工具形成死循环。
+        """
+        result = await self.tool_call(
+            messages,
+            tools,
+            tool_choice=tool_choice,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        if not result.has_calls or max_rounds <= 1:
+            return result
+
+        # 多轮: 执行工具 -> 回灌结果 -> 再问一次
+        convo: List[Dict[str, Any]] = list(messages)
+        convo.append(
+            {
+                "role": "assistant",
+                "content": result.content or "",
+                **({"tool_calls": _calls_to_raw(result.calls)} if result.calls else {}),
+            }
+        )
+
+        for _ in range(max_rounds - 1):
+            for call in result.calls:
+                try:
+                    output = await executor(call)
+                except Exception as exc:
+                    output = f"执行失败: {exc}"
+                convo.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": str(output),
+                    }
+                )
+
+            result = await self.tool_call(
+                convo,
+                tools,
+                tool_choice=tool_choice,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            # 模型不再要工具了 -> 它的 content 就是最终回复
+            if not result.has_calls:
+                break
+
+        return result
+
+
+def _calls_to_raw(calls: List[ToolCall]) -> List[Dict[str, Any]]:
+    """把 ToolCall 转回 OpenAI 的 tool_calls 报文 (回灌给模型用)。"""
+    return [
+        {
+            "id": c.id,
+            "type": "function",
+            "function": {
+                "name": c.name,
+                "arguments": c.raw_arguments or json.dumps(c.arguments, ensure_ascii=False),
+            },
+        }
+        for c in calls
+    ]
+
 
 async def _sleep(seconds: float) -> None:
     import asyncio
@@ -305,4 +518,4 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
-__all__ = ["LLMClient", "LLMError"]
+__all__ = ["LLMClient", "LLMError", "ToolCall", "ToolCallResult"]

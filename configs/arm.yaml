@@ -55,7 +55,9 @@ arm:
   notifier:
     enabled: true
     ws_url: "ws://127.0.0.1:8000/ws"
-    voice: "Default"
+    # 音色名。留空 = 用 TTS 服务端的默认音色 (configs/tts.yaml 的 defaults.voice)。
+    # 服务端支持的音色: curl -s http://127.0.0.1:8000/health | grep voices
+    voice: ""
     speed: 5
     sample_rate: 24000
     timeout: 30.0

@@ -18,7 +18,7 @@ import logging
 import struct
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 from config import TTSConfig
 
@@ -135,16 +135,22 @@ class TTSClient:
         result = TTSResult()
         started = time.time()
 
-        request = {
+        # 只发**显式配置过**的字段 —— 没配的字段让 TTS 服务端用自己的默认值
+        # (configs/tts.yaml)。这样「换默认音色/语速」只改服务端配置一处。
+        request: Dict[str, object] = {
             "type": "tts",
             "request_id": request_id,
             "text": text,
-            "voice": self.cfg.voice,
-            "speed": self.cfg.speed,
             "format": "pcm",
             "stream": True,
             "play": False,
         }
+        if self.cfg.voice:
+            request["voice"] = self.cfg.voice
+        if self.cfg.speed is not None:
+            request["speed"] = self.cfg.speed
+        if self.cfg.rate:
+            request["rate"] = self.cfg.rate
 
         t_open = time.time()
         speaker = self._open_speaker()

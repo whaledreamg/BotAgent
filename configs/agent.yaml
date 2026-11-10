@@ -25,6 +25,32 @@ router:
   # 命中即返回, 不再花时间做 LLM 校验 —— 这是省掉整段 LLM 延迟的关键。
   # 需要更保守时置 false。
   trust_rules: true
+  # 原生 function calling 升级路径。
+  # 规则**没命中**时才走这里: 一次 LLM 调用同时问出「要调哪个工具、参数是什么」,
+  # 取代原来「LLM 分类意图 -> 分支内再调一次 LLM 选动作」的两段式。
+  # 规则命中时完全不进这条路, 快速通道仍是零延迟。
+  tool_calling:
+    enabled: true
+    # 沿用 2.5-flash: 实测 TTFT ~690ms, 比 3.0-flash 稳定
+    model: agnes-2.5-flash
+    # 超时直接回落默认分支 (语音场景对延迟敏感)
+    timeout: 5.0
+    temperature: 0.0
+    max_tokens: 256
+    # auto | none | required
+    # **不要用 required** —— 纯闲聊(如「今天天气怎么样」)也会被强行调工具
+    tool_choice: auto
+    # 工具结果回灌的最大轮数 (硬上限, 防死循环)
+    max_rounds: 1
+    # 执行工具后是否让模型再生成一句口语化总结。
+    # false = 用本地固定文案: 零额外延迟, TTS 合成也更快。
+    feedback_round: false
+    # tool calling 专用的系统提示词。
+    # **不能用 system_prompt** —— 那是聊天用的, 模型会用文字「描述」动作已完成
+    # (假确认), 而不是真的去调工具。
+    # system_prompt: |
+    #   你是一个语音助手, 可以通过工具控制机器人和家电设备。
+    #   ...
   rules:
     - intent: tool
       keywords: ["打开", "关闭", "设置", "播放", "查询", "查一下", "开灯", "关灯", "开空调", "关空调", "启动", "调大", "调小", "几点", "几号", "现在时间"]

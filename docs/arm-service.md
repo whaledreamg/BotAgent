@@ -280,7 +280,13 @@ arm:
 匹配顺序 (先命中先用):
 1. 精确等于动作名 (用户直接说了「挥手」)
 2. 命中 `say` 里的说法 (「挥个手」-> 挥手)
-3. 都没命中 -> LLM 从动作清单里挑一个 (带超时, 挑不中就说不支持)
+3. 都没命中 -> 交给 **tool calling** 让模型从动作清单里挑
+
+> 第 3 步现在走的是 Agnes 的原生 function calling, 与设备工具共用同一套
+> tool schema。详见 [docs/action-integration.md](action-integration.md)。
+>
+> 无论走哪条路径, **安全门阀都会照常执行** —— 换成 tool calling 不会
+> 绕过安全检查。
 
 **`configs/agent.yaml`** —— 启用 device 分支:
 

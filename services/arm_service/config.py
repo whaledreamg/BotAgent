@@ -81,7 +81,8 @@ DEFAULTS: Dict[str, Any] = {
         "notifier": {
             "enabled": True,
             "ws_url": "ws://127.0.0.1:8000/ws",
-            "voice": "Default",
+            # 音色名。留空 = 用 TTS 服务端的默认音色 (configs/tts.yaml)
+            "voice": "",
             "speed": 5,
             "sample_rate": 24000,
             "timeout": 30.0,
@@ -260,7 +261,7 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         ws_url=os.environ.get(
             "ARM_TTS_WS_URL", nf.get("ws_url", "ws://127.0.0.1:8000/ws")
         ),
-        voice=str(nf.get("voice", "Default")),
+        voice=str(nf.get("voice", "") or ""),
         speed=int(nf.get("speed", 5)),
         sample_rate=int(nf.get("sample_rate", 24000)),
         timeout=float(nf.get("timeout", 30.0)),

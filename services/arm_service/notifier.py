@@ -17,7 +17,7 @@ import json
 import logging
 import struct
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger("arm.tts")
 
@@ -120,17 +120,21 @@ class ArmNotifier:
             return False
 
         request_id = f"arm{int(time.time() * 1000)}"
-        request = {
+        # 只发**显式配置过**的字段 —— 没配的让 TTS 服务端用自己的默认值
+        # (configs/tts.yaml)。这样「换默认音色」只改服务端配置一处。
+        request: Dict[str, object] = {
             "type": "tts",
             "request_id": request_id,
             "text": text,
-            "voice": self.voice,
-            "speed": self.speed,
             "format": "pcm",
             "stream": True,
             # 服务端播报: TTS 服务自己开扬声器放音, arm_service 这边只收帧不播
             "play": bool(self.server_play),
         }
+        if self.voice:
+            request["voice"] = self.voice
+        if self.speed is not None:
+            request["speed"] = self.speed
 
         # 服务端播报时本地不用开扬声器 (避免两个进程抢声卡)
         speaker = None if self.server_play else self._open_speaker()

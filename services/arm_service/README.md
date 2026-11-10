@@ -16,7 +16,10 @@ curl -s http://127.0.0.1:8802/v1/actions | python -m json.tool
 
 # 播一个动作
 curl -s -X POST http://127.0.0.1:8802/v1/play \
-  -H 'Content-Type: application/json' -d '{"action":"左挥手"}'
+  -H 'Content-Type: application/json' -d '{"action":"挥手"}'
+
+# 跑一次安全门阀 (不执行动作)
+curl -s http://127.0.0.1:8802/v1/safety | python -m json.tool
 
 # 停止
 curl -s -X POST http://127.0.0.1:8802/v1/stop
@@ -27,14 +30,18 @@ curl -s -X POST http://127.0.0.1:8802/v1/stop
 **文件名就是动作名** (去掉 `.json`):
 
 ```
-data/左挥手.json  ->  动作 "左挥手"
-data/插兜.json    ->  动作 "插兜"
+data/挥手.json   ->  动作 "挥手"
+data/零点.json   ->  动作 "零点"
+data/准备点.json ->  动作 "准备点"
 ```
+
+当前动作库: `挥手` / `准备点` / `打包点` / `零点` / `伸左手` / `伸右手`。
 
 文件里的 `segments` 是这个动作的轨迹片段, 首尾相连构成连续运动。每段只记
 录**结束关节角**, 第一段的起点取播放那一刻的实测姿态。
 
 新增动作: 往 `data/` 放一个 `<动作名>.json` 即可, 重启服务自动加载。
+再在 `configs/actions.yaml` 加一条说法映射, 语音就能控制它。
 
 旧版的大文件 (`action.json` / `sport.json` / `test.json`) 是整场编排, 不是动作,
 已通过 `arm.exclude_files` 排除。用 `tools/split_actions.py` 可以把它们拆成
@@ -49,6 +56,8 @@ services/arm_service/
 ├── models.py            # 请求/响应模型
 ├── service.py           # 播放编排 (入控 -> 对齐 -> 播放 -> 停控)
 ├── library.py           # 动作库加载与索引 (一个 JSON 文件 = 一个动作)
+├── safety.py            # 安全门阀 (状态检查 + 拒绝原因 + 播报文案)
+├── notifier.py          # 门阀拒绝时的 TTS 播报 (WS, 不落盘)
 ├── timeline/
 │   ├── model.py         # Segment / TimelineModel
 │   ├── interpolation.py # linear / cubic / spline (Hermite) 插值
@@ -60,7 +69,8 @@ services/arm_service/
 ├── data/                # 动作序列 JSON (来自 ActionPlanner/data)
 └── tools/
     ├── check_arm.py         # 协议级自检 (mock, 不需要真机)
-    └── check_arm_service.py # 端到端自检 (mock 控制器 + 真实服务)
+    ├── check_arm_service.py # 端到端自检 (mock 控制器 + 真实服务)
+    └── check_safety.py      # 安全门阀自检 (不需要真机)
 ```
 
 ## 配置

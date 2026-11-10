@@ -1,6 +1,6 @@
 # 模块化机器人语音系统
 
-三个独立进程、三个独立 conda 环境，通过 HTTP / WebSocket 组成一条语音问答闭环。
+四个独立进程、三个独立 conda 环境，通过 HTTP / WebSocket 组成一条语音控制闭环。
 
 ```mermaid
 flowchart LR
@@ -10,15 +10,19 @@ flowchart LR
     Sem -->|"route=chat"| Chat[ChatHandler]
     Sem -->|"route=tool"| Tool[ToolHandler]
     Sem -->|"route=device"| Dev[DeviceHandler]
-    Chat --> LLM[OpenAI 兼容 LLM]
+    Chat --> LLM[Agnes LLM<br/>原生 function calling]
     Tool --> Exec[动作执行]
     Dev --> Exec
     Chat -->|"speak=true"| ASRSvc
-    Tool -->|"speak=false"| ASRSvc
-    Dev -->|"speak=false"| ASRSvc
+    Tool -->|"按工具类型"| ASRSvc
+    Dev -->|"speak=true"| ASRSvc
     ASRSvc -->|"仅 speak=true 才连"| TTSSvc["TTS Service :8000<br/>env chattts"]
     TTSSvc -->|"PCM16 24kHz 流"| ASRSvc
     ASRSvc --> Spk[扬声器 直放, 不落盘]
+    Dev --> Gate["安全门阀<br/>状态检查"]
+    Gate -->|"放行"| ArmSvc["Arm Service :8802<br/>env botagent"]
+    ArmSvc --> Arm[机械臂]
+    Gate -->|"拒绝 + 播报原因"| ASRSvc
 ```
 
 ## 核心语义
@@ -30,7 +34,7 @@ flowchart LR
    - `tool` 分支 → 分两种：
      - **执行型**（开灯、播放音乐）→ `speak=false` → 直接执行动作，不进 TTS
      - **输出型**（查天气、查时间）→ `speak=true` → 结果经 TTS 播报
-   - `device` 分支 → `speak=false` → 直接执行动作，**不进 TTS**
+   - `device` 分支 → **安全门阀** → 放行则驱动机械臂 → `speak=true` 播报结果
 4. **不保存本地**：识别音频只在内存；TTS 的 PCM 边收边播，不写文件。
 
 ## 目录结构
@@ -50,21 +54,39 @@ Bot Agent/
 │   └── agent_service/        # 新增
 │       ├── app.py            # FastAPI 路由
 │       ├── config.py         # 读 configs/agent.yaml + configs/.env
-│       ├── llm.py            # OpenAI 兼容客户端
+│       ├── llm.py            # Agnes 客户端 (含原生 tool calling)
 │       ├── session.py        # 会话历史
-│       ├── router.py         # 意图分流
+│       ├── router.py         # 意图分流 (规则 + tool calling)
 │       ├── registry.py       # 分支注册表
+│       ├── action_tools.py   # 统一动作层 (tool 定义 + 参数校验 + 执行)
 │       └── handlers/         # chat / tool / device
+│   └── arm_service/          # 新增: 机械臂动作服务
+│       ├── main.py           # FastAPI 入口 (HTTP + WebSocket)
+│       ├── service.py        # 播放编排 (入控 -> 对齐 -> 播放 -> 停控)
+│       ├── library.py        # 动作库加载 (一个 JSON 文件 = 一个动作)
+│       ├── safety.py         # 安全门阀 (状态检查 + 拒绝原因)
+│       ├── notifier.py       # 门阀拒绝时的 TTS 播报
+│       ├── timeline/         # 时间轴模型 / 插值 / 播放引擎
+│       ├── robot/            # 控制面连接 / UDP 关节流 / 控制状态机
+│       └── data/             # 动作序列 JSON
 ├── configs/
 │   ├── agent.yaml
+│   ├── tools.yaml             # tool 定义 (模型看到的工具清单)
+│   ├── actions.yaml          # 机械臂「说法 -> 动作名」映射
+│   ├── arm.yaml              # 机械臂服务配置
+│   ├── tts.yaml              # TTS 音色 + 模型配置
 │   ├── pipeline.yaml
 │   └── .env                  # 密钥, 不入库
 ├── scripts/
 │   ├── start_all.sh / stop_all.sh
-│   ├── start_tts.sh / start_agent.sh / start_asr.sh
+│   ├── start_tts.sh / start_agent.sh / start_asr.sh / start_arm.sh
 │   ├── smoke_test.sh          # 三段式联通自检
 │   └── full_chain_test.sh     # 端到端: 回放 -> 分流 -> TTS -> 播放 -> 断言
-└── docs/architecture.md
+└── docs/
+    ├── architecture.md
+    ├── action-integration.md  # 动作接入 (function calling)
+    ├── arm-service.md         # 机械臂服务
+    └── testing.md
 ```
 
 ## Conda 环境
@@ -74,6 +96,7 @@ Bot Agent/
 | ASR | `asrt` | 3.10 | vosk 0.3.45、sounddevice、requests、websockets、pyyaml |
 | TTS | `chattts` | 3.11 | torch 2.6、fastapi、uvicorn、websockets |
 | Agent | `botagent` | 3.11 | fastapi、uvicorn、httpx、pyyaml、pydantic |
+| Arm | `botagent` | 3.11 | fastapi、uvicorn、websockets、pyyaml |
 
 vosk 中文模型在 `~/.cache/vosk/`（`vosk-model-cn-0.22`、`vosk-model-small-cn-0.22`），无需下载。
 
@@ -130,6 +153,12 @@ router:
   default_route: chat
   llm_timeout: 1.2        # 路由分类超时, 超过就回落 default_route
   trust_rules: true       # 规则命中就信, 跳过 LLM 二次确认 (省 1~3 秒)
+  # 原生 function calling: 规则没命中时才走, 一次问出「调哪个工具、参数」
+  tool_calling:
+    enabled: true
+    model: agnes-2.5-flash
+    timeout: 5.0
+    tool_choice: auto     # 不要用 required
   rules:
     - intent: tool
       keywords: ["打开", "关闭", "设置"]
@@ -139,16 +168,33 @@ router:
 > `configs/.env` 里的 `LLM_MODEL` **会覆盖** YAML 的 `llm.model`。
 > 改完 YAML 记得同步改 `.env`，否则「配置改了没效果」。
 
+### `configs/actions.yaml`（机械臂说法映射）
+
+动作名 = `arm_service/data/` 里的 JSON 文件名。匹配时命中**最长的说法**，
+所以「伸左手」永远赢过「伸手」，排列顺序不影响结果。
+
+```yaml
+arm:
+  base_url: "http://127.0.0.1:8802"
+  exclude: ["怎么样", "如何", "为什么", "怎么"]
+  actions:
+    - action: "挥手"
+      say: ["挥手", "挥个手", "挥挥手", "打个招呼"]
+    - action: "伸左手"
+      say: ["伸左手", "左手伸出来", "伸出左手"]
+```
+
 ## 启动
 
 ```bash
-# 三个服务一起起（会等健康检查通过）
+# 四个服务一起起（会等健康检查通过）
 ./scripts/start_all.sh
 
 # 或分别启动
 ./scripts/start_tts.sh      # env chattts, :8000
 ./scripts/start_agent.sh    # env botagent, :8800
 ./scripts/start_asr.sh      # env asrt, :8801
+./scripts/start_arm.sh      # env botagent, :8802
 
 # 停止
 ./scripts/stop_all.sh
@@ -157,7 +203,7 @@ router:
 ### 端到端自检
 
 ```bash
-./scripts/full_chain_test.sh            # 自动拉起三个服务, 回放真实录音, 断言分流与播放
+./scripts/full_chain_test.sh            # 自动拉起三个服务 (TTS/Agent/ASR), 回放真实录音, 断言分流与播放
 ./scripts/smoke_test.sh                 # 只做三段式联通检查
 ```
 
@@ -225,28 +271,86 @@ ASR 服务也支持透传参数：
 
 复用 ChatTTS 自带的 `examples/ws_server`，协议未改。`TTS_PLAY=0`，播放统一由 ASR 侧负责，避免回声与串扰。
 
-- `GET /health` — `{"model_loaded":true,"sample_rate":24000,"voices":[...]}`
+**音色与模型从 `configs/tts.yaml` 读** —— 换音色 / 换模型不用改代码。
+
+- `GET /health` — `{"model_loaded":true,"sample_rate":24000,"voices":[...], "default_voice":"Default", "model":{...}}`
+
+| 配置项 | 说明 |
+|---|---|
+| `model.source` | `local` / `huggingface` / `custom` |
+| `model.device` | `""` = 自动（有 CUDA 用 CUDA） |
+| `voices[].seed` | 随机种子定义音色（同机同硬件一致） |
+| `voices[].ref_audio` | 参考音频克隆音色（**跨机器一致**） |
+| `defaults.voice` | 默认音色 |
+
+客户端没显式传的字段走服务端默认值；传了不存在的音色回落到默认音色。
+
+### Arm Service `:8802`
+
+机械臂动作服务。**一个 JSON 文件 = 一个动作，文件名就是动作名**。
+
+- `GET /health` — `{"status":"ok","controller_connected":false,"actions":6,...}`
+- `GET /v1/actions` — 动作库清单
+- `POST /v1/play` — 下发播放（异步，立即返回）
+- `POST /v1/stop` — 停止播放并交还控制通道
+- `GET /v1/status` — 当前播放状态
+- `GET /v1/safety` — 跑一次安全门阀检查（不执行动作）
+
+详见 [`arm-service.md`](arm-service.md)。
 
 ## 分流机制
 
-三级策略，由 `configs/agent.yaml` 的 `router.mode` 控制：
+**两级**结构，由 `configs/agent.yaml` 控制：
 
-- `rules` — 只用关键词/正则，零延迟、可离线
-- `llm` — 只用一次轻量 LLM 调用做分类
-- `hybrid` — 规则优先，未命中再走 LLM 兜底（默认）
+### 第 1 级：规则快速通道（零延迟）
+
+`router.mode` 为 `rules` 或 `hybrid` 时启用。关键词/正则匹配，命中即返回，
+**不调 LLM**。`trust_rules: true`（默认）表示不再让 LLM 二次确认。
 
 规则示例：
 
 ```yaml
 router:
   mode: hybrid
+  trust_rules: true       # 规则命中就信, 跳过 LLM 二次确认
   default_route: chat
   rules:
     - intent: tool
       keywords: ["打开", "关闭", "设置", "播放", "查询"]
+      exclude: ["怎么样", "如何", "为什么"]
     - intent: device
-      keywords: ["走", "停下", "拍照", "抬起", "回到"]
+      keywords: []          # 机械臂说法由 configs/actions.yaml 生成
+      exclude: ["怎么样", "怎么", "为什么"]
 ```
+
+### 第 2 级：tool calling 升级路径
+
+规则没命中（或命中了但分支认不出具体动作）时，用 **Agnes 原生 function
+calling** 一次问出「调哪个工具、参数是什么」。
+
+```yaml
+router:
+  tool_calling:
+    enabled: true
+    model: agnes-2.5-flash
+    timeout: 5.0
+    tool_choice: auto      # 不要用 required, 否则闲聊也会调工具
+```
+
+机械臂动作与设备工具共用同一套 tool schema，定义在
+`configs/tools.yaml`（机械臂那个是自动生成的）。详见
+[`action-integration.md`](action-integration.md)。
+
+### 分流结果
+
+| 分支 | speak | 行为 |
+| --- | --- | --- |
+| `chat` | true | LLM 回复 → TTS 播报 |
+| `tool`（执行型） | false | 直接执行，不进 TTS |
+| `tool`（输出型） | true | 结果经 TTS 播报 |
+| `device` | true | 安全门阀 → 驱动机械臂 → 播报结果 |
+
+> `router.mode` 为 `llm` 时完全跳过规则层，所有请求都走 LLM 分类（默认不用）。
 
 ## 新增一个分支
 

@@ -1,0 +1,153 @@
+# Tool 定义 (Agnes 原生 function calling)
+#
+# 这里是**模型看到的工具清单**。加一个工具 = 在这个文件里加一条,
+# 不需要改 Python 代码 (执行逻辑除外, 见文件末尾说明)。
+#
+# 顶层结构:
+#   tools:  工具列表
+#
+# 每个 tool 的字段:
+#   name        function 名 (模型调用时用的名字)。全局唯一。
+#   kind        工具类别, 决定执行方式与播报行为:
+#                 arm    -> 走机械臂分支 (必经安全门阀), 结果要播报
+#                 device -> 设备控制, 结果不播报
+#                 query  -> 信息查询, 结果要播报
+#   label       中文名, 用于日志与回报文案
+#   description 给模型看的说明。**要精确聚焦** —— 描述含糊模型就会乱调。
+#   speak       结果是否朗读 (true/false)。默认按 kind 推断, 显式写可覆盖。
+#   intent      命中后走哪个分支 (chat / tool / device)。默认按 kind 推断。
+#   value_arg   用哪个参数的值来决定内部动作名。
+#               例: control_light 的 "state" -> on/off 决定开还是关。
+#               留空 = 这个 tool 只对应一个固定动作。
+#   action_map  参数值 -> 内部动作名 (TOOLS 表里的 key)。
+#               例: {on: light_on, off: light_off}
+#   parameters  JSON Schema (parameters 段), 原样透传给模型。
+#
+# ---------------------------------------------------------------------
+# 机械臂工具是**自动生成**的, 不用在这里写 ——
+# 动作名从 configs/actions.yaml 读, 枚举出来做 enum。
+# 见文件末尾「机械臂工具」一节。
+# ---------------------------------------------------------------------
+
+tools:
+  # ---- 电灯 ----
+  - name: control_light
+    kind: device
+    label: 电灯
+    description: 打开或关闭电灯。
+    value_arg: state
+    # 注意: on/off 必须加引号! YAML 1.1 会把裸 on/off 解析成布尔值
+    action_map:
+      "on": light_on
+      "off": light_off
+    parameters:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: ["on", "off"]
+          description: on=打开, off=关闭
+      required: ["state"]
+
+  # ---- 空调 ----
+  - name: control_aircon
+    kind: device
+    label: 空调
+    description: 打开或关闭空调。
+    value_arg: state
+    action_map:
+      "on": aircon_on
+      "off": aircon_off
+    parameters:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: ["on", "off"]
+          description: on=打开, off=关闭
+      required: ["state"]
+
+  # ---- 播放音乐 ----
+  - name: play_music
+    kind: device
+    label: 播放音乐
+    description: 播放音乐。
+    action_map:
+      "": music_play
+    parameters:
+      type: object
+      properties: {}
+
+  # ---- 查天气 ----
+  - name: query_weather
+    kind: query
+    label: 查天气
+    description: 查询指定城市的当前天气。用户没说城市时用默认城市。
+    action_map:
+      "": weather
+    parameters:
+      type: object
+      properties:
+        city:
+          type: string
+          description: 城市名, 如 北京、上海。没提到就用「默认城市」
+
+  # ---- 查时间 ----
+  - name: query_time
+    kind: query
+    label: 查时间
+    description: 查询当前时间。
+    action_map:
+      "": time
+    parameters:
+      type: object
+      properties: {}
+
+  # ---- 查日期 ----
+  - name: query_date
+    kind: query
+    label: 查日期
+    description: 查询今天的日期和星期。
+    action_map:
+      "": date
+    parameters:
+      type: object
+      properties: {}
+
+# ---------------------------------------------------------------------
+# 机械臂工具 (自动生成, 不用手写)
+# ---------------------------------------------------------------------
+#
+# 机械臂动作**不需要**在这里逐个声明 —— 动作名从 configs/actions.yaml
+# 读出来, 枚举成 enum, 合并成一个 `play_arm_action` tool。
+#
+# 为什么不一动作一 function:
+#   6 个动作就 6 个 function 会让 schema 冗余, 而且模型要在 6 个近似名字里
+#   挑 —— enum 单函数更准。Agnes 文档也要求「工具描述与 JSON Schema 应保持
+#   精确、聚焦」。
+#
+# 生成的 tool 长这样:
+#   name: play_arm_action
+#   kind: arm
+#   description: 让机械臂执行一个预置动作。可用动作: 挥手 (挥手、挥个手...);
+#                伸左手 (...); ...
+#   parameters: {action: {enum: [挥手, 伸左手, ...]}, speed: {number}}
+#
+# 如果需要自定义 (比如加一个非机械臂的「摄像头拍照」工具), 直接在上面
+# 的 tools: 列表里加一条, kind: device。
+#
+# ---------------------------------------------------------------------
+# 加工具后还需要做什么
+# ---------------------------------------------------------------------
+#
+# 1. **执行逻辑** —— yaml 只描述「模型怎么调」, 不管「怎么执行」。
+#    内部动作名 (如 light_on) 要在 services/agent_service/handlers/
+#    tool_handler.py 的 TOOLS 表里有对应项, 并在 execute() 里实现。
+#    没有实现的话会返回 "failed / 未知动作"。
+#
+# 2. **规则关键词** (可选) —— 想让某个说法走零延迟快速通道, 在
+#    configs/agent.yaml 的 router.rules 里加关键词。
+#    不加也能用, 只是会走 LLM (约 700ms)。
+#
+# 3. **校验** —— 跑 `python services/agent_service/tools/check_tool_calling.py`
+#    确认 schema 生成正确、参数校验生效。

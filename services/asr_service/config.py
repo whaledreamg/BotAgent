@@ -111,8 +111,12 @@ class AgentEndpoint:
 @dataclass
 class TTSConfig:
     ws_url: str = "ws://127.0.0.1:8000/ws"
-    voice: str = "Default"
+    #: 音色名。留空 = 用 TTS 服务端的默认音色 (configs/tts.yaml 的 defaults.voice)。
+    #: 填了才覆盖 —— 这样「换默认音色」只需要改服务端配置一处。
+    voice: str = ""
     speed: int = 5
+    #: 保音高变速倍率。0 = 用服务端默认值。
+    rate: float = 0.0
     sample_rate: int = 24000
     timeout: float = 120.0
 
@@ -170,8 +174,10 @@ def load_config(path: Path = PIPELINE_CONFIG_PATH) -> Config:
     t = merged.get("tts", {})
     tts = TTSConfig(
         ws_url=os.environ.get("TTS_WS_URL", t.get("ws_url", "ws://127.0.0.1:8000/ws")),
-        voice=t.get("voice", "Default"),
+        # 留空 = 用 TTS 服务端的默认音色 (configs/tts.yaml)
+        voice=os.environ.get("TTS_VOICE", str(t.get("voice", "") or "")),
         speed=int(t.get("speed", 5)),
+        rate=float(t.get("rate", 0.0)),
         sample_rate=int(t.get("sample_rate", 24000)),
         timeout=float(t.get("timeout", 120)),
     )

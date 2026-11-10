@@ -44,8 +44,13 @@ agent:
 
 tts:
   ws_url: ws://127.0.0.1:8000/ws
-  voice: "Default"
+  # 音色名。留空 = 用 TTS 服务端的默认音色 (configs/tts.yaml 的 defaults.voice)。
+  # 服务端支持的音色可以用这个查: curl -s http://127.0.0.1:8000/health
+  voice: ""
+  # 语速 token (0~9)。受 ChatTTS 的 [speed_N] 限制, 实际变化不大。
   speed: 5
+  # 保音高变速倍率。0 = 用服务端默认值。>1 更快, <1 更慢。范围 0.5~2.0。
+  rate: 0.0
   # 播放采样率, 与 ChatTTS 服务端一致
   sample_rate: 24000
   # 收到 TTS "done" 事件后的最长等待秒数

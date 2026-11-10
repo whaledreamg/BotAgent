@@ -13,7 +13,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("agent.config")
 
@@ -29,6 +29,8 @@ CONFIG_DIR = ROOT / "configs"
 AGENT_CONFIG_PATH = CONFIG_DIR / "agent.yaml"
 #: 机械臂语音指令映射表
 ACTIONS_CONFIG_PATH = CONFIG_DIR / "actions.yaml"
+#: tool 定义 (模型看到的工具清单)
+TOOLS_CONFIG_PATH = CONFIG_DIR / "tools.yaml"
 ENV_PATH = CONFIG_DIR / ".env"
 
 DEFAULTS: Dict[str, Any] = {
@@ -56,6 +58,23 @@ DEFAULTS: Dict[str, Any] = {
         '{"intent": "chat" | "tool" | "device"}'
     ),
 }
+
+#: tool calling 专用的默认系统提示词。
+#:
+#: **不能用 system_prompt** —— 那是聊天用的, 它的指令是「回答用户」,
+#: 模型会用文字描述动作已完成 (「空调关掉了」), 而不是真的去调工具。
+#: 那就是**假确认**: 用户以为动作做了, 实际什么都没发生。
+#:
+#: 这里明确告诉模型: 想让设备动就必须调工具, 不要用嘴说。
+DEFAULT_TOOL_CALLING_PROMPT = (
+    "你是一个语音助手, 可以通过工具控制机器人和家电设备。\n"
+    "规则:\n"
+    "1. 如果用户想让你执行一个动作 (控制机械臂、开关灯、开空调、播放音乐、"
+    "查询天气/时间/日期), 你**必须**调用对应的工具, 不要只用文字回答。\n"
+    "2. 绝对不要声称动作已经完成 —— 只有真正调用工具才算执行。\n"
+    "3. 如果用户只是在聊天、提问, 直接简短回答即可, 不要调用工具。\n"
+    "4. 回答用简洁口语化的中文, 总长度不超过 40 个字。"
+)
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -98,6 +117,37 @@ class LLMConfig:
 
 
 @dataclass
+class ToolCallingConfig:
+    """原生 function calling 配置 (router.tool_calling)。
+
+    规则命中时完全不进这条路 —— 它只负责「规则没命中」时的升级路径。
+    """
+
+    #: 是否启用
+    enabled: bool = False
+    #: 用哪个模型 (留空则用 llm.model)
+    model: str = ""
+    #: 超时秒数; 超时直接回落默认分支 (语音场景必须快)
+    timeout: float = 5.0
+    #: 工具选择是确定性的, 温度设 0
+    temperature: float = 0.0
+    #: 工具选择不需要长输出
+    max_tokens: int = 256
+    #: auto | none | required
+    #: **不要用 required** —— 纯闲聊也会被强行调工具
+    tool_choice: str = "auto"
+    #: 工具结果回灌的最大轮数 (硬上限, 防死循环)
+    max_rounds: int = 1
+    #: 执行工具后是否让模型再生成一句口语化总结
+    #: false = 用本地固定文案 (零额外延迟, TTS 合成也更快)
+    feedback_round: bool = False
+    #: tool calling 专用的系统提示词
+    #: **不能直接用 system_prompt** —— 那是聊天用的, 会让模型用文字
+    #: 「描述」动作已完成, 而不是真的去调工具 (假确认)。
+    system_prompt: str = ""
+
+
+@dataclass
 class RouterConfig:
     mode: str = "hybrid"          # rules | llm | hybrid
     llm_fallback_model: str = ""
@@ -109,6 +159,8 @@ class RouterConfig:
     trust_rules: bool = True
     #: 规则命中的关键词是否要求独占整句 (避免"打开空调"里的"气"误伤)
     strict_keywords: bool = False
+    #: 原生 function calling 配置 (规则未命中时的升级路径)
+    tool_calling: ToolCallingConfig = field(default_factory=ToolCallingConfig)
 
 
 @dataclass
@@ -203,6 +255,119 @@ def load_arm_actions(path: Path = ACTIONS_CONFIG_PATH) -> ArmActionConfig:
 
 
 @dataclass
+class ToolSpecConfig:
+    """一个 tool 的原始定义 (来自 configs/tools.yaml)。
+
+    这里存的是**未加工**的原始字段, 加工 (补默认值、生成 schema) 在
+    `action_tools.py` 里做 —— 两边职责分开: 配置只负责「写什么」,
+    代码负责「怎么变成 tool」。
+    """
+
+    #: function 名
+    name: str = ""
+    #: 工具类别: arm / device / query
+    kind: str = "device"
+    #: 中文名
+    label: str = ""
+    #: 给模型看的说明
+    description: str = ""
+    #: 结果是否朗读 (None = 按 kind 推断)
+    speak: Optional[bool] = None
+    #: 命中后走哪个分支 (None = 按 kind 推断)
+    intent: Optional[str] = None
+    #: 用哪个参数的值决定内部动作名
+    value_arg: str = ""
+    #: 参数值 -> 内部动作名
+    action_map: Dict[str, str] = field(default_factory=dict)
+    #: JSON Schema (parameters 段)
+    parameters: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class ToolConfig:
+    """tool 定义清单 (configs/tools.yaml)。"""
+
+    #: 工具条目
+    tools: List[ToolSpecConfig] = field(default_factory=list)
+    #: 是否成功读到过
+    loaded: bool = False
+
+    @property
+    def names(self) -> List[str]:
+        return [t.name for t in self.tools if t.name]
+
+
+def _yaml_key_to_str(key: Any) -> str:
+    """把 yaml 的 key 统一成小写字符串。
+
+    **YAML 1.1 的坑**: 裸写的 `on` / `off` / `yes` / `no` 会被解析成布尔值,
+    `str(True)` 得到 `"True"` —— 与 `"on"` 对不上, action_map 就查不到。
+    这里统一还原成小写, 保证 `on:` 和 `"on":` 行为一致。
+    """
+    if isinstance(key, bool):
+        return "on" if key else "off"
+    return str(key)
+
+
+def load_tool_specs(path: Path = TOOLS_CONFIG_PATH) -> ToolConfig:
+    """加载 tool 定义清单。
+
+    文件缺失不算错误 —— 只是没有自定义工具, 机械臂那一个仍会生成。
+    """
+    if not path or not Path(path).is_file():
+        return ToolConfig()
+    if yaml is None:
+        return ToolConfig()
+
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception as exc:  # pragma: no cover - 配置坏了不该让服务起不来
+        logger.warning("[工具] 读取 %s 失败: %s", path, exc)
+        return ToolConfig()
+
+    specs: List[ToolSpecConfig] = []
+    seen: set = set()
+    for item in data.get("tools") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            logger.warning("[工具] 有一条定义缺 name, 跳过")
+            continue
+        if name in seen:
+            logger.warning("[工具] 重复的 name %r, 跳过", name)
+            continue
+        seen.add(name)
+
+        raw_map = item.get("action_map") or {}
+        action_map: Dict[str, str] = {}
+        if isinstance(raw_map, dict):
+            for k, v in raw_map.items():
+                # YAML 1.1 会把裸 on/off/yes/no 解析成布尔值, 这里还原成字符串。
+                # 不还原的话 action_map 的键会变成 "True"/"False", 查不到。
+                key = _yaml_key_to_str(k)
+                action_map[key] = str(v)
+
+        speak = item.get("speak")
+        intent = item.get("intent")
+        specs.append(
+            ToolSpecConfig(
+                name=name,
+                kind=str(item.get("kind", "device") or "device"),
+                label=str(item.get("label", name) or name),
+                description=str(item.get("description", "") or ""),
+                speak=None if speak is None else bool(speak),
+                intent=str(intent) if intent else None,
+                value_arg=str(item.get("value_arg", "") or ""),
+                action_map=action_map,
+                parameters=dict(item.get("parameters") or {}),
+            )
+        )
+
+    logger.info("[工具] 已加载 %d 个 tool 定义: %s", len(specs), ", ".join(specs and [s.name for s in specs]))
+    return ToolConfig(tools=specs, loaded=True)
+
+
+@dataclass
 class Config:
     llm: LLMConfig
     router: RouterConfig
@@ -212,6 +377,8 @@ class Config:
     router_prompt: str
     #: 机械臂语音指令映射表
     arm_actions: ArmActionConfig = field(default_factory=ArmActionConfig)
+    #: tool 定义清单 (configs/tools.yaml)
+    tool_specs: ToolConfig = field(default_factory=ToolConfig)
 
     @property
     def enabled_handlers(self) -> List[HandlerConfig]:
@@ -242,6 +409,18 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
     )
 
     router_raw = merged.get("router", {})
+    tc_raw = router_raw.get("tool_calling") or {}
+    tool_calling = ToolCallingConfig(
+        enabled=bool(tc_raw.get("enabled", False)),
+        model=str(tc_raw.get("model") or ""),
+        timeout=float(tc_raw.get("timeout", 5.0)),
+        temperature=float(tc_raw.get("temperature", 0.0)),
+        max_tokens=int(tc_raw.get("max_tokens", 256)),
+        tool_choice=str(tc_raw.get("tool_choice", "auto")),
+        max_rounds=int(tc_raw.get("max_rounds", 1)),
+        feedback_round=bool(tc_raw.get("feedback_round", False)),
+        system_prompt=str(tc_raw.get("system_prompt") or DEFAULT_TOOL_CALLING_PROMPT),
+    )
     router = RouterConfig(
         mode=router_raw.get("mode", "hybrid"),
         llm_fallback_model=router_raw.get("llm_fallback_model") or llm.model,
@@ -250,6 +429,7 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
         llm_timeout=float(router_raw.get("llm_timeout", 3.0)),
         trust_rules=bool(router_raw.get("trust_rules", True)),
         strict_keywords=bool(router_raw.get("strict_keywords", False)),
+        tool_calling=tool_calling,
     )
 
     handlers: Dict[str, HandlerConfig] = {}
@@ -277,4 +457,5 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
         system_prompt=merged.get("system_prompt", "").strip(),
         router_prompt=merged.get("router_prompt", "").strip(),
         arm_actions=load_arm_actions(),
+        tool_specs=load_tool_specs(),
     )

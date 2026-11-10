@@ -143,7 +143,7 @@ class ToolHandler(Handler):
                 trace=[self._trace("match", (time.time() - started) * 1000, "no-tool")],
             )
 
-        status, detail = await self._execute(name, args)
+        status, detail = await self.execute(name, args)
         label = spec.get("label", name)
         speak = self.is_output_tool(name)
 
@@ -210,10 +210,16 @@ class ToolHandler(Handler):
 
     # ------------------------------------------------------------ 执行
 
-    async def _execute(self, name: str, args: Dict[str, Any]) -> Tuple[str, str]:
+    def tool_label(self, name: str) -> str:
+        """工具的中文名。"""
+        return str((TOOLS.get(name) or {}).get("label", name))
+
+    async def execute(self, name: str, args: Dict[str, Any]) -> Tuple[str, str]:
         """执行动作。真实项目里在这里接设备控制。
 
         返回 (status, detail); detail 是给人听的一句话。
+
+        **tool calling 路径也走这里** —— 与正则匹配路径共用同一份实现。
         """
         if name == "light_on":
             return "ok", "灯已打开"

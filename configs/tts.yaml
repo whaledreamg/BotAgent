@@ -1,0 +1,102 @@
+# TTS 服务配置 (音色 + 模型)
+#
+# 这里定义 **TTS 服务端** 的行为: 用哪个模型、哪些音色、默认语速。
+# 客户端 (asr_service / arm_service) 通过 WS 报文的 "voice" 字段选音色。
+#
+# ---------------------------------------------------------------------
+# 音色 (voice)
+# ---------------------------------------------------------------------
+#
+# 音色有两种定义方式, 可以混用:
+#
+# 1. **seed** —— 由随机种子确定。轻量、可复现, 加载快。
+#    同一个 seed 在**同一台机器、同一套硬件**上每次启动都是同一个音色。
+#    ⚠️ 换机器 / CPU↔GPU 回退时音色会变 (ChatTTS 的采样器 CPU/GPU 用不同的
+#    随机数流), 这就是你之前遇到「音色变了」的原因。
+#
+# 2. **ref_audio** —— 从一段参考音频克隆音色。**跨机器一致**, 代价是要
+#    多做一次 DVAE 编码 (启动时慢一点)。
+#
+# 至少要有一个音色。名字随便起, 客户端用这个名字选。
+#
+#   voices:
+#     - name: Default        # 客户端写 "voice": "Default"
+#       seed: 2              # 方式 1: 随机种子
+#
+#     - name: 客服小美
+#       ref_audio: assets/voices/xiaomei.wav   # 方式 2: 参考音频克隆
+#
+#     - name: 机械臂
+#       seed: 5555
+#       ref_audio: assets/voices/robot.wav     # 两种都写: 先克隆, 失败回落 seed
+#
+# ---------------------------------------------------------------------
+# 模型 (model)
+# ---------------------------------------------------------------------
+#
+# source:
+#   local       从 tts_service/asset/ 加载 (默认, 离线可用)
+#   huggingface 从 HuggingFace 下载 2Noise/ChatTTS (需要联网)
+#   custom      从 custom_path 加载指定的模型目录
+#
+# custom_path: source=custom 时的模型目录 (必须是完整的 ChatTTS 模型目录)
+#
+# device: 推理设备。留空 = 自动 (有 CUDA 用 CUDA, 否则 CPU)。
+#   ⚠️ CPU 推理慢约 10 倍, 且音色与 GPU 不同 (见上面的说明)。
+#
+# compile:     torch.compile, 首次推理会慢, 之后更快
+# use_flash_attn: 显存不够时关掉
+# enable_cache: KV cache, 提速明显
+#
+# ---------------------------------------------------------------------
+# 合成默认值 (defaults)
+# ---------------------------------------------------------------------
+#
+# 客户端可以在报文里覆盖这些值 (客户端没给就用这里的)。
+#
+# speed:    ChatTTS 的语速 token (0~9)。受 [speed_N] token 本身限制,
+#           实际语速变化不大 —— 想大幅调速请用 rate。
+# rate:     保音高变速倍率。1.0 = 原生语速, >1 更快, <1 更慢。范围 0.5~2.0。
+#           这是真正可控的语速调节。
+# temperature / top_p / top_k: 采样参数。调高更随机, 调低更稳定。
+# lang:     语言归一化。zh / en。留空 = 不做归一化。
+
+model:
+  source: local
+  custom_path: ""
+  device: ""
+  compile: false
+  use_flash_attn: false
+  enable_cache: true
+
+voices:
+  - name: Default
+    seed: 2
+  - name: Timbre1
+    seed: 1111
+  - name: Timbre2
+    seed: 2222
+  - name: Timbre3
+    seed: 3333
+  - name: Timbre4
+    seed: 4444
+  - name: Timbre5
+    seed: 5555
+  - name: Timbre6
+    seed: 6666
+  - name: Timbre7
+    seed: 7777
+  - name: Timbre8
+    seed: 8888
+  - name: Timbre9
+    seed: 9999
+
+defaults:
+  voice: Default
+  speed: 5
+  rate: 1.0
+  lang: ""
+  temperature: 0.3
+  top_p: 0.7
+  top_k: 20
+  refine_text: false

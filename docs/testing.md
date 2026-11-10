@@ -11,6 +11,42 @@
 
 ---
 
+## 0. 单元级自检（最快，不用起服务）
+
+各服务自带自检脚本，只跑单模块逻辑，不依赖真机 / 网络：
+
+```bash
+cd services/agent_service
+python tools/check_tool_calling.py          # 动作接入 (72 项, 离线)
+python tools/check_tool_calling.py --live   # + 真实 API 的 tool_calls 解析 (76 项)
+python tools/selftest.py                    # 分流 / 播报语义
+python tools/check_device.py                # 机械臂说法匹配
+python tools/check_actions.py               # actions.yaml 与动作库是否对得上
+
+cd ../arm_service
+python tools/check_arm.py                   # 协议级: 时序 / 报文 / 对齐 / 停控
+python tools/check_arm_service.py           # 端到端: mock 控制器 + 真实 HTTP/WS
+python tools/check_safety.py                # 安全门阀: 逐项判定 + 播报文案
+
+cd ../tts_service
+python examples/ws_server/check_tts_config.py      # TTS 音色 / 模型配置读取
+python examples/ws_server/check_tts_behavior.py    # 客户端覆盖 vs 服务端默认
+```
+
+| 脚本 | 覆盖 | 需要真机 |
+| --- | --- | --- |
+| `check_tool_calling.py` | tool schema、参数校验、路由决策、假确认检测、执行分派 | 否（`--live` 需要网络） |
+| `selftest.py` | 分流正确性、`speak` 语义 | 否 |
+| `check_device.py` | 说法匹配、疑问句排除、分支隔离 | 否 |
+| `check_actions.py` | 配置与动作库一致性 | 否 |
+| `check_arm.py` | 关节流时序、报文格式、起点对齐、停控 | 否（mock 控制器） |
+| `check_arm_service.py` | HTTP/WS 接口 + 播放编排 | 否（mock 控制器） |
+| `check_safety.py` | 门阀逐项判定 + 拒绝文案 | 否 |
+| `check_tts_config.py` | 音色 / 模型配置读取、客户端覆盖识别 | 否 |
+| `check_tts_behavior.py` | 客户端覆盖 vs 服务端默认的选择逻辑 | 否 |
+
+---
+
 ## 1. 前置条件
 
 ### 1.1 环境检查
@@ -70,7 +106,7 @@ cd "/home/gxh/workspace/project/Bot Agent"
 4. 用真实录音生成 16k 测试音频（`--skip-wake-audio`）
 5. 以 `--no-wake` 启动 ASR 回放（`:8801`），跳过唤醒词环节
 6. 轮询 `/state` 直到本轮处理完成
-7. 逐项断言，结束后自动拆掉三个服务
+7. 逐项断言，结束后自动拆掉这三个服务
 
 ### 2.2 期望输出
 

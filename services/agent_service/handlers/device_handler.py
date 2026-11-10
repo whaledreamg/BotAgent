@@ -156,6 +156,31 @@ class DeviceHandler(Handler):
 
         client = self._get_client()
 
+        # 执行交给 execute() —— tool calling 路径也走它, 保证两条路径
+        # 的安全门阀行为与播报文案完全一致。
+        result = await self.execute(name, source=how)
+
+        # 把匹配耗时也记进 trace
+        result.trace.insert(0, self._trace("match", (time.time() - started) * 1000, how))
+        return result
+
+    async def execute(
+        self,
+        name: str,
+        args: Optional[Dict[str, Any]] = None,
+        source: str = "rule",
+    ) -> BranchResult:
+        """执行一个已确定的动作名。
+
+        **规则匹配路径与 tool calling 路径共用这一份实现** ——
+        安全门阀预检、下发、播报文案全都一样, 两条路径不会出现行为差异。
+
+        `source` 只用于日志与 trace (rule / tool_call / llm)。
+        """
+        started = time.time()
+        args = args or {}
+        client = self._get_client()
+
         # ---- 安全门阀预检 ----
         #
         # 先探一下机械臂状态再决定要不要动手。机械臂有急停/故障/未使能时,
@@ -164,13 +189,13 @@ class DeviceHandler(Handler):
         safety = await client.check_safety()
         if not safety.get("ok", True):
             reason = str(safety.get("reason") or "机械臂现在不能动")
-            logger.warning("[机械臂] 安全门阀拒绝 %r: %s", name, reason)
+            logger.warning("[机械臂] 安全门阀拒绝 %r (%s): %s", name, source, reason)
             return BranchResult(
                 reply=f"{reason}，请先处理一下",
                 speak=True,
                 action={
                     "name": name,
-                    "args": {},
+                    "args": args,
                     "status": "blocked",
                     "detail": reason,
                     "safety_code": str(safety.get("code") or ""),
@@ -194,7 +219,7 @@ class DeviceHandler(Handler):
                 speak=True,
                 action={
                     "name": name,
-                    "args": {},
+                    "args": args,
                     "status": "failed",
                     "detail": str(exc),
                     "speak": True,
@@ -210,7 +235,7 @@ class DeviceHandler(Handler):
         logger.info(
             "[机械臂] 已下发 %r (%s, %.1fs), 服务端 phase=%s",
             name,
-            how,
+            source,
             duration,
             body.get("phase"),
         )
@@ -219,10 +244,10 @@ class DeviceHandler(Handler):
             speak=True,
             action={
                 "name": name,
-                "args": {},
+                "args": args,
                 "status": "ok",
                 "duration": duration,
-                "matched_by": how,
+                "matched_by": source,
                 "speak": True,
             },
             trace=[
