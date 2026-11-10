@@ -33,44 +33,78 @@ class Router:
         self.cfg = cfg
         self.registry = registry
         self.llm = llm
-        self._compiled: List[Tuple[re.Pattern, str, str]] = []
-        self._excludes: List[Tuple[re.Pattern, str]] = []
+        self._compiled: List[Tuple[re.Pattern, str, str, List[re.Pattern]]] = []
         self._compile_rules()
 
     # ------------------------------------------------------------ 规则
 
     def _compile_rules(self) -> None:
         self._compiled = []
-        self._excludes = []
         for rule in self.cfg.router.rules:
             intent = rule.get("intent")
             if not intent:
                 continue
-            for pattern in rule.get("patterns") or []:
-                try:
-                    self._compiled.append((re.compile(pattern), intent, str(pattern)))
-                except re.error as exc:
-                    logger.warning("忽略非法正则 %r: %s", pattern, exc)
-            for kw in rule.get("keywords") or []:
-                if kw:
-                    self._compiled.append(
-                        (re.compile(re.escape(str(kw))), intent, str(kw))
-                    )
-            # 排除词: 命中则该规则不生效 (用于区分闲聊与动作)
+            # 排除词必须**按规则隔离**:
+            # 之前把所有规则的 exclude 汇总成一个全局列表, 导致 tool 规则的
+            # 「介绍」会误伤 device 规则 —— 两条规则互相干扰。
+            excludes: List[re.Pattern] = []
             for kw in rule.get("exclude") or []:
                 if kw:
-                    self._excludes.append((re.compile(re.escape(str(kw))), str(kw)))
+                    excludes.append(re.compile(re.escape(str(kw))))
+
+            keywords = [str(k) for k in (rule.get("keywords") or [])]
+
+            # 机械臂动作的说法不在 agent.yaml 里 —— 那是 arm_service 的领域知识,
+            # 统一放在 configs/actions.yaml。这里按 intent 取过来。
+            if intent == "device":
+                keywords = self._arm_keywords() + keywords
+
+            for pattern in rule.get("patterns") or []:
+                try:
+                    self._compiled.append(
+                        (re.compile(pattern), intent, str(pattern), excludes)
+                    )
+                except re.error as exc:
+                    logger.warning("忽略非法正则 %r: %s", pattern, exc)
+            for kw in keywords:
+                if kw:
+                    self._compiled.append(
+                        (
+                            re.compile(re.escape(str(kw))),
+                            intent,
+                            str(kw),
+                            excludes,
+                        )
+                    )
+
+    def _arm_keywords(self) -> List[str]:
+        """机械臂动作的说法 (来自 configs/actions.yaml)。"""
+        arm = getattr(self.cfg, "arm_actions", None)
+        if arm is None:
+            return []
+        return [str(p) for p in getattr(arm, "say_phrases", [])]
 
     def match_rules(self, text: str) -> Optional[Tuple[str, str]]:
-        """返回 (intent, 命中内容); 没命中返回 None。"""
-        for pattern, intent, raw in self._compiled:
+        """返回 (intent, 命中内容); 没命中返回 None。
+
+        命中多条规则时取**关键词最长**的那条 —— 说「伸左手」时,
+        「伸左手」(3字) 应该赢过「伸手」(2字)。这样配置文件之间不需要
+        排先后顺序, 加新说法不会意外改变已有匹配结果。
+        """
+        best: Optional[Tuple[str, str]] = None
+        best_len = -1
+        for pattern, intent, raw, excludes in self._compiled:
             if not pattern.search(text):
                 continue
-            # 命中排除词则跳过这条规则
-            if any(ex.search(text) for ex, _ in self._excludes):
+            # 命中本规则自己的排除词则跳过这条规则
+            if any(ex.search(text) for ex in excludes):
                 continue
-            return intent, raw
-        return None
+            # 正则规则没有长度可比, 直接采用 (正则本来就比关键词精确)
+            length = len(raw)
+            if length > best_len:
+                best = (intent, raw)
+                best_len = length
+        return best
 
     # ------------------------------------------------------------ LLM
 

@@ -9,10 +9,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
+
+logger = logging.getLogger("agent.config")
 
 try:
     import yaml
@@ -24,6 +27,8 @@ except ImportError:  # pragma: no cover - 依赖缺失时给出清晰提示
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = ROOT / "configs"
 AGENT_CONFIG_PATH = CONFIG_DIR / "agent.yaml"
+#: 机械臂语音指令映射表
+ACTIONS_CONFIG_PATH = CONFIG_DIR / "actions.yaml"
 ENV_PATH = CONFIG_DIR / ".env"
 
 DEFAULTS: Dict[str, Any] = {
@@ -124,6 +129,80 @@ class SessionConfig:
 
 
 @dataclass
+class ArmActionConfig:
+    """机械臂语音指令映射表 (configs/actions.yaml)。"""
+
+    #: 机械臂动作服务地址
+    base_url: str = "http://127.0.0.1:8802"
+    #: 调用超时 (秒)
+    timeout: float = 5.0
+    #: 疑问句式 —— 命中则不算动作指令
+    exclude: List[str] = field(default_factory=list)
+    #: 动作条目: [{"action": "挥手", "say": ["挥个手"]}, ...]
+    actions: List[Dict[str, Any]] = field(default_factory=list)
+    #: 是否成功读到过映射表
+    loaded: bool = False
+
+    @property
+    def say_phrases(self) -> List[str]:
+        """所有说法 (展平), 供 router 生成规则。"""
+        out: List[str] = []
+        for item in self.actions:
+            for phrase in item.get("say") or []:
+                out.append(str(phrase))
+        return out
+
+    @property
+    def action_names(self) -> List[str]:
+        """所有动作名 (去重, 按配置顺序)。"""
+        out: List[str] = []
+        for item in self.actions:
+            name = str(item.get("action", ""))
+            if name and name not in out:
+                out.append(name)
+        return out
+
+
+def load_arm_actions(path: Path = ACTIONS_CONFIG_PATH) -> ArmActionConfig:
+    """加载机械臂语音指令映射表。
+
+    文件缺失不算错误 —— device 分支会退化成「只按动作名精确匹配」。
+    """
+    if not path or not Path(path).is_file():
+        return ArmActionConfig()
+
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception:  # pragma: no cover - 配置坏了不该让服务起不来
+        return ArmActionConfig()
+
+    arm = data.get("arm") or {}
+    actions = []
+    for item in arm.get("actions") or []:
+        name = str(item.get("action", "") or "").strip()
+        if not name:
+            continue
+        say = [str(x).strip() for x in (item.get("say") or []) if str(x).strip()]
+        actions.append({"action": name, "say": say})
+
+    cfg = ArmActionConfig(
+        base_url=os.environ.get(
+            "ARM_SERVICE_URL", arm.get("base_url", "http://127.0.0.1:8802")
+        ),
+        timeout=float(arm.get("timeout", 5.0)),
+        exclude=[str(x) for x in (arm.get("exclude") or [])],
+        actions=actions,
+        loaded=True,
+    )
+    logger.info(
+        "[机械臂] 已加载 %d 个动作说法: %s",
+        len(cfg.actions),
+        ", ".join(cfg.action_names),
+    )
+    return cfg
+
+
+@dataclass
 class Config:
     llm: LLMConfig
     router: RouterConfig
@@ -131,6 +210,8 @@ class Config:
     session: SessionConfig
     system_prompt: str
     router_prompt: str
+    #: 机械臂语音指令映射表
+    arm_actions: ArmActionConfig = field(default_factory=ArmActionConfig)
 
     @property
     def enabled_handlers(self) -> List[HandlerConfig]:
@@ -195,4 +276,5 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
         session=session,
         system_prompt=merged.get("system_prompt", "").strip(),
         router_prompt=merged.get("router_prompt", "").strip(),
+        arm_actions=load_arm_actions(),
     )

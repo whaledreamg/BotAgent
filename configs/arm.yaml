@@ -1,0 +1,68 @@
+# 机械臂动作服务配置
+#
+# 控制器地址按 ActionPlanner 的默认配置填 (机械臂 192.168.100.16)。
+# 控制器不可达时服务仍能启动, /health 会反映 controller_connected=false。
+
+arm:
+  # 机器人控制器的 WebSocket 控制面
+  controller_ws: ws://192.168.100.16:9000
+  # 实时指令面 (UDP) 端口; 入控时以控制器 getStatus 回读值为准
+  command_port: 9030
+  # 关节流下发频率 (Hz), 协议允许 10~1000
+  frequency: 100
+  # 入控后从实测角平滑过渡到轨迹起点的时长 (毫秒)
+  lead_in_ms: 700
+  # 左右臂在控制器里的真实名字; 留空则连接后用 robot/list 自动识别
+  left_arm: ""
+  right_arm: ""
+  # 关节级限幅。协议缺省是关闭的 (即没有任何关节级限速),
+  # 这里必须显式打开, 否则一次错误的轨迹就能把手臂甩出去。
+  joint_limit:
+    enable: true
+    max_velocity: 1.5       # rad/s
+    max_acceleration: 5.0   # rad/s^2
+  # 动作库目录 (一个 JSON 文件 = 一个动作, 文件名即动作名)
+  action_dir: services/arm_service/data
+  # 动作库中要跳过的文件名 (留空 —— 动作库现在都是单动作文件)
+  exclude_files: []
+  # 静止多久后暂停下发 (毫秒)
+  idle_stop_ms: 1000
+  connect_timeout: 5.0
+  play_timeout_ms: 15000
+
+  # 安全门阀: 动作执行前先检查控制器状态, 有异常就拒绝动作并语音播报原因。
+  #
+  # 检查项 (对应 robot/status 字段):
+  #   connected        控制器连得上
+  #   faulted          安全锁定 (有未清除的故障)
+  #   emergency_stop   急停没松开
+  #   safety_response  安全响应已触发 (快停/减速停等)
+  #   safety_phase     正在减速中
+  #   enabled          机械臂已上使能
+  #   mode             运行模式在允许列表里
+  safety:
+    enabled: true
+    require_enabled: true
+    require_connection: true
+    check_fault: true
+    allowed_modes: ["CSPPassthrough"]
+    # 门阀查询状态的超时 (毫秒); 超时按「不通过」处理 (不能盲动)
+    timeout_ms: 3000
+    # 拒绝时是否用 TTS 播报原因
+    speak_on_reject: true
+
+  # 门阀拒绝时的 TTS 播报 (连 ChatTTS 的 WebSocket, 不落盘)
+  notifier:
+    enabled: true
+    ws_url: "ws://127.0.0.1:8000/ws"
+    voice: "Default"
+    speed: 5
+    sample_rate: 24000
+    timeout: 30.0
+    # true = 由 TTS 服务端自己播 (arm_service 环境没有 sounddevice 时必须用这个)
+    # false = arm_service 本地用 sounddevice 播
+    server_play: true
+
+server:
+  host: 0.0.0.0
+  port: 8802

@@ -1,0 +1,33 @@
+{
+    "segments": [
+        {
+            "duration": 2,
+            "endJoints": {
+                "leftArm": [
+                    0,
+                    -1.5004369167808533,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+                "rightArm": [
+                    0,
+                    -1.5078551518707275,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            },
+            "interpolation": "cubic",
+            "label": "机械1",
+            "startTime": 0,
+            "type": "arm"
+        }
+    ],
+    "totalDuration": 2,
+    "version": "4.0"
+}

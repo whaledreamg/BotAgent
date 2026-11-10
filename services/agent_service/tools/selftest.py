@@ -83,7 +83,14 @@ async def main() -> int:
     print(f"已装载分支: {registry.names()}")
     check("chat 分支已装载", "chat" in registry)
     check("tool 分支已装载", "tool" in registry)
-    check("device 分支默认禁用", "device" not in registry)
+    # device 分支由 configs/agent.yaml 的 handlers.device.enabled 控制
+    # (启用后机械臂才能接语音指令), 这里按配置断言而不是写死
+    device_expected = cfg.handlers.get("device").enabled if "device" in cfg.handlers else False
+    check(
+        "device 分支装载状态与配置一致",
+        ("device" in registry) == device_expected,
+        f"(enabled={device_expected})",
+    )
 
     router = Router(cfg, registry, llm)
 

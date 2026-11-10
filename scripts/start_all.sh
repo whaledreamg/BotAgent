@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键启动全部三个服务 (TTS -> Agent -> ASR), 并做健康检查
+# 一键启动全部四个服务 (TTS -> Agent -> ASR -> Arm), 并做健康检查
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -7,6 +7,7 @@ LOG_DIR="$ROOT/logs"
 TTS_PORT="${TTS_PORT:-8000}"
 AGENT_PORT="${AGENT_PORT:-8800}"
 ASR_PORT="${ASR_PORT:-8801}"
+ARM_PORT="${ARM_PORT:-8802}"
 
 mkdir -p "$LOG_DIR"
 cd "$ROOT"
@@ -36,26 +37,33 @@ check_port_free() {
     return 0
 }
 
-echo "=== 1/3 启动 TTS ==="
+echo "=== 1/4 启动 TTS ==="
 check_port_free tts "$TTS_PORT" || exit 1
 nohup "$ROOT/scripts/start_tts.sh" >"$LOG_DIR/tts.out" 2>&1 &
 echo "$!" > "$LOG_DIR/tts.pid"
 wait_health "tts" "http://127.0.0.1:${TTS_PORT}/health" 90 || true
 
-echo "=== 2/3 启动 Agent ==="
+echo "=== 2/4 启动 Agent ==="
 check_port_free agent "$AGENT_PORT" || exit 1
 nohup "$ROOT/scripts/start_agent.sh" >"$LOG_DIR/agent.out" 2>&1 &
 echo "$!" > "$LOG_DIR/agent.pid"
 wait_health "agent" "http://127.0.0.1:${AGENT_PORT}/health" 30 || true
 
-echo "=== 3/3 启动 ASR ==="
+echo "=== 3/4 启动 ASR ==="
 check_port_free asr "$ASR_PORT" || exit 1
 nohup "$ROOT/scripts/start_asr.sh" "$@" >"$LOG_DIR/asr.out" 2>&1 &
 echo "$!" > "$LOG_DIR/asr.pid"
 wait_health "asr" "http://127.0.0.1:${ASR_PORT}/health" 30 || true
+
+echo "=== 4/4 启动 Arm ==="
+check_port_free arm "$ARM_PORT" || exit 1
+nohup "$ROOT/scripts/start_arm.sh" >"$LOG_DIR/arm.out" 2>&1 &
+echo "$!" > "$LOG_DIR/arm.pid"
+wait_health "arm" "http://127.0.0.1:${ARM_PORT}/health" 30 || true
 
 echo
 echo "全部服务已启动, 日志目录: $LOG_DIR"
 echo "  TTS   http://127.0.0.1:${TTS_PORT}/health"
 echo "  Agent http://127.0.0.1:${AGENT_PORT}/health"
 echo "  ASR   http://127.0.0.1:${ASR_PORT}/health"
+#echo "  Arm   http://127.0.0.1:${ARM_PORT}/health"
