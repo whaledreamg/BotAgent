@@ -73,7 +73,11 @@ def test_schema(cfg: Any) -> None:
     arm = next((s for s in specs if s.name == "play_arm_action"), None)
     check("机械臂 tool 存在", arm is not None)
     if arm is not None:
-        enum = arm.parameters["properties"]["action"].get("enum") or []
+        props = arm.parameters["properties"]
+        check("参数是 actions (数组)", "actions" in props, str(list(props)))
+        arr = props.get("actions") or {}
+        check("actions 是 array 类型", arr.get("type") == "array", str(arr.get("type")))
+        enum = (arr.get("items") or {}).get("enum") or []
         expected = [
             str(i.get("action")) for i in (cfg.arm_actions.actions or []) if i.get("action")
         ]
@@ -82,7 +86,7 @@ def test_schema(cfg: Any) -> None:
             set(enum) == set(expected),
             f"enum={enum} expected={expected}",
         )
-        check("action 是必填", "action" in (arm.parameters.get("required") or []))
+        check("actions 是必填", "actions" in (arm.parameters.get("required") or []))
         check("kind=arm", arm.kind == "arm", arm.kind)
         check("动作要朗读", arm.speak is True)
 
@@ -182,17 +186,24 @@ def test_validation(cfg: Any) -> None:
 
     # 合法
     try:
-        out = validate_args(arm, {"action": "挥手"})
-        check("合法动作名通过", out.get("action") == "挥手", str(out))
+        out = validate_args(arm, {"actions": ["挥手"]})
+        check("合法动作名通过", out.get("actions") == ["挥手"], str(out))
     except ActionError as exc:
         check("合法动作名通过", False, str(exc))
 
     # 幻觉出的动作名必须被拦下
     try:
-        validate_args(arm, {"action": "不存在的动作"})
+        validate_args(arm, {"actions": ["不存在的动作"]})
         check("非法动作名被拦下", False, "没有抛错")
     except ActionError as exc:
         check("非法动作名被拦下", "不合法" in str(exc), str(exc))
+
+    # 数组里混进一个非法动作名也要被拦下
+    try:
+        validate_args(arm, {"actions": ["挥手", "不存在的动作"]})
+        check("数组里的非法动作名被拦下", False, "没有抛错")
+    except ActionError as exc:
+        check("数组里的非法动作名被拦下", "不合法" in str(exc), str(exc))
 
     # 缺必填
     try:
@@ -210,7 +221,7 @@ def test_validation(cfg: Any) -> None:
 
     # 类型转换
     try:
-        out = validate_args(arm, {"action": "挥手", "speed": "1.5"})
+        out = validate_args(arm, {"actions": ["挥手"], "speed": "1.5"})
         check("speed 字符串转数字", out.get("speed") == 1.5, str(out))
     except ActionError as exc:
         check("speed 字符串转数字", False, str(exc))
@@ -415,6 +426,52 @@ def test_routing(cfg: Any) -> None:
         not router._looks_like_fake_confirm("北京今天晴，气温 24 度"),
     )
 
+    # ---- 3h2. 「用嘴列动作清单」检测器 ----
+    #
+    # 模型听懂复合指令但没调工具, 直接把动作名列出来当回复 ——
+    # 「准备点、挥手」。这跟假确认一样严重: 机器人说了要做但没做。
+    check(
+        "识别出动作清单式回复",
+        router._looks_like_action_list("准备点、挥手"),
+    )
+    check(
+        "单个动作名也算动作清单",
+        router._looks_like_action_list("挥手"),
+    )
+    check(
+        "带前缀的动作清单也算",
+        router._looks_like_action_list("好的，准备点、挥手"),
+    )
+    check(
+        "普通闲聊不算动作清单",
+        not router._looks_like_action_list("你好，有什么可以帮你的吗？"),
+    )
+    check(
+        "普通回答不算动作清单",
+        not router._looks_like_action_list("北京今天晴，气温 24 度"),
+    )
+    check(
+        "故事不算动作清单",
+        not router._looks_like_action_list("有一天 0 在街上遇到了 8"),
+    )
+
+    # ---- 3h3. tool_calling 必须有自己的 system_prompt ----
+    #
+    # 用 chat 的 system_prompt 的话, 模型会用文字「描述」动作已完成,
+    # 而不是真的去调工具 —— 表现为「说了要做但没做」。
+    tc_prompt = router._tool_messages(AgentRequest(text="挥手"))
+    tc_system = tc_prompt[0]["content"] if tc_prompt else ""
+    check(
+        "tool calling 有专用 system_prompt",
+        "工具" in tc_system or "tool" in tc_system.lower(),
+        tc_system[:60],
+    )
+    check(
+        "tool calling 提示词要求调工具",
+        "调用" in tc_system,
+        tc_system[:60],
+    )
+
     # ---- 3i. 并行多工具调用 ----
     llm = FakeLLM(
         ToolCallResult(
@@ -475,6 +532,28 @@ def test_routing(cfg: Any) -> None:
     check("关闭后规则命中仍然放行", decision.intent == "tool", decision.intent)
     check("关闭后不调 LLM", llm.calls == 0)
 
+    # ---- 3m. 复合指令走规则路径, **不依赖 LLM** ----
+    #
+    # 「先准备点然后再挥挥手」命中两个动作。规则路径按出现位置排序就能
+    # 处理, 不需要 LLM —— 之前一律升级到 tool calling, 结果 LLM 一限流
+    # (429) 整句话就掉到 chat 分支, 机器人什么都不做。
+    llm = FakeLLM()
+    router = _make_router(cfg, llm)
+    decision = asyncio.run(router.decide(AgentRequest(text="先准备点然后再挥挥手")))
+    check("复合指令不调 LLM", llm.calls == 0, f"LLM 调用了 {llm.calls} 次")
+    check("复合指令走规则路径", decision.by == "rule", decision.by)
+    check("复合指令进 device 分支", decision.intent == "device", decision.intent)
+
+    # LLM 完全挂掉时, 复合指令依然要能被规则接住
+    class DeadLLM:
+        async def tool_call(self, *a, **kw):
+            raise RuntimeError("LLM 挂了")
+
+    router = _make_router(cfg, DeadLLM())
+    decision = asyncio.run(router.decide(AgentRequest(text="先准备点然后再挥挥手")))
+    check("LLM 挂了复合指令仍走规则", decision.by == "rule", decision.by)
+    check("LLM 挂了复合指令仍是 device", decision.intent == "device", decision.intent)
+
 
 # ------------------------------------------------------------ 4. 执行分派
 
@@ -486,15 +565,36 @@ def test_execution(cfg: Any) -> None:
     class FakeDevice:
         def __init__(self) -> None:
             self.seen: List[str] = []
+            self.batches: List[List[str]] = []
 
         async def execute(self, name, args=None, source="rule"):
             from handlers.base import BranchResult
 
             self.seen.append(name)
+            self.batches.append([name])
             return BranchResult(
                 reply=f"好的，{name}",
                 speak=True,
                 action={"name": name, "status": "ok", "detail": "", "speak": True},
+                trace=[],
+            )
+
+        async def execute_many(self, names, args=None, source="rule"):
+            from handlers.base import BranchResult
+
+            names = list(names)
+            self.seen.extend(names)
+            self.batches.append(names)
+            return BranchResult(
+                reply="好的，" + "、".join(names),
+                speak=True,
+                action={
+                    "name": names[0] if names else "none",
+                    "status": "ok",
+                    "actions": names,
+                    "detail": "",
+                    "speak": True,
+                },
                 trace=[],
             )
 
@@ -517,10 +617,23 @@ def test_execution(cfg: Any) -> None:
     catalog = ActionCatalog(specs, device_handler=dev, tool_handler=tool)
 
     arm = next(s for s in specs if s.name == "play_arm_action")
-    outcome = asyncio.run(catalog.execute(arm, {"action": "挥手"}))
+    outcome = asyncio.run(catalog.execute(arm, {"actions": ["挥手"]}))
     check("机械臂走 device_handler", dev.seen == ["挥手"], str(dev.seen))
     check("机械臂结果 ok", outcome.ok is True)
     check("机械臂要朗读", outcome.speak is True)
+
+    # 多动作: 按顺序传给 device_handler
+    dev.seen.clear()
+    dev.batches.clear()
+    outcome = asyncio.run(catalog.execute(arm, {"actions": ["准备点", "挥手"]}))
+    check("多动作按顺序", dev.batches == [["准备点", "挥手"]], str(dev.batches))
+    check("多动作主动作是第一个", outcome.action == "准备点", str(outcome.action))
+
+    # 单个字符串也容忍 (模型偶尔会偷懒)
+    dev.seen.clear()
+    dev.batches.clear()
+    asyncio.run(catalog.execute(arm, {"actions": "挥手"}))
+    check("裸字符串也认", dev.batches == [["挥手"]], str(dev.batches))
 
     light = next(s for s in specs if s.name == "control_light")
     outcome = asyncio.run(catalog.execute(light, {"state": "off"}))
@@ -535,11 +648,26 @@ def test_execution(cfg: Any) -> None:
     # 参数非法必须被拦下, 且**不能**到达执行器
     before = len(dev.seen)
     try:
-        asyncio.run(catalog.execute(arm, {"action": "不存在的动作"}))
+        asyncio.run(catalog.execute(arm, {"actions": ["不存在的动作"]}))
         check("非法参数被拦下", False, "没有抛错")
     except ActionError:
         check("非法参数被拦下", True)
     check("非法参数没到执行器", len(dev.seen) == before, str(dev.seen))
+
+    # 数组里有一项非法也要拦下
+    try:
+        asyncio.run(catalog.execute(arm, {"actions": ["挥手", "不存在的动作"]}))
+        check("数组里有非法项被拦下", False, "没有抛错")
+    except ActionError:
+        check("数组里有非法项被拦下", True)
+    check("非法项没到执行器", len(dev.seen) == before, str(dev.seen))
+
+    # 空数组要拦下
+    try:
+        asyncio.run(catalog.execute(arm, {"actions": []}))
+        check("空数组被拦下", False, "没有抛错")
+    except ActionError:
+        check("空数组被拦下", True)
 
 
 # ------------------------------------------------------------ 5. live

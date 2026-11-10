@@ -108,6 +108,50 @@ def test_matching() -> None:
         check(f"「{text}」不匹配动作", got is None, f"实际 {got}")
 
 
+def test_multi_action() -> None:
+    """复合指令: 一句话里的多个动作, 按出现位置排序。"""
+    print("\n[2b] 复合指令")
+    from config import load_config
+    from registry import Registry
+
+    cfg = load_config()
+    reg = Registry()
+    reg.load(cfg)
+    handler = reg.get("device")
+    if handler is None:
+        check("device 分支已装载", False)
+        return
+
+    # 复合指令要**按在句子里出现的顺序**返回, 而不是按说法长度
+    hits = handler._match_all("机器人先帮我会准备点然后再挥挥手")
+    names = [a for a, _ in hits]
+    check("识别出多个动作", len(names) >= 2, str(names))
+    check("按出现位置排序", names == sorted(names, key=lambda n: text_pos(hits, n)),
+          str(names))
+    check("包含准备点", "准备点" in names, str(names))
+    check("包含挥手", "挥手" in names, str(names))
+
+    # 单动作不该被当成复合
+    hits1 = handler._match_all("挥个手")
+    check("单动作只命中一个", len(hits1) == 1, str([a for a, _ in hits1]))
+
+    # 疑问句不该命中任何动作
+    hits2 = handler._match_all("你怎么挥手")
+    check("疑问句不命中动作", len(hits2) == 0, str([a for a, _ in hits2]))
+
+    # 去重: 「挥挥手」同时命中「挥手」和「挥挥手」两条说法, 只算一个动作
+    hits3 = handler._match_all("挥挥手")
+    check("重复说法只算一个动作", len(hits3) == 1, str([a for a, _ in hits3]))
+
+
+def text_pos(hits, name: str) -> int:
+    """取某个动作在命中列表里的位置。"""
+    for action, pos in hits:
+        if action == name:
+            return pos
+    return 999
+
+
 def test_router_isolation() -> None:
     """exclude 必须按规则隔离。"""
     print("\n[3] 分支隔离")
@@ -229,6 +273,7 @@ def main() -> int:
     print("=" * 60)
 
     test_matching()
+    test_multi_action()
     test_router_isolation()
     if args.live:
         test_live(args.agent, args.arm)

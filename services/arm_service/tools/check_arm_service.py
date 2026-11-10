@@ -217,6 +217,30 @@ def _shortest_action(base: str) -> str:
     return "零点"
 
 
+def _two_shortest_actions(base: str) -> List[str]:
+    """挑两个最短的动作 (用来测队列)。
+
+    动作名不写死 —— 动作库换了内容这个测试照样能跑。
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{base}/v1/actions", timeout=8) as resp:
+            body = json.load(resp)
+        items = body.get("actions") or []
+        if len(items) >= 2:
+            ordered = sorted(items, key=lambda a: float(a.get("duration", 0)))
+            return [
+                str(a.get("key") or a.get("label")) for a in ordered[:2]
+            ]
+        if items:
+            one = str(items[0].get("key") or items[0].get("label"))
+            return [one, one]
+    except Exception:
+        pass
+    return ["零点", "零点"]
+
+
 def main() -> int:
     import urllib.error
     import urllib.request
@@ -413,6 +437,90 @@ def main() -> int:
             safety_ok = json.load(resp)
         check("恢复正常后门阀放行", safety_ok.get("ok") is True,
               str(safety_ok.get("reason")))
+
+        # ---- 播放队列 ----
+        #
+        # 多个动作按顺序播, **只入控一次** —— 这是队列的核心价值:
+        # 每个动作单独播都要重新入控 (700ms 对齐 + 通道断开重连)。
+        print("\n[7] 播放队列")
+        events.clear()
+        two = _two_shortest_actions(base)
+        check("拿到两个动作", len(two) == 2, str(two))
+
+        cmds_before = len(robot.commands)
+        req = urllib.request.Request(
+            f"{base}/v1/play",
+            data=json.dumps({"actions": two, "speed": 2.0}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            queue_resp = json.load(resp)
+        check("队列指令被接受", queue_resp.get("ok") is True, str(queue_resp))
+        check("返回了动作列表", queue_resp.get("actions") == two,
+              str(queue_resp.get("actions")))
+        check("返回了队列总时长",
+              float(queue_resp.get("duration") or 0) > 0,
+              str(queue_resp.get("duration")))
+
+        # 队列播完要等两个动作都结束
+        deadline = time.time() + 40.0
+        finished_count = 0
+        while time.time() < deadline:
+            finished_count = sum(
+                1 for e in events if e.get("type") == "finished"
+            )
+            if finished_count >= 2:
+                break
+            time.sleep(0.1)
+        check("收到两个 finished 事件", finished_count >= 2,
+              f"{finished_count} 个")
+
+        # **只入控一次** —— 队列的 핵심
+        new_cmds = [c.get("ty") for c in robot.commands[cmds_before:]]
+        start_count = new_cmds.count("realtime/startControl")
+        check("整个队列只入控一次", start_count == 1,
+              f"startControl x{start_count}: {new_cmds}")
+        check("队列结束已交还通道",
+              "realtime/stopControl" in new_cmds, str(new_cmds))
+
+        with urllib.request.urlopen(f"{base}/v1/status", timeout=5) as resp:
+            after_queue = json.load(resp)
+        check("队列播完回到 IDLE", after_queue.get("phase") == "idle",
+              str(after_queue.get("phase")))
+        check("队列已清空", after_queue.get("queue") == [],
+              str(after_queue.get("queue")))
+
+        # 旧的单动作参数仍然能用 (向后兼容)
+        print("\n[8] 向后兼容: 单动作参数")
+        events.clear()
+        single = _shortest_action(base)
+        req = urllib.request.Request(
+            f"{base}/v1/play",
+            data=json.dumps({"action": single, "speed": 2.0}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            single_resp = json.load(resp)
+        check("单动作仍然接受", single_resp.get("ok") is True, str(single_resp))
+        check("单动作也返回 actions 列表",
+              single_resp.get("actions") == [single],
+              str(single_resp.get("actions")))
+
+        # 不给动作要被拒
+        req = urllib.request.Request(
+            f"{base}/v1/play",
+            data=json.dumps({"speed": 1.0}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                json.load(resp)
+            check("没指定动作被拒", False, "居然成功了")
+        except urllib.error.HTTPError as exc:
+            check("没指定动作被拒", exc.code == 400, f"HTTP {exc.code}")
 
         ws.close()
     finally:

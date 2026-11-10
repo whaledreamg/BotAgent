@@ -39,6 +39,32 @@ flowchart TD
 纯规则命中时**完全不调 LLM**, 这条快速通道不能动 —— 它是语音体验的
 基础。tool calling 只接管「规则搞不定」的部分。
 
+### 为什么不是「所有请求都带 tools」
+
+试过 (见 `tools/exp_unified_tools.py`), 19 个测试句子的结果:
+
+| 策略 | 符合预期 | 平均延迟 |
+|---|---|---|
+| 规则优先 (当前) | 12/19 | ~1070ms |
+| 一律带 tools | 18/19 | ~6800ms |
+
+**准确率确实更高** —— 模型区分「要执行动作」和「纯闲聊」比规则准。
+但有两个问题:
+
+1. **延迟是 6 倍**。规则命中的单动作 23~38ms, 一律带 tools 要 600~2000ms。
+   语音场景里这个差距是能感觉到的。
+2. **完全依赖 LLM**。免费额度限流 (HTTP 429) 时, 一律带 tools 的路径
+   **全线失败** —— 动作类请求直接掉到 chat 分支, 机器人什么都不做。
+
+所以保持「规则优先」。但从实验里学到了两件事, 都已落实:
+
+- **tool_calling 必须有自己的 system_prompt**。之前它被注释掉了, 回落到
+  chat 的提示词, 结果模型用文字回答「准备点、挥手」而不调工具 ——
+  **说了要做但没做**。现在补上了专用提示词。
+- **复合指令不该依赖 LLM**。之前多动作一律升级到 tool calling, LLM 一限流
+  整句话就废了。现在规则路径直接按位置排序处理, 零延迟 (实测 800~3000ms
+  -> 26~57ms), LLM 挂了也不影响。
+
 ### 比原来的实现省了什么
 
 原来规则没命中时是**两段式**:
@@ -59,13 +85,33 @@ OpenAI 的 `tools` 数组, 以及执行时分派。
 
 | function | 来源 | 参数 | 说明 |
 |---|---|---|---|
-| `play_arm_action` | `configs/actions.yaml` (自动生成) | `action` (enum), `speed` | 机械臂动作, 动作名 = JSON 文件名 |
+| `play_arm_action` | `configs/actions.yaml` (自动生成) | `actions` (enum 数组), `speed` | 机械臂动作, 动作名 = JSON 文件名 |
 | `control_light` | `configs/tools.yaml` | `state` (on/off) | 电灯 |
 | `control_aircon` | `configs/tools.yaml` | `state` (on/off) | 空调 |
 | `play_music` | `configs/tools.yaml` | — | 播放音乐 |
 | `query_weather` | `configs/tools.yaml` | `city` | 查天气 (输出型, 要播报) |
 | `query_time` | `configs/tools.yaml` | — | 查时间 (输出型, 要播报) |
 | `query_date` | `configs/tools.yaml` | — | 查日期 (输出型, 要播报) |
+
+### 机械臂 tool 的 actions 数组
+
+机械臂的 `actions` 是**数组**, 不是单值:
+
+```json
+{"actions": ["准备点", "挥手"], "speed": 1.0}
+```
+
+- 用户要一个动作 -> `{"actions": ["挥手"]}`
+- 用户要多个动作 -> 按他说的顺序填
+
+这是 function calling 的强项 —— LLM 把「先 A 再 B」映射成数组是天然的,
+而正则要写「先...然后...」的语法解析器, 换个说法就失效。
+
+数组里**每一项**都会过 enum 校验 —— 模型填了不存在的动作名会在执行前就被
+拦下 (不会到服务端才报错)。
+
+整个数组交给 arm_service 排成队列, **只入控一次**。详见
+[docs/arm-service.md](arm-service.md#播放队列)。
 
 ### yaml 字段说明
 
@@ -252,6 +298,12 @@ router:
     tool_choice: auto        # 不要用 required
     max_rounds: 1            # 工具结果回灌轮数 (硬上限, 防死循环)
     feedback_round: false    # 执行后是否让模型再总结一句
+    # **必须有专用的 system_prompt** —— 少了它模型会用文字回答
+    # 「准备点、挥手」而不调工具, 表现为「说了要做但没做」。
+    system_prompt: |
+      你是一个语音助手, 可以通过工具控制机器人和家电设备。
+      **必须调用工具来执行动作, 不要用文字代替。**
+      ...
 ```
 
 ### 各参数怎么调
@@ -264,6 +316,7 @@ router:
 | `tool_choice` | `auto` | `required` 会让闲聊也去调工具 |
 | `max_rounds` | `1` | 每多一轮就多一次往返 (~850ms) |
 | `feedback_round` | `false` | 本地固定文案更快, TTS 合成也更快 |
+| `system_prompt` | **必填** | 少了它模型会用文字代替调工具 (假确认) |
 
 `feedback_round: true` 时, 工具执行完会把结果回灌给模型, 让它生成一句
 更自然的话。代价是多一次往返。
@@ -273,20 +326,24 @@ router:
 ```bash
 cd services/agent_service
 
-# 离线自检 (72 项, 不需要网络/真机)
+# 离线自检 (112 项, 不需要网络/真机)
 python tools/check_tool_calling.py
 
 # 额外验证真实 API 的 tool_calls 解析
 python tools/check_tool_calling.py --live
+
+# 对比实验: 「一律带 tools」vs「规则优先」(要消耗 API 额度)
+python tools/exp_unified_tools.py
 ```
 
 覆盖:
 
 1. tool schema 生成 (function 名 / enum 完整性 / required)
-2. 参数校验 (非法动作名 / 缺参数 / 类型错 都被拦下)
+2. 参数校验 (非法动作名 / 缺参数 / 类型错 / 空数组 都被拦下)
 3. 路由决策 (假 LLM 替身验证规则命中 / tool_calls / 纯 chat / 升级路径)
-4. 假确认检测与重试
+4. 假确认检测与重试 (含「用嘴列动作清单」这种形态)
 5. 动作执行分派 (机械臂走安全门阀, 设备走 TOOLS)
+6. 复合指令走规则路径 (LLM 挂了也能执行)
 
 回归:
 

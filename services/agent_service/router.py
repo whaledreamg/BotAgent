@@ -342,6 +342,52 @@ class Router:
             return False
         return any(marker in text for marker in self._FAKE_CONFIRM_MARKERS)
 
+    def _looks_like_action_list(self, content: str) -> bool:
+        """判断模型是不是「用嘴列了动作清单」。
+
+        这是比假确认更隐蔽的一种错误: 模型听懂��复合指令, 但没调工具,
+        直接把动作名列出来当回复 —— 比如用户说「先准备点再挥挥手」,
+        模型回「准备点、挥手」。
+
+        从用户角度看, 机器人**说了要做但没做**, 一样是假确认。
+
+        判据: 回复里出现的是**动作名**, 而不是句子。
+        """
+        text = (content or "").strip()
+        if not text:
+            return False
+
+        names = self._arm_action_names()
+        if not names:
+            return False
+
+        # 去掉常见分隔符后, 看剩下的词是不是动作名
+        cleaned = text
+        for sep in ("、", ",", "，", "。", " ", "then", "and", "再", "然后", "先"):
+            cleaned = cleaned.replace(sep, "")
+
+        if not cleaned:
+            return False
+
+        # 回复里出现的每个动作名都要在清单里, 且至少有一个
+        hit = [n for n in names if n in text]
+        if not hit:
+            return False
+        # 回复里除了动作名不该有别的东西 (长度接近动作名总长)
+        return len(cleaned) <= sum(len(n) for n in hit) + 2
+
+    def _arm_action_names(self) -> List[str]:
+        """机械臂动作名清单 (来自 configs/actions.yaml)。"""
+        arm = getattr(self.cfg, "arm_actions", None)
+        if arm is None:
+            return []
+        actions = getattr(arm, "actions", None) or []
+        return [
+            str(item.get("action")).strip()
+            for item in actions
+            if item.get("action")
+        ]
+
     def _tool_messages(self, req: AgentRequest) -> List[Dict[str, Any]]:
         """构造 tool calling 的消息列表。
 
@@ -504,11 +550,18 @@ class Router:
             # **假确认检测**: 模型用文字说「帮你关掉空调」, 但没调工具。
             # 设备其实什么都没动, 用户却以为做了 —— 这是最严重的错误。
             # 这时用 tool_choice=required 强制它必须调工具, 重试一次。
-            if self._looks_like_fake_confirm(content):
-                logger.warning("检测到假确认 (%r), 用 required 重试", content[:40])
-                trace.append(
-                    {"step": "tools", "ms": elapsed, "detail": "fake-confirm"}
+            #
+            # 两种形态都要抓:
+            # 1. 「已帮你挥挥手」—— 声称做完了
+            # 2. 「准备点、挥手」—— 把动作名列出来当回复 (复合指令时更常见)
+            fake_confirm = self._looks_like_fake_confirm(content)
+            action_list = self._looks_like_action_list(content)
+            if fake_confirm or action_list:
+                reason = "fake-confirm" if fake_confirm else "action-list"
+                logger.warning(
+                    "检测到 %s (%r), 用 required 重试", reason, content[:40]
                 )
+                trace.append({"step": "tools", "ms": elapsed, "detail": reason})
                 retried = await self._retry_with_required(req, tools, tc, trace)
                 if retried is not None:
                     return retried, False

@@ -137,6 +137,8 @@ def validate_args(spec: ActionSpec, args: Dict[str, Any]) -> Dict[str, Any]:
         elif expected == "boolean":
             if isinstance(value, str):
                 value = value.strip().lower() in ("1", "true", "yes", "on", "是", "开")
+        elif expected == "array":
+            value = _validate_array(spec, key, value, prop)
 
         enum = prop.get("enum")
         if enum and value not in enum:
@@ -152,6 +154,67 @@ def validate_args(spec: ActionSpec, args: Dict[str, Any]) -> Dict[str, Any]:
             raise ActionError(f"{spec.label} 缺少必填参数: {key}")
 
     return cleaned
+
+
+def _validate_array(
+    spec: ActionSpec, key: str, value: Any, prop: Dict[str, Any]
+) -> List[Any]:
+    """校验数组参数。
+
+    机械臂的 `actions` 就是数组 —— 每一项都要过 item 的 enum 校验,
+    否则模型填了不存在的动作名, 会在服务端才报错。
+    """
+    items = prop.get("items") or {}
+    item_enum = items.get("enum") or []
+    item_type = items.get("type")
+
+    if isinstance(value, str):
+        # 模型偶尔会把单元素数组写成裸字符串 —— 容忍一下
+        value = [value]
+    elif isinstance(value, (list, tuple)):
+        value = list(value)
+    else:
+        raise ActionError(f"{spec.label} 参数 {key} 必须是数组")
+
+    out: List[Any] = []
+    for item in value:
+        if item_type == "string" and not isinstance(item, str):
+            item = str(item)
+        if item_enum and item not in item_enum:
+            raise ActionError(
+                f"{spec.label} 参数 {key} 的值 {item!r} 不合法, "
+                f"合法值: {', '.join(str(x) for x in item_enum)}"
+            )
+        out.append(item)
+
+    if not out:
+        raise ActionError(f"{spec.label} 参数 {key} 不能为空数组")
+    return out
+
+
+def _as_name_list(raw: Any) -> List[str]:
+    """把参数值归一化成动作名列表。
+
+    模型的输出可能是:
+    - ``["挥手", "准备点"]`` —— 数组
+    - ``"挥手"`` —— 单个字符串 (模型有时会偷懒)
+    - ``["挥手", "挥手"]`` —— 重复 (去重但保序)
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        items = [raw]
+
+    out: List[str] = []
+    for item in items:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 # ------------------------------------------------------------ tool 定义构建
@@ -192,24 +255,32 @@ def build_arm_spec(cfg: Any) -> Optional[ActionSpec]:
         kind=KIND_ARM,
         label="机械臂动作",
         description=(
-            "让机械臂执行一个预置动作。"
+            "让机械臂执行预置动作。"
             f"可用动作: {'; '.join(say_lines)}。"
+            "用户要求多个动作时, 按他说的先后顺序填进 actions 数组 "
+            "(如「先准备点再挥手」-> [\"准备点\", \"挥手\"])。"
             "只在用户明确要求机器人做出这些动作时调用。"
         ),
         parameters={
             "type": "object",
             "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": names,
-                    "description": "要执行的动作名",
+                "actions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": names,
+                    },
+                    "description": (
+                        "要依次执行的动作名, 按用户说的顺序。"
+                        "只要求一个动作时也用这个字段, 填单元素数组。"
+                    ),
                 },
                 "speed": {
                     "type": "number",
                     "description": "播放倍速, 1.0 是原速, 范围 0.1~3.0",
                 },
             },
-            "required": ["action"],
+            "required": ["actions"],
         },
         speak=True,
         intent=INTENT_BY_KIND[KIND_ARM],
@@ -356,16 +427,25 @@ class ActionCatalog:
 
     async def _execute_arm(self, spec: ActionSpec, args: Dict[str, Any]) -> ActionOutcome:
         """执行机械臂动作 (走 device_handler, 内含安全门阀)。"""
-        action = str(args.get("action") or "")
         if self._device_handler is None:
             raise ActionError("机械臂分支未装载")
 
+        # 参数名是 actions (数组) —— 多个动作按顺序依次执行
+        raw = args.get("actions")
+        if raw is None:
+            # 兼容旧格式 (单数)
+            raw = args.get("action")
+        names = _as_name_list(raw)
+        if not names:
+            raise ActionError("没指定要执行的动作")
+
         # 复用 device_handler 的实现 —— 规则路径与 tool calling 路径
         # 共用同一份安全门阀预检与播报文案, 行为完全一致。
-        result = await self._device_handler.execute(action, args, source="tool_call")
+        result = await self._device_handler.execute_many(names, args, source="tool_call")
+        primary = names[0]
         return ActionOutcome(
             ok=(result.action or {}).get("status") in ("ok",),
-            action=action,
+            action=primary,
             reply=result.reply,
             speak=bool(result.speak),
             detail=str((result.action or {}).get("detail") or ""),

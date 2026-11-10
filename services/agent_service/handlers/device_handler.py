@@ -88,8 +88,45 @@ class DeviceHandler(Handler):
                 return True
         return False
 
+    def _match_all(self, text: str) -> List[Tuple[str, int]]:
+        """返回句子里命中的**所有**动作, 按在文本中的位置排序。
+
+        返回 [(动作名, 首次出现位置), ...]。
+
+    **为什么要按位置而不是按长度**: 用户说「先准备点然后挥挥手」,
+    「准备点」在前面「挥手」在后面 —— 顺序就是用户要的执行顺序。
+    按长度排会丢掉顺序信息。
+
+    去重: 同一条说法可能被多个短语命中 (如「挥挥手」同时命中
+    「挥手」和「挥挥手」), 同一个动作只算一次。
+    """
+        text = (text or "").strip()
+        if not text or self._is_question(text):
+            return []
+
+        # (动作名, 位置) —— 取该动作所有命中里**最早**的位置
+        hits: Dict[str, int] = {}
+        for phrase, action in self._phrases:
+            if not phrase:
+                continue
+            pos = text.find(phrase)
+            if pos < 0:
+                continue
+            if action not in hits or pos < hits[action]:
+                hits[action] = pos
+
+        # 精确等于动作名 —— 整个句子就是动作名
+        if text in self._action_names:
+            return [(text, 0)]
+
+        return sorted(hits.items(), key=lambda kv: kv[1])
+
     def _match(self, text: str) -> Tuple[Optional[str], str]:
-        """返回 (动作名, 匹配方式)。匹配不到返回 (None, "")。"""
+        """返回 (动作名, 匹配方式)。匹配不到返回 (None, "")。
+
+        **只返回一个动作** —— 复合指令 (「先A再B」) 由 `_match_all()` 处理,
+        或者交给 tool calling 解析 (见 `classify`)。
+        """
         text = (text or "").strip()
         if not text:
             return None, ""
@@ -119,7 +156,25 @@ class DeviceHandler(Handler):
         return None, ""
 
     async def classify(self, req: AgentRequest) -> float:
-        """能匹配到机械臂动作才认可。"""
+        """能匹配到机械臂动作才认可。
+
+        **复合指令 (命中多个动作) 也认可** —— 规则路径按动作在句子里出现的
+        位置排序, 零延迟, 不依赖 LLM。
+
+        为什么要这样: 之前复合指令一律返回 0.0 升级到 tool calling, 结果是
+        复合指令**完全依赖 LLM** —— LLM 限流 (429) 或超时时, 整句话掉到
+        chat 分支, 机器人什么都不做。位置排序虽然不如模型懂时序, 但
+        「先A再B」这种最常见的说法位置排序就是对的, 没必要为它付 LLM 的
+        延迟与失败风险。
+        """
+        hits = self._match_all(req.text)
+        if len(hits) > 1:
+            logger.info(
+                "[机械臂] 命中 %d 个动作 (%s), 规则路径按位置排序",
+                len(hits),
+                ", ".join(a for a, _ in hits),
+            )
+            return 1.0
         name, _ = self._match(req.text)
         if name:
             return 1.0
@@ -130,6 +185,25 @@ class DeviceHandler(Handler):
 
     async def handle(self, req: AgentRequest) -> BranchResult:
         started = time.time()
+
+        # 先看是不是复合指令 (命中多个动作)
+        hits = self._match_all(req.text)
+        if len(hits) > 1:
+            # 复合指令: 按文本位置排序执行。
+            #
+            # 规则匹配只能拿到「有哪些动作」和它们的**大致**先后 (按在句子里
+            # 出现的位置)。像「挥完手再准备点」这种带明确时序的复杂说法,
+            # 位置排序可能不准 —— 但比起丢掉一个动作, 顺序错的风险小得多。
+            #
+            # 这条路径**不依赖 LLM** —— LLM 限流时复合指令照样能执行。
+            names = [a for a, _ in hits]
+            logger.info("[机械臂] 复合指令: %s", " -> ".join(names))
+            result = await self.execute_many(names, source="phrase")
+            result.trace.insert(
+                0, self._trace("match", (time.time() - started) * 1000, "multi")
+            )
+            return result
+
         name, how = self._match(req.text)
 
         if name is None:
@@ -154,8 +228,6 @@ class DeviceHandler(Handler):
                     ],
                 )
 
-        client = self._get_client()
-
         # 执行交给 execute() —— tool calling 路径也走它, 保证两条路径
         # 的安全门阀行为与播报文案完全一致。
         result = await self.execute(name, source=how)
@@ -170,16 +242,37 @@ class DeviceHandler(Handler):
         args: Optional[Dict[str, Any]] = None,
         source: str = "rule",
     ) -> BranchResult:
-        """执行一个已确定的动作名。
+        """执行一个已确定的动作名。"""
+        return await self.execute_many([name], args=args, source=source)
+
+    async def execute_many(
+        self,
+        names: List[str],
+        args: Optional[Dict[str, Any]] = None,
+        source: str = "rule",
+    ) -> BranchResult:
+        """执行一组已确定的动作 (按顺序)。
 
         **规则匹配路径与 tool calling 路径共用这一份实现** ——
         安全门阀预检、下发、播报文案全都一样, 两条路径不会出现行为差异。
+
+        多个动作时整个队列**只入控一次** (arm_service 内部处理),
+        动作之间不松手。
 
         `source` 只用于日志与 trace (rule / tool_call / llm)。
         """
         started = time.time()
         args = args or {}
+        names = [str(n).strip() for n in (names or []) if str(n).strip()]
+        if not names:
+            return BranchResult(
+                reply="没指定要执行的动作。",
+                speak=True,
+                action={"name": "none", "args": {}, "status": "failed", "speak": True},
+                trace=[self._trace("execute", 0.0, "no-action")],
+            )
         client = self._get_client()
+        primary = names[0]
 
         # ---- 安全门阀预检 ----
         #
@@ -189,12 +282,12 @@ class DeviceHandler(Handler):
         safety = await client.check_safety()
         if not safety.get("ok", True):
             reason = str(safety.get("reason") or "机械臂现在不能动")
-            logger.warning("[机械臂] 安全门阀拒绝 %r (%s): %s", name, source, reason)
+            logger.warning("[机械臂] 安全门阀拒绝 %r (%s): %s", primary, source, reason)
             return BranchResult(
                 reply=f"{reason}，请先处理一下",
                 speak=True,
                 action={
-                    "name": name,
+                    "name": primary,
                     "args": args,
                     "status": "blocked",
                     "detail": reason,
@@ -205,20 +298,20 @@ class DeviceHandler(Handler):
                     self._trace(
                         "safety",
                         (time.time() - started) * 1000,
-                        f"{name}:{safety.get('code')}",
+                        f"{primary}:{safety.get('code')}",
                     )
                 ],
             )
 
         try:
-            body = await client.play(name)
+            body = await client.play_many(names)
         except ArmError as exc:
             logger.error("[机械臂] 下发失败: %s", exc)
             return BranchResult(
                 reply="机械臂现在动不了，请稍后再试。",
                 speak=True,
                 action={
-                    "name": name,
+                    "name": primary,
                     "args": args,
                     "status": "failed",
                     "detail": str(exc),
@@ -226,33 +319,36 @@ class DeviceHandler(Handler):
                 },
                 trace=[
                     self._trace(
-                        "execute", (time.time() - started) * 1000, f"{name}:failed"
+                        "execute", (time.time() - started) * 1000, f"{primary}:failed"
                     )
                 ],
             )
 
         duration = body.get("duration", 0)
         logger.info(
-            "[机械臂] 已下发 %r (%s, %.1fs), 服务端 phase=%s",
-            name,
+            "[机械臂] 已下发 %s (%s, %.1fs), 服务端 phase=%s",
+            " -> ".join(names),
             source,
             duration,
             body.get("phase"),
         )
+        # 多个动作时把整串念出来 —— 用户要知道接下来会做什么
+        reply = f"好的，{'、'.join(names)}"
         return BranchResult(
-            reply=f"好的，{name}",
+            reply=reply,
             speak=True,
             action={
-                "name": name,
+                "name": primary,
                 "args": args,
                 "status": "ok",
                 "duration": duration,
+                "actions": names,
                 "matched_by": source,
                 "speak": True,
             },
             trace=[
                 self._trace(
-                    "execute", (time.time() - started) * 1000, f"{name}:ok"
+                    "execute", (time.time() - started) * 1000, f"{primary}:ok"
                 )
             ],
         )

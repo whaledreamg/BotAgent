@@ -101,6 +101,18 @@ class ArmService:
         self._loop = False
         self._speed = 1.0
 
+        # ---- 播放队列 ----
+        #
+        # 队列里存的是**还没播**的动作名。整个队列只入控一次, 动作之间
+        # 不松手 —— 机械臂运动连贯, 也省掉每个动作重新入控的 700ms 对齐开销。
+        self._queue: List[str] = []
+        #: 队列里所有动作 (含正在播的), 用于状态查询
+        self._queue_all: List[str] = []
+        #: 队列的总时长
+        self._queue_duration: float = 0.0
+        #: 当前队列中正在播的那个是不是最后一个 (最后一个播完就要停控)
+        self._queue_started: bool = False
+
         # WebSocket 订阅者
         self._subscribers: List[Any] = []
         self._sub_lock = threading.Lock()
@@ -362,9 +374,36 @@ class ArmService:
 
     # ------------------------------------------------------------ 播放
 
-    def play(self, action_name: str, speed: float = 1.0, loop: bool = False) -> Dict[str, Any]:
-        """下发播放。立即返回, 实际播放在后台线程进行。"""
-        unit = self.library.get(action_name)   # 抛 ActionNotFound
+    def play(
+        self,
+        action_name: str,
+        speed: float = 1.0,
+        loop: bool = False,
+    ) -> Dict[str, Any]:
+        """下发播放 (单个动作)。立即返回, 实际播放在后台线程进行。"""
+        return self.play_many([action_name], speed=speed, loop=loop)
+
+    def play_many(
+        self,
+        action_names: List[str],
+        speed: float = 1.0,
+        loop: bool = False,
+    ) -> Dict[str, Any]:
+        """下发播放 (动作队列)。立即返回, 实际播放在后台线程进行。
+
+        **整个队列只入控一次** —— 动作之间不松手, 机械臂运动连贯,
+        也省掉每个动作重新入控的 700ms S 曲线对齐开销。
+
+        每个动作播完时重新取一次实测关节角作为下一个动作的起点 ——
+        轨迹不落盘起始姿态, 避免把机器人拽到某个固定姿态上去。
+        """
+        names = [str(x).strip() for x in (action_names or []) if str(x).strip()]
+        if not names:
+            raise ActionNotFound("动作名为空")
+
+        # 全部动作先查一遍 —— 有不存在的就别开始了, 免得播到一半才发现
+        units = [self.library.get(name) for name in names]
+        total_duration = sum(u.duration for u in units)
 
         with self._lock:
             if self._play_thread is not None and self._play_thread.is_alive():
@@ -373,30 +412,47 @@ class ArmService:
             self._stop_requested = False
             self._loop = loop
             self._speed = max(0.1, min(3.0, speed))
-            self._current_action = unit.label
-            self._current_key = unit.key
-            self._current_duration = unit.duration
+            self._current_action = units[0].label
+            self._current_key = units[0].key
+            self._current_duration = units[0].duration
+
+            # 队列里存**还没播**的动作 (第一个马上要播, 不入队)
+            self._queue = [u.label for u in units[1:]]
+            self._queue_all = [u.label for u in units]
+            self._queue_duration = total_duration
+            self._queue_started = False
 
             thread = threading.Thread(
                 target=self._play_loop,
-                args=(unit,),
+                args=(units[0],),
                 name="arm-playback",
                 daemon=True,
             )
             self._play_thread = thread
 
         thread.start()
+        logger.info(
+            "[服务] 下发播放队列 (%d 个动作, 共 %.2fs): %s",
+            len(units),
+            total_duration,
+            " -> ".join(u.label for u in units),
+        )
         return {
             "ok": True,
-            "action": unit.label,
-            "key": unit.key,
-            "duration": round(unit.duration, 3),
+            "action": units[0].label,
+            "key": units[0].key,
+            "duration": round(total_duration, 3),
+            "actions": [u.label for u in units],
             "phase": Phase.ENTERING,
             "message": "",
         }
 
     def _play_loop(self, unit: ActionUnit) -> None:
-        """后台播放线程。"""
+        """后台播放线程。
+
+        播完当前动作后, 如果队列里还有, 就接着播下一个 ——
+        **不重新入控**, 直接推新轨迹。
+        """
         try:
             self._do_play(unit)
         except ActionNotFound as exc:
@@ -507,6 +563,11 @@ class ArmService:
         threading.Thread(target=_worker, name="arm-notify", daemon=True).start()
 
     def _do_play(self, unit: ActionUnit) -> None:
+        """播放一个动作 (队列里的第一个)。
+
+        之后如果队列里还有, 由 `_play_next_in_queue()` 接着播 ——
+        **不重新入控**。
+        """
         # ---- 1. 确保控制器连接 ----
         if not self._conn.connected:
             self._controller._set_phase(Phase.CONNECTING, "正在连接控制器")
@@ -608,11 +669,24 @@ class ArmService:
 
         # 对齐完成, 现在才推进时间轴
         engine.start()
+        with self._lock:
+            self._queue_started = True
 
         # ---- 7. 播放循环 ----
+        self._run_engine(engine)
+
+        # ---- 8. 队列推进 ----
+        #
+        # 当前动作播完。如果队列里还有下一个, 就接着播 —— **不重新入控**,
+        # 直接推新轨迹。这样整个队列只入控一次, 动作之间不松手。
+        if not self._stop_requested:
+            self._play_next_in_queue()
+
+    def _run_engine(self, engine: PlaybackEngine) -> None:
+        """推进一个时间轴直到播完 (或被停止)。"""
         while True:
             if self._stop_requested:
-                break
+                return
             # 倍速: 用缩放后的时间推进
             if self._speed != 1.0:
                 engine._accumulated_ms += TICK_MS * (self._speed - 1.0)
@@ -621,10 +695,92 @@ class ArmService:
                 if self._loop and not self._stop_requested:
                     engine.start()
                     continue
-                break
+                return
             time.sleep(TICK_MS / 1000.0)
 
-        self._stop_playback(silent=True)
+    def _play_next_in_queue(self) -> None:
+        """播队列里的下一个动作。
+
+        **不重新入控** —— 控制器通道还开着, 直接推新轨迹即可。
+
+        下一个动作的起点取**当前实测姿态** (上一个动作刚停下的位置),
+        轨迹不落盘起始姿态, 避免把机器人拽到某个固定姿态上去。
+        """
+        with self._lock:
+            if not self._queue:
+                # 队列空了 -> 收尾: 停控交还通道
+                self._stop_playback(silent=True)
+                return
+            next_name = self._queue.pop(0)
+            self._current_action = next_name
+
+        unit = self.library.find(next_name)
+        if unit is None:
+            logger.warning("[服务] 队列里的动作 %r 不存在, 跳过", next_name)
+            self._play_next_in_queue()
+            return
+
+        with self._lock:
+            self._current_key = unit.key
+            self._current_duration = unit.duration
+
+        logger.info("[服务] 队列继续: %s (还剩 %d 个)", unit.label, len(self._queue))
+
+        # ---- 每个动作切换前再查一次门阀 ----
+        #
+        # 队列可能播十几秒, 期间用户可能按了急停。下一个动作带故障去播,
+        # 后果比第一个动作更严重。
+        report = self.check_safety()
+        if not report.ok:
+            logger.warning("[门阀] 队列中断 (%s): %s", unit.label, report.reason)
+            self._speak_reject(report)
+            self._controller._fail(f"安全门阀拒绝执行: {report.reason}")
+            self._stop_playback(silent=True)
+            return
+
+        # ---- 构造新时间轴 (起点 = 当前实测姿态) ----
+        origin = self._origin_pose()
+        model = unit.to_timeline(origin)
+        engine = PlaybackEngine(
+            model,
+            on_frame=self._on_frame,
+            on_finished=self._on_playback_finished,
+        )
+        with self._lock:
+            self._engine = engine
+
+        # ---- 冻结起点 -> 对齐 -> 播放 ----
+        #
+        # 这里仍然要对齐 —— 控制器要求第一帧必须贴近实测角, 否则拒收
+        # (firstFrameJumpRejected)。对齐期间机器人平滑过渡到新轨迹起点。
+        start_frame = engine.prime_start_frame()
+        self._controller.push_frame(start_frame)
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if self._controller.advance_lead_in():
+                break
+            if self._stop_requested:
+                self._stop_playback(silent=True)
+                return
+            if self._controller.failed:
+                raise ControllerError(self._controller.last_error or "入控失败")
+            time.sleep(TICK_MS / 1000.0)
+
+        if not self._controller.playback_active:
+            if self._stop_requested:
+                self._stop_playback(silent=True)
+                return
+            if self._controller.failed:
+                raise ControllerError(self._controller.last_error or "入控失败")
+            raise ControllerError("起点对齐超时")
+
+        engine.start()
+        self._run_engine(engine)
+
+        # 播完, 继续下一个
+        if not self._stop_requested:
+            self._play_next_in_queue()
 
     def _origin_pose(self) -> JointState:
         """当前实测姿态, 作为轨迹的出发姿态。
@@ -649,10 +805,25 @@ class ArmService:
         self._broadcast({"type": "finished"})
 
     def stop(self) -> Dict[str, Any]:
-        """停止播放并交还通道。"""
-        was_playing = self._play_thread is not None and self._play_thread.is_alive()
+        """停止播放并交还通道。
+
+        **返回时播放线程已经退出** —— 这是 API 契约的一部分。
+        不等的话, 调用方紧接着下发新指令会撞上「已有动作正在播放」(409),
+        因为播放线程要等到下一次 tick (最长 16ms) 才看到停止标志。
+        """
+        with self._lock:
+            thread = self._play_thread
+        was_playing = thread is not None and thread.is_alive()
+
         self._stop_requested = True
         self._stop_playback(silent=True)
+
+        # 等播放线程真的退出 (不持锁, 免得和线程里的加锁操作互等)
+        if was_playing and thread is not None:
+            thread.join(timeout=3.0)
+            if thread.is_alive():  # pragma: no cover - 极端情况
+                logger.warning("[服务] 播放线程未在 3s 内退出")
+
         return {
             "ok": True,
             "phase": Phase.IDLE,
@@ -660,11 +831,19 @@ class ArmService:
         }
 
     def _stop_playback(self, silent: bool = False) -> None:
-        """停掉时间轴并停控交还通道。"""
+        """停掉时间轴并停控交还通道。
+
+        队列也一并清空 —— 停了就意味着后面的都不播了。
+        """
         with self._lock:
             engine = self._engine
             self._engine = None
             self._current_action = None
+            # 清空队列
+            self._queue = []
+            self._queue_all = []
+            self._queue_duration = 0.0
+            self._queue_started = False
 
         if engine is not None:
             try:
@@ -687,6 +866,9 @@ class ArmService:
             engine = self._engine
             action = self._current_action
             duration = self._current_duration
+            queue = list(self._queue)
+            queue_all = list(self._queue_all)
+            queue_duration = self._queue_duration
 
         current_time = engine.current_time if engine is not None else 0.0
         total = engine.total_duration if engine is not None else duration
@@ -706,6 +888,10 @@ class ArmService:
             "last_error": self._controller.last_error,
             # 最近一次安全门阀检查结果 (没查过就是 None)
             "safety": self._last_safety.to_dict() if self._last_safety else None,
+            # 队列状态: queue 是还没播的, queue_all 是整个队列
+            "queue": queue,
+            "queue_total": len(queue_all),
+            "queue_duration": round(queue_duration, 3),
         }
 
     def health(self) -> Dict[str, Any]:

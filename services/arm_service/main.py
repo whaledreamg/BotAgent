@@ -103,9 +103,16 @@ async def list_actions() -> Dict[str, Any]:
 
 @app.post("/v1/play", response_model=PlayResponse)
 async def play(req: PlayRequest) -> Dict[str, Any]:
+    """下发播放。
+
+    传 ``action`` 播一个动作, 传 ``actions`` 播一串 (按顺序, 只入控一次)。
+    """
     svc = _svc()
+    actions = req.action_list()
+    if not actions:
+        raise HTTPException(status_code=400, detail="没指定动作")
     try:
-        return svc.play(req.action, speed=req.speed, loop=req.loop)
+        return svc.play_many(actions, speed=req.speed, loop=req.loop)
     except ActionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ControllerError as exc:

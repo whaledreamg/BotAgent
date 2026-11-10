@@ -127,6 +127,24 @@ services/arm_service/data/零点.json   →  动作 "零点"
 新增动作：往 `data/` 放 `<动作名>.json`，再在 `configs/actions.yaml` 加一条
 说法映射。
 
+### 复合指令（动作队列）
+
+一句话说了多个动作时，Agent 解析成**有序动作列表**，arm_service 排成队列播：
+
+```
+"先准备点然后挥挥手"  ->  ["准备点", "挥手"]  ->  依次播放
+```
+
+整个队列**只入控一次**——动作之间不松手，机械臂运动连贯。播报是一次性总览：
+「好的，准备点、挥手」。
+
+```bash
+# 直接下发队列
+curl -s -X POST http://127.0.0.1:8802/v1/play \
+  -H 'Content-Type: application/json' \
+  -d '{"actions":["准备点","挥手"]}'
+```
+
 ### 音色与模型
 
 **TTS 的音色和模型都在 `configs/tts.yaml` 里**，改配置重启服务即可：
