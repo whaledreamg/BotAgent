@@ -187,7 +187,7 @@ arm:
 ## 启动
 
 ```bash
-# 四个服务一起起（会等健康检查通过）
+# 五个服务一起起（会等健康检查通过）
 ./scripts/start_all.sh
 
 # 或分别启动
@@ -195,10 +195,14 @@ arm:
 ./scripts/start_agent.sh    # env botagent, :8800
 ./scripts/start_asr.sh      # env asrt, :8801
 ./scripts/start_arm.sh      # env botagent, :8802
+./scripts/start_vision.sh   # env yolo, :8803  (相机独占, 排在 Arm 之后)
 
 # 停止
 ./scripts/stop_all.sh
 ```
+
+> **Vision 排在 Arm 之后** —— 视觉服务的动态外参要连 `arm_service` 拿
+> 臂基座 / 头位姿，Arm 先起来它才拿得到。
 
 ### 端到端自检
 

@@ -121,6 +121,19 @@ class ArmService:
         #: 最近一次查询 robot/status 的臂名 (应答里没有 name 字段, 只能记住)
         self._status_query_arm = ""
 
+        # ---- 运动学快照 (手眼标定用) ----
+        #
+        # 标定时需要「工具在世界系下的位姿」来当量尺, 控制器给的是
+        # `robot/status.cartesian` (世界系) + `baseFrame` (臂基座在世界系下
+        # 的位姿) + `baseFrameKind` (静态/随父机动态派生)。
+        #
+        # 这些数据之前只存在于状态推送里, 没被存下来 —— 标定脚本没法用。
+        # 这里把每条臂的最近一次状态存一份, 通过 /v1/kinematics 暴露出去。
+        self._kin: Dict[str, Dict[str, Any]] = {}
+        self._kin_lock = threading.Lock()
+        #: 升降柱状态 (相机装在升降柱顶端时要做动态补偿)
+        self._column: Optional[Dict[str, Any]] = None
+
         # ---- 安全门阀 ----
         #
         # 动作执行前必须先检查控制器状态: 急停、安全锁定、伺服故障、没使能
@@ -184,6 +197,10 @@ class ArmService:
         if "enabled" in state and name:
             self._controller.set_arm_enabled(name, bool(state.get("enabled")))
 
+        # 运动学快照: 状态推送里带 cartesian / baseFrame, 标定要用
+        if name:
+            self._record_kinematics(name, state)
+
         joints = state.get("joints")
         if not isinstance(joints, list) or len(joints) < JOINT_COUNT:
             return
@@ -192,6 +209,100 @@ class ArmService:
         except (TypeError, ValueError):
             return
         self._controller.set_actual_joints(str(name), values)
+
+    def _record_kinematics(self, name: str, payload: Dict[str, Any]) -> None:
+        """记一条臂的运动学快照。
+
+        只挑标定用得上的字段, 避免把整包状态推存下来 (推送很频繁)。
+
+        - ``joints``         实测关节角 (rad)
+        - ``cartesian``      TCP 位姿, **世界系** {x,y,z,a,b,c}
+        - ``baseFrame``      臂基座在世界系下的位姿 {x,y,z,a,b,c}
+        - ``baseFrameKind``  ``static`` / ``derived``
+        """
+        entry: Dict[str, Any] = {}
+
+        joints = payload.get("joints")
+        if isinstance(joints, list):
+            try:
+                entry["joints"] = [float(v) for v in joints]
+            except (TypeError, ValueError):
+                pass
+
+        cart = payload.get("cartesian")
+        if isinstance(cart, dict):
+            entry["cartesian"] = {
+                k: float(cart.get(k, 0.0) or 0.0)
+                for k in ("x", "y", "z", "a", "b", "c")
+            }
+            # 七轴臂的臂型角 (rad), 有就带上
+            if "e" in cart:
+                try:
+                    entry["cartesian"]["e"] = float(cart.get("e"))
+                except (TypeError, ValueError):
+                    pass
+
+        base = payload.get("baseFrame")
+        if isinstance(base, dict):
+            entry["base_frame"] = {
+                k: float(base.get(k, 0.0) or 0.0)
+                for k in ("x", "y", "z", "a", "b", "c")
+            }
+
+        kind = payload.get("baseFrameKind")
+        if kind:
+            entry["base_frame_kind"] = str(kind)
+
+        # 头/相机安装座在世界系下的位姿 (头会动时, 视觉服务做补偿要用)。
+        #
+        # **控制器的字段名目前没确认过** —— 所以这里把几种可能的键名都认了,
+        # 拿到哪个用哪个, 一个都没有就不给 (而不是编一个)。
+        for key in ("headFrame", "headBaseFrame", "headFramePose"):
+            head = payload.get(key)
+            if isinstance(head, dict):
+                entry["head_frame"] = {
+                    k: float(head.get(k, 0.0) or 0.0)
+                    for k in ("x", "y", "z", "a", "b", "c")
+                }
+                hk = payload.get(f"{key}Kind")
+                if hk:
+                    entry["head_frame_kind"] = str(hk)
+                break
+
+        for key in ("enabled", "mode", "faulted"):
+            if key in payload:
+                entry[key] = payload.get(key)
+
+        if not entry:
+            return
+
+        with self._kin_lock:
+            existing = self._kin.get(name, {})
+            existing.update(entry)
+            existing["timestamp_ms"] = int(time.monotonic() * 1000)
+            self._kin[name] = existing
+
+    def _record_column(self, payload: Dict[str, Any]) -> None:
+        """记升降柱状态 (相机装在升降柱顶端时做动态补偿要用)。"""
+        entry: Dict[str, Any] = {}
+        for key in ("name", "online", "enabled", "fault", "moving", "targetReached"):
+            if key in payload:
+                entry[key] = payload.get(key)
+        if "height" in payload:
+            try:
+                entry["height"] = float(payload.get("height"))
+            except (TypeError, ValueError):
+                pass
+        if "errorCode" in payload:
+            try:
+                entry["error_code"] = int(payload.get("errorCode"))
+            except (TypeError, ValueError):
+                pass
+        if not entry:
+            return
+        with self._kin_lock:
+            entry["timestamp_ms"] = int(time.monotonic() * 1000)
+            self._column = entry
 
     def _on_controller_event(self, action: str, response: Dict[str, Any]) -> None:
         """收到控制器的请求-响应。"""
@@ -207,6 +318,10 @@ class ArmService:
             self._handle_realtime_status(db, response)
         elif action == "realtime/startControl":
             self._handle_start_control(db, response)
+        elif action == "liftingColumn/getState":
+            self._handle_column_state(db)
+        elif action == "liftingColumn/list":
+            self._handle_column_list(db)
 
     def _handle_robot_list(self, db: Any) -> None:
         """从 robot/list 识别左右臂。
@@ -280,6 +395,10 @@ class ArmService:
         if "enabled" in db and name:
             self._controller.set_arm_enabled(name, bool(db.get("enabled")))
 
+        # 运动学快照 (标定要用)
+        if name:
+            self._record_kinematics(name, db)
+
         joints = db.get("joints")
         if not isinstance(joints, list) or len(joints) < JOINT_COUNT:
             return
@@ -288,6 +407,36 @@ class ArmService:
         except (TypeError, ValueError):
             return
         self._controller.set_actual_joints(name, values)
+
+    def _handle_column_list(self, db: Any) -> None:
+        """处理 liftingColumn/list 的应答。
+
+        升降柱是独立设备, 名字 (比如 "Column") 要记下来, 后面查状态要用。
+        """
+        items: List[Any] = []
+        if isinstance(db, list):
+            items = db
+        elif isinstance(db, dict):
+            raw = db.get("items")
+            if isinstance(raw, list):
+                items = raw
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            with self._kin_lock:
+                column = self._column or {}
+                column.setdefault("name", name)
+                column["online"] = bool(item.get("online", True))
+                self._column = column
+            break
+
+    def _handle_column_state(self, db: Any) -> None:
+        """处理 liftingColumn/getState 的应答。"""
+        if isinstance(db, dict):
+            self._record_column(db)
 
     def _handle_realtime_status(self, db: Any, response: Dict[str, Any]) -> None:
         """处理 realtime/getStatus 的响应。
@@ -904,6 +1053,116 @@ class ArmService:
             "streaming": self._controller.streaming,
             "safety_enabled": self.cfg.safety.enabled,
         }
+
+    # ------------------------------------------------------------ 运动学
+
+    def kinematics(self) -> Dict[str, Any]:
+        """运动学快照 —— 手眼标定要用的位姿数据。
+
+        每条臂给出:
+        - ``joints``          实测关节角 (rad)
+        - ``cartesian``       TCP 位姿, **世界系** {x,y,z,a,b,c}
+        - ``base_frame``      臂基座在世界系下的位姿 {x,y,z,a,b,c}
+        - ``base_frame_kind`` ``static`` / ``derived``
+
+        **为什么不给笛卡尔积的世界位姿之外的东西**: 控制器
+        `robot/status.cartesian` 就是世界系的 TCP 位姿, 这是标定需要的
+        「量尺」。而 `base_frame` 用来把「臂基座系」和「世界系」连起来 ——
+        相机装在躯干上时, 相机到臂基座的相对关系是固定的, 但臂基座到
+        世界系会随升降柱/挂接安装变化。
+
+        ``base_frame_kind == "derived"`` 说明臂基座是挂接在父机器人上的,
+        基座本身在动 —— 这时静态外参不成立, 必须用这里的动态值。
+        """
+        with self._kin_lock:
+            arms = {name: dict(data) for name, data in self._kin.items()}
+            column = dict(self._column) if self._column else None
+            # 头/相机安装座: 优先用任一条臂状态里带的 headFrame
+            head_frame: Optional[Dict[str, float]] = None
+            head_frame_kind = ""
+            for data in arms.values():
+                hf = data.get("head_frame")
+                if isinstance(hf, dict):
+                    head_frame = dict(hf)
+                    head_frame_kind = str(data.get("head_frame_kind") or "")
+                    break
+
+        notes: List[str] = []
+        if not arms:
+            notes.append("还没有收到任何机器人的状态快照")
+        else:
+            missing = [
+                name for name, data in arms.items()
+                if "cartesian" not in data
+            ]
+            if missing:
+                notes.append(
+                    "这些臂还没有 cartesian (TCP 世界系位姿): " + ", ".join(missing)
+                )
+            derived = [
+                name for name, data in arms.items()
+                if data.get("base_frame_kind") == "derived"
+            ]
+            if derived:
+                notes.append(
+                    "这些臂是挂接安装 (base_frame_kind=derived), 基座在动, "
+                    "静态外参不成立: " + ", ".join(derived)
+                )
+
+        if column is None:
+            notes.append("没有升降柱状态 (控制器上可能没有配升降柱)")
+
+        if head_frame is None:
+            notes.append(
+                "没有头/相机安装座位姿 (headFrame) —— 头会动的话需要控制器提供"
+            )
+
+        return {
+            "ok": bool(arms),
+            "arms": arms,
+            "lifting_column": column,
+            "head_frame": head_frame,
+            "head_frame_kind": head_frame_kind,
+            "controller_connected": self._conn.connected,
+            "timestamp_ms": int(time.monotonic() * 1000),
+            "notes": notes,
+        }
+
+    def refresh_kinematics(self) -> Dict[str, Any]:
+        """主动拉一次运动学数据并返回。
+
+        标定脚本用这个: 每采一个位姿就调一次, 拿到的是**当下**的
+        TCP 位姿 (状态推送有延迟, 推送周期 50ms, 快速运动时不够准)。
+        """
+        if not self._conn.connected:
+            return self.kinematics()
+
+        for name in self._controller.active_arms():
+            self._conn.get_robot_status(name)
+
+        # 升降柱
+        column = None
+        with self._kin_lock:
+            column = dict(self._column) if self._column else None
+        if column and column.get("name"):
+            self._conn.send_command(
+                "liftingColumn/getState", {"device": column.get("name")}
+            )
+        elif not column:
+            self._conn.send_command("liftingColumn/list", {})
+
+        # 等一小会儿让应答回来 (应答在读线程里处理)
+        deadline = time.time() + 0.6
+        while time.time() < deadline:
+            with self._kin_lock:
+                arms = dict(self._kin)
+            if arms:
+                # 关节角更新过就说明应答到了
+                time.sleep(0.05)
+                break
+            time.sleep(0.05)
+
+        return self.kinematics()
 
 
 def _arm_of(robot_name: str) -> str:

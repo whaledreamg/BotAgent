@@ -200,13 +200,46 @@ class LLMClient:
                         return resp.json()
                     except ValueError as exc:
                         last_err = LLMError(f"响应不是合法 JSON: {exc}")
-                elif resp.status_code in (429, 500, 502, 503, 504):
+                elif resp.status_code == 429:
+                    # **速率限制** —— 免费额度下很常见。
+                    #
+                    # 关键: 429 必须等**更久**。之前用的 2**attempt 秒
+                    # (1s) 对限流窗口来说太短, 重试必然再撞 429, 表现
+                    # 就是「required 重试失败」—— 但根因不是重试逻辑有问题,
+                    # 而是被限流了。
+                    #
+                    # 这里按 (attempt+1) * 2.5 秒退避, 并且尊重服务端
+                    # 给的 Retry-After (如果���)。
+                    wait = self._retry_after(resp, attempt)
+                    last_err = LLMError(f"HTTP 429 速率限制: {resp.text[:200]}")
+                    if attempt < self.cfg.max_retries - 1:
+                        logger.warning(
+                            "LLM 触发速率限制, %.1fs 后重试 (%d/%d)",
+                            wait, attempt + 1, self.cfg.max_retries,
+                        )
+                        await _sleep(wait)
+                        continue
+                elif resp.status_code in (500, 502, 503, 504):
                     last_err = LLMError(f"HTTP {resp.status_code}: {resp.text[:500]}")
                 else:
                     raise LLMError(f"HTTP {resp.status_code}: {resp.text[:500]}")
             if attempt < self.cfg.max_retries - 1:
                 await _sleep(2 ** attempt)
         raise last_err or LLMError("请求失败")
+
+    @staticmethod
+    def _retry_after(resp: httpx.Response, attempt: int) -> float:
+        """429 之后该等多久。
+
+        优先用服务端的 Retry-After 头; 没有就用指数退避 (2.5s / 5s / ...)。
+        """
+        header = resp.headers.get("Retry-After")
+        if header:
+            try:
+                return max(0.5, float(header))
+            except (TypeError, ValueError):
+                pass
+        return 2.5 * (attempt + 1)
 
     # ------------------------------------------------------------- 公开
 

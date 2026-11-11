@@ -13,6 +13,7 @@ TTS_PORT="${TTS_PORT:-8000}"
 AGENT_PORT="${AGENT_PORT:-8800}"
 ASR_PORT="${ASR_PORT:-8801}"
 ARM_PORT="${ARM_PORT:-8802}"
+VISION_PORT="${VISION_PORT:-8803}"
 
 stop_one() {
     local name="$1" pidfile="$LOG_DIR/$1.pid"
@@ -56,18 +57,20 @@ stop_one tts
 stop_one agent
 stop_one asr
 stop_one arm
+stop_one vision
 
 stop_port tts "$TTS_PORT"
 stop_port agent "$AGENT_PORT"
 stop_port asr "$ASR_PORT"
 stop_port arm "$ARM_PORT"
+stop_port vision "$VISION_PORT"
 
 sleep 1
-if ss -ltnpH 2>/dev/null | grep -qE ":(${TTS_PORT}|${AGENT_PORT}|${ASR_PORT}|${ARM_PORT}) "; then
+if ss -ltnpH 2>/dev/null | grep -qE ":(${TTS_PORT}|${AGENT_PORT}|${ASR_PORT}|${ARM_PORT}|${VISION_PORT}) "; then
     echo "[warn] 仍有端口被占用:" >&2
-    ss -ltnpH 2>/dev/null | grep -E ":(${TTS_PORT}|${AGENT_PORT}|${ASR_PORT}|${ARM_PORT}) " >&2
+    ss -ltnpH 2>/dev/null | grep -E ":(${TTS_PORT}|${AGENT_PORT}|${ASR_PORT}|${ARM_PORT}|${VISION_PORT}) " >&2
 else
-    echo "[ok] 端口 ${TTS_PORT}/${AGENT_PORT}/${ASR_PORT}/${ARM_PORT} 均已释放"
+    echo "[ok] 端口 ${TTS_PORT}/${AGENT_PORT}/${ASR_PORT}/${ARM_PORT}/${VISION_PORT} 均已释放"
 fi
 
 echo "[done] 已停止全部服务"

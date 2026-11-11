@@ -1,0 +1,48 @@
+# 标定配置 (视觉服务)
+#
+# 这里的尺寸必须跟**实际打印出来**的板子一致 —— 量出来的, 不是标称的。
+# 打印缩放 2% 在 1.5 m 处就是 30 mm 的误差, 跟整个标定误差预算同量级。
+#
+# 生成标定板:
+#   conda run -n yolo python tools/make_board.py \
+#       --square 0.040 --marker 0.030 --cols 7 --rows 5
+#
+# 打印后用尺子量**相邻角点的距离**, 把量到的值填到 square_length。
+
+vision_calibration:
+  # ChArUco 标定板规格
+  board:
+    # 棋盘格边长 (米) —— 相邻角点的距离。
+    # 用尺子量打印结果, 把实际值填这里。
+    square_length: 0.040
+
+    # ArUco 标记边长 (米), 必须小于棋盘格边长。
+    marker_length: 0.030
+
+    # 棋盘格列数 / 行数 (角点列数 / 行数)
+    cols: 7
+    rows: 5
+
+    # ArUco 字典
+    dictionary: "DICT_4X4_50"
+
+  # 手眼标定参数
+  handeye:
+    # 目标坐标系: arm_base (机械臂基座系) / world (世界系)
+    target_frame: "arm_base"
+
+    # 相机在机械臂上的安装偏置 —— 装好后拍照测出来, 填进 matrix。
+    # 没有就保持 null (单位阵)。
+    camera_to_base_matrix: null
+
+  # 采集参数
+  capture:
+    # 每个位姿至少要检出多少个角点。低于 8 点的数据质量差, 直接跳过。
+    min_corners: 8
+
+    # 采一个位姿时, 机械臂要停稳到多少米以内才算静止。
+    # 控制器 TCP 读数精度约 1 mm, 所以 2 mm 是个合理的阈值。
+    settle_tolerance_m: 0.002
+
+    # 判定野值的阈值 (米)。超过就是坏位姿 (板被挡 / 读数抖动)。
+    outlier_threshold_m: 0.020

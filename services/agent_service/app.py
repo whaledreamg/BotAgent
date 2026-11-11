@@ -315,6 +315,14 @@ async def lifespan(app: FastAPI):
     finally:
         if service is not None:
             await service.llm.aclose()
+            # 各个分支可能持有 HTTP 客户端 (视觉/机械臂), 一起关掉
+            for handler in list(service.registry.all().values()):
+                closer = getattr(handler, "aclose", None)
+                if closer is not None:
+                    try:
+                        await closer()
+                    except Exception:  # pragma: no cover
+                        pass
 
 
 app = FastAPI(title="Bot Agent Service", version="1.0.0", lifespan=lifespan)

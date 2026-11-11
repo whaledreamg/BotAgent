@@ -19,6 +19,7 @@ GUI 程序里剥离出来, 做成与 TTS / ASR / Agent 并列的独立服务。
 | POST | `/v1/stop` | 停止播放并交还控制通道 |
 | GET  | `/v1/status` | 当前播放状态 (阶段 / 进度 / 错误 / 最近一次门阀结果 / 队列) |
 | GET  | `/v1/safety` | 跑一次安全门阀检查 (不执行动作) |
+| GET  | `/v1/kinematics` | 运动学快照 (TCP 世界系位姿 / 基座位姿 / 关节角), 手眼标定用 |
 
 ```bash
 # 看动作库
@@ -84,6 +85,64 @@ curl -s http://127.0.0.1:8802/v1/status
 ```
 
 阶段取值: `idle` / `connecting` / `entering` / `aligning` / `playing` / `stopping` / `error`
+
+## 运动学接口 (手眼标定用)
+
+### GET /v1/kinematics
+
+返回各臂的运动学快照 —— **视觉服务做手眼标定时的「量尺」**。
+
+```bash
+curl -s "http://127.0.0.1:8802/v1/kinematics" | python -m json.tool
+curl -s "http://127.0.0.1:8802/v1/kinematics?refresh=true" | python -m json.tool
+```
+
+```json
+{
+  "ok": true,
+  "arms": {
+    "LeftArm": {
+      "joints": [0.0, 0.1, -0.2, 0.0, 0.3, 0.5],
+      "cartesian": {"x": 0.35, "y": 0.12, "z": 0.45, "a": 1.57, "b": 0.0, "c": 0.0},
+      "base_frame": {"x": 0.0, "y": 0.0, "z": 0.0, "a": 0.0, "b": 0.0, "c": 0.0},
+      "base_frame_kind": "static",
+      "enabled": true,
+      "mode": "CSPPassthrough",
+      "timestamp_ms": 1731290000000
+    }
+  },
+  "lifting_column": {"name": "Column", "height": 0.85, "online": true},
+  "controller_connected": true,
+  "timestamp_ms": 1731290000123,
+  "notes": []
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `arms.<臂名>.joints` | 实测关节角 (rad) |
+| `arms.<臂名>.cartesian` | **TCP 世界系位姿** {x,y,z,a,b,c} —— 标定用的量尺 |
+| `arms.<臂名>.base_frame` | 臂基座在**世界系**下的位姿 |
+| `arms.<臂名>.base_frame_kind` | `static` (配置量) / `derived` (挂接安装, 基座会动) |
+| `lifting_column` | 升降柱状态 (相机装在升降柱顶端时做动态补偿要用) |
+| `notes` | 提示信息 (比如某条臂还没有 `cartesian`) |
+
+### `refresh=true` 为什么重要
+
+状态推送是**异步**的, 周期 50ms —— 快速运动时推送值跟不上实际。标定每个
+位姿都要精确的 TCP 位姿, 所以标定脚本用 `?refresh=true`, 让服务**主动**
+向控制器发一次 `robot/status` 请求-响应再返回。
+
+### `base_frame_kind: derived` 的含义
+
+`derived` 说明这条臂是**挂接**在父机器人上的 (比如装在升降柱顶端),
+基座本身在动。这时候:
+
+- 相机到**臂基座系**的相对关系仍然是静态的 → 静态外参成立
+- 但臂基座到**世界系**的关系会变 → 需要用这里的 `base_frame` 做动态补偿
+
+视觉服务配置 `target_frame: world` + `dynamic: true` 时, 每次检测前都会
+拉一次这个接口。
 
 ## 安全门阀
 

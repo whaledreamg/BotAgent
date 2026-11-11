@@ -1,0 +1,4 @@
+# Orbbec SDK 的运行日志 (每次开相机会追加, 不入库)
+Log/
+*.log.txt
+__pycache__/

@@ -342,6 +342,52 @@ class Router:
             return False
         return any(marker in text for marker in self._FAKE_CONFIRM_MARKERS)
 
+    @staticmethod
+    def _is_arm_query(text: str) -> bool:
+        """句子里问的是机械臂部位吗?
+
+        「左手在哪」「机械臂在什么位置」这类问题是问机械臂自己的状态,
+        归 device 分支管, 视觉服务答不了 (相机里根本没有「左手」这个类别)。
+        """
+        t = (text or "").strip()
+        if not t:
+            return False
+        for part in ("左手", "右手", "机械臂", "手臂", "胳膊", "爪子", "手爪"):
+            if part in t:
+                return True
+        return False
+
+    def _needs_vision_lookup(self, text: str) -> bool:
+        """用户这句话是不是「应该查相机」但模型没用工具?
+
+        典型场景: 用户问「人在什么位置」, 模型**凭想象**回答
+        「人在相机坐标系下, 距离 1.89 米」—— 这个数字是它编的。
+
+        判据: 句子里有「位置/在哪/看到没/有几个」这类**需要实测**的提问,
+        且没提到机械臂 (那是另一个分支管的)。
+        """
+        t = (text or "").strip()
+        if not t:
+            return False
+        if self._is_arm_query(t):
+            return False
+        # 时间/状态类提问走 clock 工具, 不是视觉
+        if any(w in t for w in ("几点", "几时", "几号", "星期几", "什么时间", "现在时间")):
+            return False
+        patterns = (
+            r"(在哪|在哪儿|什么位置|哪个位置|什么方位)",
+            r"(有没有|有没)(看到|看见)",
+            r"(找一下|找找|查找|寻找)",
+            r"(看到|看见)了?[^，。]*吗",
+            # 计数型提问也必须实测 —— 「桌上有几个瓶子」的答案只能
+            # 靠相机数, 模型说「有3个」就是编的。
+            #
+            # 量词是**必需**的: 「几点」是查时间, 「几个」才是数东西。
+            r"几(个|只|瓶|杯|张|块|把|支|颗|人|件|条|台|本|双|副)",
+            r"(多少)(个|只|瓶|杯|张|块|把|支|颗|人|件|条|台|本)",
+        )
+        return any(re.search(p, t) for p in patterns)
+
     def _looks_like_action_list(self, content: str) -> bool:
         """判断模型是不是「用嘴列了动作清单」。
 
@@ -556,8 +602,15 @@ class Router:
             # 2. 「准备点、挥手」—— 把动作名列出来当回复 (复合指令时更常见)
             fake_confirm = self._looks_like_fake_confirm(content)
             action_list = self._looks_like_action_list(content)
-            if fake_confirm or action_list:
-                reason = "fake-confirm" if fake_confirm else "action-list"
+            # 模型**凭想象**回答了需要实测的问题 (如「人在什么位置」)
+            vision_miss = self._needs_vision_lookup(req.text)
+            if fake_confirm or action_list or vision_miss:
+                if fake_confirm:
+                    reason = "fake-confirm"
+                elif action_list:
+                    reason = "action-list"
+                else:
+                    reason = "vision-miss"
                 logger.warning(
                     "检测到 %s (%r), 用 required 重试", reason, content[:40]
                 )
@@ -566,6 +619,16 @@ class Router:
                 if retried is not None:
                     return retried, False
                 # 重试也没成 -> 老实说做不到, 不要假装做完了
+                if vision_miss:
+                    return (
+                        Decision(
+                            intent=self.cfg.router.default_route,
+                            by="tools",
+                            content="我暂时看不到摄像头画面，无法确认位置。",
+                            trace=trace,
+                        ),
+                        False,
+                    )
                 return (
                     Decision(
                         intent=self.cfg.router.default_route,
@@ -601,6 +664,15 @@ class Router:
                 continue
             if self._tool_intent(spec) not in self.registry:
                 logger.warning("工具 %r 没有对应分支, 忽略", call.name)
+                continue
+            # **机械臂肢体问题不能被 find_object 截胡**。
+            #
+            # 「左手在哪」问的是机械臂自己的状态, 归 device 分支管。
+            # 正则匹配路径里有 `_is_arm_query` 挡着, 但 LLM 直接生成
+            # tool call 时不走正则 —— 模型会老老实实填 name="左手",
+            # 于是相机去查「左手」, 答一句「没有看到左手」。
+            if call.name == "find_object" and self._is_arm_query(req.text):
+                logger.warning("find_object 命中机械臂肢体问题, 忽略: %r", req.text)
                 continue
             known.append((call, spec))
 
@@ -675,6 +747,10 @@ class Router:
             if spec is None:
                 continue
             if self._tool_intent(spec) not in self.registry:
+                continue
+            # 同上: 机械臂肢体问题不能走 find_object
+            if call.name == "find_object" and self._is_arm_query(req.text):
+                logger.warning("find_object 命中机械臂肢体问题, 忽略: %r", req.text)
                 continue
             known.append((call, spec))
 

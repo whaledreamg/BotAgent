@@ -12,7 +12,7 @@
 ## 快速开始
 
 ```bash
-# 一键启动四个服务（会等健康检查通过）
+# 一键启动五个服务（会等健康检查通过）
 ./scripts/start_all.sh
 
 # 端到端自检（自动拉起服务、回放真实录音、断言分流与播放）
@@ -30,8 +30,15 @@
 | Agent | `botagent` | 3.11 | 8800 | 意图分流 + 动作编排 + LLM 对话 |
 | TTS | `chattts` | 3.11 | 8000 | 语音合成（WS 流式 PCM） |
 | Arm | `botagent` | 3.11 | 8802 | 机械臂动作序列播放 + 安全门阀 |
+| Vision | `yolo` | 3.11 | 8803 | Orbbec RGBD + YOLO 物体识别 + 位姿估计 |
 
 vosk 中文模型已在 `~/.cache/vosk/`，无需下载。
+
+> **Vision 服务已包含在 `start_all.sh` 里**（排在 Arm 之后 —— 它的动态
+> 外参要连 `arm_service` 拿臂基座位姿）。相机是**独占**的，所以
+> `check_vision.py` 等自检脚本在服务跑着时会自动改走 HTTP 检查。
+> 单独启动用 `./scripts/start_vision.sh`。
+> 详见 [docs/vision-service.md](docs/vision-service.md)。
 
 ## 目录
 
@@ -41,6 +48,7 @@ services/
   tts_service/    源自 project/ChatTTS（WS 协议未改）
   agent_service/  FastAPI + 意图分流 + 统一动作层 + 可扩展分支
   arm_service/    机械臂动作序列播放（时间轴 / 关节流 / 安全门阀）
+  vision_service/ Orbbec RGBD 采集 + YOLO 检测 + 深度反算 3D 位姿
 configs/
   agent.yaml      Agent 配置（LLM / 分流规则 / tool calling）
   tools.yaml      tool 定义（模型看到的工具清单）
@@ -48,12 +56,16 @@ configs/
   arm.yaml        机械臂服务配置（控制器 / 关节限幅 / 安全门阀）
   tts.yaml        TTS 音色与模型配置
   pipeline.yaml   ASR 侧配置（唤醒词 / 连续对话窗口）
+  vision.yaml     视觉服务配置（相机 / 检测器 / 解算 / 手眼外参）
+  calibration.yaml 标定板规格（尺寸必须量实际打印结果）
   .env            密钥，不入库
 scripts/          启停与自检脚本
 docs/
   architecture.md         架构与接口契约
   action-integration.md   动作接入（Agnes 原生 function calling）
   arm-service.md          机械臂服务（协议约束 / 安全门阀）
+  vision-service.md       视觉服务（相机编译 / D2C 对齐 / 深度采样）
+  calibration.md          标定指南（内参 / 手眼 / 左右手性检查）
   testing.md              怎么测
   latency-optimization.md 延迟优化记录
 ```
@@ -210,12 +222,73 @@ python tools/check_safety.py                # 安全门阀: 逐项判定 + 播�
 cd ../tts_service
 python examples/ws_server/check_tts_config.py      # TTS 音色 / 模型配置读取
 python examples/ws_server/check_tts_behavior.py    # 客户端覆盖 vs 服务端默认
+
+cd ../vision_service
+python tools/check_vision.py              # 视觉服务总自检（配置/相机/检测/解算/HTTP/arm/Agent）
+python tools/check_camera.py              # 相机：枚举 / 采帧 / 内参 / D2C 对齐
+python tools/check_detector.py            # YOLO 模型加载与推理
+python tools/check_solver.py              # 深度采样与 3D 反算（纯离线）
+python tools/check_e2e.py                 # 端到端：采帧 -> 检测 -> 解算
+python tools/check_calibration.py         # 标定数学自检（合成数据，不需要相机）
+python tools/check_frames.py               # 多坐标系联调自检（自起假 arm_service）
+python tools/check_recognition.py          # 相机识别到了什么（模式取自配置，默认 live）
 ```
+
+> **注意**：相机是**独占**的。视觉服务在跑的时候，`check_vision.py` 会
+> 自动探测 `/health` 并改走 HTTP 检查，不会去抢相机。想看「相机识别到了
+> 什么」用 `tools/check_recognition.py`（`--http` 走服务，`--live` 直接
+> 开相机）。
+
+## 坐标系与标定（相机 → 机械臂）
+
+相机装在机器人**头部**、双臂各有基座，所以坐标要过好几层：
+
+| 坐标系 | 含义 |
+|---|---|
+| `camera` | 相机系（X右 Y下 Z前），永远可用 |
+| `world` | 世界系 |
+| `left_base` / `right_base` | 左/右臂各自的基座系 |
+| `arm_base` | 按配置选左/右 |
+
+`GET /v1/frames` 可以一次看到同一个点在所有系里的坐标，以及每个坐标
+**是怎么来的**（`sources` 字段）—— 调试标定最直接的接口。
+
+要拿到机械臂能用的坐标，得先标定（**眼在手外**：标定板挂工具，用控制器
+正解当量尺）。详见 [docs/calibration.md](docs/calibration.md)。
+
+```bash
+cd services/vision_service
+
+# 1. 生成标定板 → 100% 尺寸打印 → 用尺量准尺寸
+python tools/make_board.py --square 0.040 --out /tmp/board.png
+
+# 2. 标内参（SDK 给的是标称值，差 1~2%）
+python tools/calib_intrinsics.py --capture
+
+# 3. 手眼标定（板挂工具，用控制器正解当量尺）
+python tools/calib_handeye.py --capture --arm right
+
+# 4. 验证（**含左右手性检查** —— 最常见的翻车点，不能省）
+python tools/calib_verify.py --samples /tmp/handeye_samples.json
+
+# 5. 写回配置
+python tools/apply_calibration.py --all
+```
+
+坐标系说明：
+
+| 名称 | 含义 |
+|---|---|
+| `camera` | 相机系（OpenCV：X右 Y下 Z前），永远可用 |
+| `arm_base` | 机械臂基座系（X前 Y左 Z上），相机固定在躯干上时用 |
+| `world` | 世界系，需要叠加基座动态补偿（升降柱升降 / 挂接安装） |
 
 ## 文档
 
 - [`docs/architecture.md`](docs/architecture.md) — 架构与接口契约
 - [`docs/action-integration.md`](docs/action-integration.md) — 动作接入与自定义工具
 - [`docs/arm-service.md`](docs/arm-service.md) — 机械臂服务
+- [`docs/vision-service.md`](docs/vision-service.md) — 视觉服务（相机编译 / D2C 对齐 / 深度采样）
+- [`docs/calibration.md`](docs/calibration.md) — 标定指南（内参 / 手眼 / 左右手性检查）
 - [`docs/testing.md`](docs/testing.md) — 怎么测
 - [`docs/latency-optimization.md`](docs/latency-optimization.md) — 延迟优化记录

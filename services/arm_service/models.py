@@ -111,6 +111,38 @@ class SafetyResponse(BaseModel):
     checks: List[Dict[str, Any]] = []
 
 
+class KinematicsResponse(BaseModel):
+    """运动学快照 —— 手眼标定要用的位姿数据。
+
+    **为什么要有这个接口**: 视觉服务做手眼标定时需要「工具在世界系
+    下的位姿」来当量尺。控制器的 `robot/status.cartesian` 就是这个量,
+    但它之前只存在于状态推送里, 没被存下来、也没有 HTTP 出口。
+
+    字段全是**可选**的 —— 控制器版本不同, 字段名/结构可能不一样,
+    拿不到就留空, 不要编。
+    """
+
+    ok: bool = True
+    #: 各臂的运动学状态, key 是控制器里的机器人名
+    arms: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    #: 升降柱状态 (相机装在升降柱顶端时需要它做动态补偿)
+    lifting_column: Optional[Dict[str, Any]] = None
+    #: 头/相机安装座在世界系下的位姿 {x,y,z,a,b,c}
+    #:
+    #: 相机装在机器人头部、且头以后会动时, 视觉服务需要它来把
+    #: 「相机 -> 头座」的静态标定量补成「相机 -> 世界系」。
+    #: 控制器没提供时为 None —— **不要编一个**, 宁可没有。
+    head_frame: Optional[Dict[str, float]] = None
+    #: 头部位姿是静态还是挂接派生 (static / derived)
+    head_frame_kind: str = ""
+    #: 控制器连上了没
+    controller_connected: bool = False
+    #: 快照时间 (毫秒, 单调时钟)
+    timestamp_ms: int = 0
+    #: 提示信息 (比如某项拿不到)
+    notes: List[str] = Field(default_factory=list)
+
+
 class HealthResponse(BaseModel):
     status: str
     controller_connected: bool

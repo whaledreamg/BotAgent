@@ -114,6 +114,32 @@ tools:
       type: object
       properties: {}
 
+  # ---- 找物体 (视觉服务) ----
+  - name: find_object
+    kind: query
+    label: 找物体
+    description: >-
+      用相机查找某个物体的位置。用户问「XXX 在哪」「看看有没有 XXX」
+      「XXX 在什么位置」时使用。返回该物体的三维坐标。
+    action_map:
+      "": find_object
+    parameters:
+      type: object
+      properties:
+        name:
+          type: string
+          description: 要找的物体名称, 如 杯子、苹果、瓶子
+        frame:
+          type: string
+          enum: ["camera", "world", "arm_base", "left_base", "right_base"]
+          description: >-
+            camera=相机坐标系(默认, 总是可用);
+            world=世界坐标系(需要已完成手眼标定);
+            arm_base=机械臂基座坐标系(需要标定 + 运行时基座位姿);
+            left_base=左臂基座坐标系;
+            right_base=右臂基座坐标系
+      required: ["name"]
+
 # ---------------------------------------------------------------------
 # 机械臂工具 (自动生成, 不用手写)
 # ---------------------------------------------------------------------

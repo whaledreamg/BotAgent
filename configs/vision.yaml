@@ -1,0 +1,178 @@
+# 视觉服务配置 (物体识别 + 位姿估计)
+#
+# 服务: Orbbec 相机采集 RGBD -> YOLO 检测/姿态 -> 深度反算 3D 位置
+# 端口: 8803
+#
+# 配置来源优先级 (后者覆盖前者):
+#   1. 本文件内的默认值
+#   2. configs/vision.yaml
+#   3. 环境变量 (VISION_*)
+
+vision:
+  server:
+    host: "0.0.0.0"
+    port: 8803
+
+  camera:
+    # 相机序列号; 留空 = 用枚举到的第一个设备
+    serial_number: ""
+    # 采集宽度/高度/帧率。留空(0) = 用相机的默认模式。
+    # 深度流通常有独立的分辨率, 这里不强行对齐。
+    width: 0
+    height: 0
+    fps: 0
+    # 单帧等待超时 (毫秒)
+    frame_timeout_ms: 2000
+    # 是否开启深度到彩色的硬件/软件对齐。
+    # 对齐后可以直接用彩色图上的像素坐标去查深度, 省掉手工缩放。
+    align_depth_to_color: true
+
+    # 标定好的彩色内参 (覆盖 SDK 的标称内参)。
+    #
+    # **为什么必须标**: SDK 给的是标称值, 实测通常差 1~2%。1% 的误差在
+    # 1.5 m 处就是 15 mm 的横向误差 —— 跟手眼外参的误差同量级。
+    # 不先修内参, 外参标得再准也没用。
+    #
+    # 标定方法:
+    #   conda run -n yolo python tools/calib_intrinsics.py --capture
+    # 然后把 configs/intrinsics.json 里的值抄到这里 (见 tools/calib_intrinsics.py 提示)。
+    #
+    # **内参是跟着分辨率走的** —— 改了彩色流分辨率就必须重标。
+    # 留空 = 用 SDK 内参。
+    calibrated_intrinsics:
+      fx: 0.0
+      fy: 0.0
+      cx: 0.0
+      cy: 0.0
+      width: 0
+      height: 0
+
+  detector:
+    # 检测模型权重路径。
+    # 留空 = 用 ultralytics 的内置名字 (如 yolo26n.pt, 会自动下载)。
+    # 这里的本地权重在 ultralytics 源码目录下。
+    weights: "/home/gxh/workspace/project/ultralytics/yolo26n.pt"
+    # 姿态模型权重 (关键点)。留空 = 不启用姿态估计。
+    pose_weights: ""
+    # 置信度阈值
+    conf: 0.35
+    # 按名字查找物体时的置信度阈值 (比 conf 宽松)。
+    # 用户明确点名了要找什么, 就该尽力去找 —— 用默认阈值会漏掉
+    # 置信度 0.2~0.3 的目标 (半遮挡的瓶子、远处的杯子), 让服务回答
+    # 「没有看到」, 明明目标就在画面里。
+    find_conf: 0.15
+    # IoU 阈值 (NMS)
+    iou: 0.5
+    # 推理设备: auto / cpu / 0 (GPU 序号)
+    # auto = 有 CUDA 就用, 否则 CPU
+    device: auto
+    # 输入尺寸 (长边)。留空 = 用模型默认
+    imgsz: 640
+    # 最多返回多少个目标 (按置信度排序)
+    max_objects: 20
+
+  solver:
+    # 深度采样: 在检测框内取多少个采样点
+    # 中心 + 四象限分位数, 避开物体边缘的深度跳变
+    sample_grid: 5
+    # 检测框内有效深度像素占比低于此值 -> 认为深度不可信
+    #
+    # **注意**: 真实相机的深度是稀疏的 (有效率常常只有 30%~40%),
+    # 反光/透明物体表面更是成片空洞, 所以这个阈值不能设高。
+    # 深度是否可信主要看「锚点是否在框内圈找到」(锚点可靠)。
+    min_valid_ratio: 0.05
+    # 深度合法范围 (米), 超出范围的值视为无效
+    depth_min: 0.1
+    depth_max: 5.0
+    # 深度平滑: 对采样值取中位数前先做这个尺寸的形态学处理
+    # 0 = 不处理
+    erode_iterations: 1
+
+  # 识别测试工具 (tools/check_recognition.py) 的配置
+  #
+  # **mode** 决定测试脚本怎么拿画面:
+  #
+  #   live  —— 直接开相机跑 YOLO, 并把标注图存到 logs/。
+  #            **相机是独占的** —— 视觉服务在跑的时候这个模式会开相机
+  #            失败 (报 `uvc_open failed -6`), 脚本会自动回退到 http。
+  #   http  —— 走视觉服务的 HTTP 接口 (/v1/detect), 不碰相机。
+  #
+  # 默认 live: 视觉服务平时是空着的, 相机闲着也是闲着; 而且 live 模式
+  # 会存标注图, 框画得对不对肉眼看最快。
+  #
+  # **要用 http 模式** (服务在跑的时候), 改这里或者命令行加 `--http`。
+  recognition:
+    mode: "live"
+    # 测试用的置信度阈值。比服务默认的 detector.conf 松 ——
+    # 实测桌面场景的杯子/刀/遥控器常落在 0.15~0.30。
+    conf: 0.05
+    # live 模式最多试几帧, 取检测到东西最多的那帧
+    frames: 5
+    # 标注图 / 原图的保存目录 (相对项目根)。留空 = logs/
+    output_dir: "logs"
+
+  # 手眼外参: 相机坐标系 -> 目标坐标系
+  #
+  # 未标定时 enabled: false, 服务只输出相机坐标系, 并在响应里标
+  # "frame": "camera" —— 不假装是基座坐标。
+  #
+  # 标定方法 (眼在手外: 标定板挂工具, 用控制器正解当量尺):
+  #   conda run -n yolo python tools/calib_handeye.py --capture
+  # 然后把 configs/handeye.json 里的 matrix 抄到这里, 或者:
+  #   conda run -n yolo python tools/apply_calibration.py --handeye
+  extrinsic:
+    enabled: false
+    # 4x4 齐次矩阵 (行主序) —— 相机系 -> 目标系。
+    # 优先于 rotation/translation。
+    matrix: []
+    # 3x3 旋转矩阵 (行主序) + 3 维平移 (米)
+    rotation: []
+    translation: [0.0, 0.0, 0.0]
+
+    # **matrix_frame**: 标定出来的 matrix 描述的是「相机 -> 哪个系」。
+    #
+    #   world    —— 标定时直接解出的 T_world_cam (眼在手外, 板挂工具)。
+    #               这是最常见的情况, 头固定时用它。
+    #   head     —— T_head_cam (相机 -> 头座)。**头会动时用这个**:
+    #               运行时再补 T_world_head(q_head) 才得到 T_world_cam。
+    #   arm_base —— T_base_cam (相机 -> 某条臂基座), 静态量。
+    matrix_frame: "world"
+
+    # 目标坐标系 (对外输出用哪个系):
+    #
+    #   camera      相机系 (原始值)
+    #   world       世界系
+    #   arm_base    机械臂基座系 (按下面的 arm 选左/右)
+    #   left_base   左臂基座系
+    #   right_base  右臂基座系
+    #
+    # **注意**: left_base / right_base 需要运行时从 arm_service 拿基座位姿,
+    # 所以必须同时把 dynamic 设为 true。
+    target_frame: "arm_base"
+
+    # 目标系为 arm_base 时用哪条臂: left / right / auto
+    arm: "auto"
+
+    # 是否需要运行时动态补偿 (从 arm_service 拿基座/头位姿)。
+    #
+    # 需要 dynamic=true 的情况:
+    #   - target_frame 是 left_base / right_base / arm_base (双臂分档)
+    #   - matrix_frame 是 head (头会动)
+    #
+    # 只报世界系且头固定时, matrix_frame=world + dynamic=false 就够了。
+    dynamic: false
+
+    # arm_service 的地址 (动态外参时用来拿基座/头位姿)
+    arm_service_url: "http://127.0.0.1:8802"
+
+    # 乘外参前先做「相机系 -> 基座系」的轴置换。
+    #
+    #   相机系 (OpenCV): X右 Y下 Z前
+    #   基座系 (ROS/URDF): X前 Y左 Z上
+    #
+    # 置换矩阵 (行列式 +1, 是旋转不是镜像):
+    #   [[0, 0, 1], [-1, 0, 0], [0, -1, 0]]
+    #
+    # **推荐做法**: 把这个置换直接烘进 matrix, 然后这里置 false ——
+    # 一切都在矩阵里, 不会有隐式变换把标定结果带偏。
+    flip_axes: false

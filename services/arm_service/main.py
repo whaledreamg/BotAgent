@@ -12,6 +12,8 @@
     POST /v1/play       下发播放 (异步)
     POST /v1/stop       停止并交还通道
     GET  /v1/status     当前播放状态
+    GET  /v1/safety     跑一次安全门阀检查 (不动作)
+    GET  /v1/kinematics 运动学快照 (TCP 世界系位姿, 手眼标定用)
     WS   /ws            阶段与进度推送
 """
 
@@ -37,6 +39,7 @@ from models import (  # noqa: E402
     ActionInfo,
     ActionListResponse,
     HealthResponse,
+    KinematicsResponse,
     PlayRequest,
     PlayResponse,
     SafetyResponse,
@@ -44,7 +47,7 @@ from models import (  # noqa: E402
     StopResponse,
 )
 from robot.controller import ControllerError  # noqa: E402
-from service import ArmService  # noqa: E402
+from service import ArmService, run_blocking  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,6 +141,23 @@ async def safety() -> Dict[str, Any]:
     """
     report = _svc().check_safety()
     return report.to_dict()
+
+
+@app.get("/v1/kinematics", response_model=KinematicsResponse)
+async def kinematics(refresh: bool = False) -> Dict[str, Any]:
+    """运动学快照 —— 手眼标定要用的位姿数据。
+
+    每条臂给出 TCP 的**世界系**位姿 (`cartesian`)、臂基座在世界系下的
+    位姿 (`base_frame`) 和实测关节角。
+
+    `refresh=true` 会**主动**向控制器拉一次最新状态再返回 —— 标定脚本
+    每采一个位姿都该用这个, 因为状态推送有 50ms 周期, 快速运动时
+    推送值跟不上实际。
+    """
+    svc = _svc()
+    if refresh:
+        return await run_blocking(svc.refresh_kinematics)
+    return svc.kinematics()
 
 
 @app.websocket("/ws")
