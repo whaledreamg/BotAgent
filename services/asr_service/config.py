@@ -36,6 +36,17 @@ DEFAULTS: Dict[str, Any] = {
         # 连续对话窗口(秒)。一轮对话结束后, 在这个时间内再次说话不需要唤醒词;
         # 超过则回到 IDLE, 需要重新说唤醒词。设为 0 则关闭连续对话。
         "continuous_timeout": 30.0,
+        # 回声沉降期(秒)。TTS 播完之后, 扬声器的余音还在空气里飘
+        # (声波传播 + 房间混响 + 音频缓冲排空)。这段时间内麦克风录到的
+        # 全是机器人自己的声音 —— 如果当成人声触发录音, 下一轮就会把
+        # 播报内容当成用户的话再识别一遍 (机器人自己跟自己对话)。
+        #
+        # 这个值要盖住「播完 -> 房间安静」的时间。小房间 0.4~0.6s 够,
+        # 大房间/嘈杂环境要调大。设为 0 = 关闭回声抑制 (不推荐)。
+        "echo_settle": 0.5,
+        # 等安静的最长等待(秒)。沉降期结束后最多再等这么久确认房间安静,
+        # 超时强制恢复 (免得房间一直吵导致机器人变聋)。
+        "echo_quiet_timeout": 2.0,
     },
     "agent": {
         "base_url": "http://127.0.0.1:8800",
@@ -79,6 +90,17 @@ class ASRConfig:
     empty_result_prompt: str = "没听清内容，请再说一遍"
     #: 连续对话窗口(秒)。一轮结束后这段时间内说话不需要唤醒词; 0 表示关闭
     continuous_timeout: float = 30.0
+        #: 回声沉降期(秒)。TTS 播完之后, 等多久才接受用户语音。
+        #:
+        #: 播报期间麦克风会录到机器人自己的声音, 播完之后还有余音飘着。
+        #: 这段时间内不采信任何「人声」, 否则会把播报内容当成用户的话
+        #: 再识别一遍 (机器人自己跟自己对话)。
+        #:
+        #: 0 = 关闭回声抑制 (不推荐)。
+    echo_settle: float = 0.5
+    #: 等安静的最长等待 (秒)。沉降期结束后, 最多再等这么久来确认
+    #: 房间真的安静下来; 超时就强制恢复 (免得房间一直吵导致机器人变聋)。
+    echo_quiet_timeout: float = 2.0
 
     @property
     def wake_word_list(self) -> list:
@@ -159,6 +181,18 @@ def load_config(path: Path = PIPELINE_CONFIG_PATH) -> Config:
             os.environ.get(
                 "ASR_CONTINUOUS_TIMEOUT",
                 a.get("continuous_timeout", 30.0),
+            )
+        ),
+        echo_settle=float(
+            os.environ.get(
+                "ASR_ECHO_SETTLE",
+                a.get("echo_settle", 0.5),
+            )
+        ),
+        echo_quiet_timeout=float(
+            os.environ.get(
+                "ASR_ECHO_QUIET_TIMEOUT",
+                a.get("echo_quiet_timeout", 2.0),
             )
         ),
     )

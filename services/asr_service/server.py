@@ -50,6 +50,15 @@ CONTINUOUS_WAKE_LABEL = "(连续对话)"
 #: 设太小会被瞬时撞击声误触发, 设太大会让响应显得迟钝。
 VOICE_RUN_BLOCKS = 2
 
+#: 回声拒绝期里, 需要连续这么多块**安静**才确认余音已消散。
+#:
+#: 余音是断断续续的 —— 声波在房间里反射叠加, 能量会有起伏, 声音
+#: 之间有间隙。只看一块安静就放开, 会在余音的间隙里误触发, 把
+#: 机器人自己的声音当成用户开口。
+#:
+#: 每块约 256ms, 3 块约 768ms。
+ECHO_QUIET_BLOCKS = 3
+
 
 class VoiceASR(wakeup_asr.WakeupASR):
     """带 Agent 分流与 TTS 朗读的语音助手。
@@ -76,6 +85,20 @@ class VoiceASR(wakeup_asr.WakeupASR):
         self._waiting_speech = False
         #: 连续有声块计数 (VAD 去抖)
         self._voice_run = 0
+        #: 回声拒绝期里连续安静的块数 (确认余音消散用)
+        self._quiet_run = 0
+        #: **回声抑制**: 播报结束后的静默沉降期 (秒)。
+        #:
+        #: TTS 播完之后, 扬声器的余音还在空气里传播 (声波 + 房间混响 +
+        #: ALSA 缓冲)。这段时间内麦克风录到的是机器人自己的声音 ——
+        #: 如果当成人声触发录音, 下一轮就会把播报内容当成用户的话。
+        self.echo_settle_sec = float(
+            getattr(args, "echo_settle", 0.0) or 0.0
+        )
+        #: 等安静的最长等待 (秒) —— 沉降期之后最多再等这么久确认房间安静
+        self.echo_quiet_timeout = float(
+            getattr(args, "echo_quiet_timeout", 2.0) or 0.0
+        )
         super().__init__(args)
 
     # 不落盘: 禁止保存识别音频
@@ -113,6 +136,73 @@ class VoiceASR(wakeup_asr.WakeupASR):
         logger.info(
             "[连续对话] 已开启, %.0fs 内再次说话无需唤醒词",
             self.continuous_timeout,
+        )
+
+    def arm_echo_guard(self, settle_sec: Optional[float] = None) -> None:
+        """**在播报开始前**调用, 声明「接下来这段时间别听我的声音」。
+
+        这是回声抑制的关键 —— 必须在 TTS 开口**之前**就把守卫架起来,
+        不能等播完了再补:
+
+        - 播报**期间**录到的音频: 直接丢弃 (时间戳早于守卫结束时刻)
+        - 播报**之后**的余音: 要求能量回落到噪声底附近才认作用户开口
+
+        之前的问题是守卫在播完之后才架, 结果播报最后那几帧的余音
+        时间戳反而比守卫还新, 过滤不掉, 直接被当成用户说话。
+
+        Args:
+            settle_sec: 沉降期秒数。None = 用配置值。
+                这是「播报结束 -> 可以开始听用户说话」的最短等待时间,
+                要覆盖声波传播 + 混响 + ALSA 缓冲排空的时间。
+        """
+        if settle_sec is None:
+            settle_sec = self.echo_settle_sec
+        settle = float(settle_sec or 0.0)
+
+        # 守卫覆盖「从现在开始直到播报结束 + 沉降期」
+        #
+        # 这里先用一个保守的下界占位 —— 真正的结束时刻在播报结束后
+        # 由 finalize_echo_guard() 修正 (那时才知道播了多久)。
+        now = time.time()
+        self.echo_guard_until = now + settle
+        self.echo_reject_until = now + settle
+        self.echo_quiet_at = 0.0
+        self._quiet_run = 0
+        logger.info("[回声守卫] 已架起 (沉降期 %.2fs)", settle)
+
+    def finalize_echo_guard(self, settle_sec: Optional[float] = None) -> None:
+        """播报结束后调用, 把守卫延伸到「播报结束 + 沉降期」。
+
+        ``arm_echo_guard`` 只知道「现在要播了」, 不知道播了多久。
+        播完之后才知道真正的余音窗口在哪。
+
+        **两个时间窗口不是一回事**:
+
+        - ``echo_guard_until`` = 播完 + 沉降期。这段时间音频**整个丢弃**,
+          根本不看电平。
+        - ``echo_reject_until`` = 播完 + 沉降期 + 等安静的上限。这段时间
+          音频照收, 但 VAD 不认作人声, 直到房间真的安静下来。
+
+        两者必须分开 —— 如果用同一个时间戳, 守卫期把音频全丢了,
+        等守卫结束时拒绝期也正好到期, 「等安静」的逻辑就永远不会触发
+        (余音还在就已经放行了)。
+        """
+        if settle_sec is None:
+            settle_sec = self.echo_settle_sec
+        settle = float(settle_sec or 0.0)
+        now = time.time()
+
+        # 硬丢弃期: 播完 + 沉降期
+        self.echo_guard_until = now + settle
+        # 等安静期: 在硬丢弃期之后, 再给一段「确认房间安静」的时间
+        self.echo_reject_until = now + settle + self.echo_quiet_timeout
+        self.echo_quiet_at = 0.0
+        self._quiet_run = 0
+        logger.info(
+            "[回声守卫] 沉降期 %.2fs, 等安静上限 %.2fs (到 %.2f)",
+            settle,
+            self.echo_quiet_timeout,
+            self.echo_reject_until,
         )
 
     def close_session(self) -> None:
@@ -161,10 +251,17 @@ class VoiceASR(wakeup_asr.WakeupASR):
         self.kw_text = ""
         self.gen_text = ""
 
-        # 前滚: 只带窗口开启之后的音频 (排除 TTS 播放期间录到的)
+        # 前滚: 只带「安全时刻」之后的音频
+        #
+        # 安全时刻 = max(窗口开启时刻, 回声守卫结束时刻)。
+        #
+        # **为什么要取 max**: 回声守卫结束时刻比窗口开启时刻晚 (播报
+        # 之后还有沉降期)。只按窗口时刻过滤的话, 播报尾声的余音
+        # (时间戳在两者之间) 会被带进前滚, 直接变成「用户说的话」。
         preroll = []
+        safe_from = max(self._session_started_ts, self.echo_guard_until)
         for rts, chunk in list(self.ring):
-            if rts < self._session_started_ts:
+            if rts < safe_from:
                 continue
             if ts - rts <= self.preroll_sec:
                 preroll.append(chunk)
@@ -177,11 +274,20 @@ class VoiceASR(wakeup_asr.WakeupASR):
         if self.pipeline.busy:
             return False
 
+        # **回声守卫期内**: 收到的音频一律丢弃, 不进环形缓冲也不参与 VAD。
+        #
+        # 这段时间是「播报刚结束」的沉降期 —— 麦克风里全是机器人自己的
+        # 余音。放进来只会有两种坏结果:
+        #   1. 被 VAD 当成用户开口 -> 立刻开始录音 -> 识别出自己的播报
+        #   2. 进了环形缓冲 -> 下一轮的前滚把它带进识别
+        if ts < self.echo_guard_until:
+            return False
+
         if self.state == "IDLE":
             # 连续对话窗口内: 等用户开口, 不需要唤醒词
             if self.in_continuous_session:
                 if self._waiting_speech:
-                    if self._voice_detected(data):
+                    if self._voice_detected(data, ts):
                         self._waiting_speech = False
                         remaining = self._session_remaining()
                         logger.info(
@@ -208,7 +314,7 @@ class VoiceASR(wakeup_asr.WakeupASR):
 
         return super().process_block(data, ts)
 
-    def _voice_detected(self, data) -> bool:
+    def _voice_detected(self, data, ts: Optional[float] = None) -> bool:
         """判断这一块音频里有没有人声 (VAD)。
 
         连续对话时不能一进窗口就开始录音 —— 那会把环境噪声当成用户开口,
@@ -216,9 +322,45 @@ class VoiceASR(wakeup_asr.WakeupASR):
 
         需要**连续** VOICE_RUN_BLOCKS 块都有人声才认定为「用户开口」,
         中间只要断一下就重新计数, 避免瞬时撞击声误触发。
+
+        **回声拒绝**: 刚播报完时, 即使电平超阈值也不算人声 —— 那还是
+        机器人自己的余音。要等声音真的落到噪声底附近, 确认是「新的」
+        人声, 才开始录音。
         """
         db = rms_db(data)
         thresh = max(self.noise_floor + 10.0, self.args.vad_threshold)
+        now = ts if ts is not None else time.time()
+
+        # ---- 回声拒绝期 ----
+        #
+        # 余音可能比预想的久 (大房间混响)。所以不能简单地「等固定
+        # 时间就恢复」—— 要**等到真的安静下来**。
+        #
+        # 但也不能无限等: 房间本来就吵的话会永远等下去。所以有个
+        # 硬上限 (echo_reject_until), 到点就强制恢复。
+        if self.echo_reject_until and now < self.echo_reject_until:
+            if db <= thresh:
+                # 一块安静不够 —— 余音是断断续续的, 声音之间有间隙,
+                # 间隙里电平会掉下去。只看一块就放开, 会在余音的
+                # 间隙里误触发。要**连续**安静 ECHO_QUIET_BLOCKS 块
+                # 才认账。
+                self._quiet_run += 1
+                if self._quiet_run >= ECHO_QUIET_BLOCKS:
+                    self.echo_quiet_at = now
+                    self.echo_reject_until = 0.0
+                    self._quiet_run = 0
+                    logger.info("[回声守卫] 余音已消散, 恢复接受人声")
+            else:
+                # 又吵起来了 —— 余音还在, 重新计数
+                self._quiet_run = 0
+            return False
+
+        # 硬上限到了, 但一直没安静下来 —— 强制放行, 免得机器人变聋
+        if self.echo_reject_until and now >= self.echo_reject_until:
+            logger.info("[回声守卫] 超过等待上限, 强制恢复接受人声")
+            self.echo_reject_until = 0.0
+            self.echo_quiet_at = now
+
         if db <= thresh:
             self._voice_run = 0
             return False
@@ -334,6 +476,12 @@ def parse_args(argv=None):
     p.add_argument("--continuous-timeout", type=float, default=None,
                    help="连续对话窗口秒数: 一轮结束后多久内说话无需唤醒词, "
                         "0 表示关闭 (默认取 configs/pipeline.yaml)")
+    p.add_argument("--echo-settle", type=float, default=None,
+                   help="回声沉降期秒数: TTS 播完后等多久才接受用户语音 "
+                        "(要覆盖声波传播+混响+音频缓冲, 默认取 configs/pipeline.yaml)")
+    p.add_argument("--echo-quiet-timeout", type=float, default=None,
+                   help="等安静的最长等待秒数: 沉降期后最多再等这么久确认"
+                        "房间安静, 超时强制恢复 (默认取 configs/pipeline.yaml)")
     p.add_argument("--host", default=None, help="健康检查监听地址")
     p.add_argument("--port", type=int, default=None, help="健康检查监听端口")
     return p.parse_args(argv)
@@ -372,6 +520,18 @@ def build_wakeup_args(args, cfg):
             if args.continuous_timeout is not None
             else cfg.asr.continuous_timeout
         ),
+        # 回声沉降期(秒): 播报结束后等多久才允许接受用户语音
+        echo_settle=(
+            args.echo_settle
+            if args.echo_settle is not None
+            else cfg.asr.echo_settle
+        ),
+        # 等安静的最长等待(秒)
+        echo_quiet_timeout=(
+            args.echo_quiet_timeout
+            if args.echo_quiet_timeout is not None
+            else cfg.asr.echo_quiet_timeout
+        ),
     )
     return ns
 
@@ -399,6 +559,10 @@ def main(argv=None):
     app = VoiceASR(wakeup_args, pipeline)
     # 一轮彻底结束后开启连续对话窗口 (播报完成才计时, 不占用用户的窗口)
     pipeline.on_turn_complete = app.open_session
+    # 播报**之前**架回声守卫 (挡住自己的声音被麦克风收进去)
+    pipeline.on_before_speak = app.arm_echo_guard
+    # 播报**之后**把守卫延伸到沉降期 (余音还没散)
+    pipeline.on_after_speak = app.finalize_echo_guard
 
     if app.continuous_timeout:
         print(

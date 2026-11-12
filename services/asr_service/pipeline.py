@@ -63,6 +63,17 @@ class Pipeline:
         #: 一轮完全结束 (Agent + TTS 播完) 时的回调。
         #: ASR 侧用它来开启连续对话窗口。
         self.on_turn_complete: Optional[Callable[[], None]] = None
+        #: **播报开始前**的回调。
+        #:
+        #: ASR 侧用它来架「回声守卫」—— 必须在 TTS 开口**之前**就
+        #: 声明「接下来别听我的声音」。等播完了再补就晚了: 播报最后
+        #: 几帧的余音时间戳比守卫还新, 过滤不掉, 会被当成用户说话。
+        self.on_before_speak: Optional[Callable[[], None]] = None
+        #: **播报结束后**的回调。
+        #:
+        #: ASR 侧用它把回声守卫延伸到「播报结束 + 沉降期」——
+        #: 播之前只知道「要播了」, 播完才知道余音窗口到底在哪。
+        self.on_after_speak: Optional[Callable[[], None]] = None
 
     # ------------------------------------------------------------ 状态
 
@@ -88,6 +99,33 @@ class Pipeline:
             cb()
         except Exception as exc:  # pragma: no cover - 回调异常不该影响主流程
             logger.warning("turn_complete 回调异常: %s", exc)
+
+    def _notify_before_speak(self) -> None:
+        """通知外部「马上要播报了」。
+
+        ASR 侧在这里架回声守卫 —— 必须在 TTS 开口之前, 否则挡不住
+        播报本身的回声。
+        """
+        cb = self.on_before_speak
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("before_speak 回调异常: %s", exc)
+
+    def _notify_after_speak(self) -> None:
+        """通知外部「播报结束了」。
+
+        ASR 侧在这里把回声守卫延伸到「播完 + 沉降期」。
+        """
+        cb = self.on_after_speak
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("after_speak 回调异常: %s", exc)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -160,6 +198,8 @@ class Pipeline:
             return
 
         self._set_state(State.SAY)
+        # **播报前**架回声守卫 —— 挡住「没听清」这句提示被自己听到
+        self._notify_before_speak()
         try:
             result = self.tts.speak(prompt)
             logger.info(
@@ -172,11 +212,13 @@ class Pipeline:
             self._record_error(f"TTS 提示播报失败: {exc}")
         except Exception as exc:  # pragma: no cover - 兜底
             self._record_error(f"TTS 提示播报异常: {exc}")
+        finally:
+            # 播完了 (不管成功还是失败) —— 把回声守卫延伸到沉降期
+            self._notify_after_speak()
 
         self._set_state(State.IDLE)
         # 没听清也算一轮结束, 连续对话窗口继续开着 (用户可以马上再说一次)
         self._notify_turn_complete()
-
     def _run_turn(self, text: str, record_ms: int = 0) -> None:
         """后台线程: Agent 分流 -> (必要时) TTS 播放。"""
         logger.info("[识别] %s", text)
@@ -233,6 +275,8 @@ class Pipeline:
 
         # 3) 需要朗读: 进 TTS 合成并直接播放 (不落盘)
         self._set_state(State.SAY)
+        # **播报前**架回声守卫 —— 挡住机器人自己的声音被麦克风收进去
+        self._notify_before_speak()
         t_tts = time.time()
         try:
             result = self.tts.speak(reply.reply)
@@ -254,6 +298,9 @@ class Pipeline:
         except Exception as exc:  # pragma: no cover - 兜底
             tts_ms = int((time.time() - t_tts) * 1000)
             self._record_error(f"TTS 异常: {exc}")
+        finally:
+            # 播完了 (不管成功还是失败) —— 把回声守卫延伸到沉降期
+            self._notify_after_speak()
 
         total_ms = int((time.time() - turn_start) * 1000)
         timings = {

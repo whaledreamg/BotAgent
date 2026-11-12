@@ -512,7 +512,7 @@ asr:
 > - **前滚音频会排除 TTS 播放期间录到的声音**。麦克风在机器人播报时
 >   也会录到声音，如果不排除，下一轮会把机器人的声音当成用户的话识别出来。
 
-单独验证（不需要麦克风，9 项断言）：
+单独验证（不需要麦克风，15 项断言）：
 
 ```bash
 cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
@@ -576,6 +576,65 @@ cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
 ### 排查建议
 
 ```bash
+### 4.8.1 回声抑制（TTS 播报不被自己当成用户说话）
+
+**症状**：机器人播报「没听清内容，请再说一遍」，麦克风把这句播报录了进去，
+下一轮识别成「没听清内容请在说起帮我查下今天南京天气」——机器人开始**自己跟
+自己对话**，还会拿播报内容去查天气。
+
+**根因**（修复前的时序 bug）：
+
+```
+TTS 播报 2.3s ──────────────► 播完
+                              └─► 才设置过滤标记 _session_started_ts
+                              └─► VAD 看到余音 → 立刻开始录音
+                                  └─► 前滚带进播报尾声的余音
+                                      └─► 识别成「没听清内容请在说起…」
+```
+
+过滤标记设在**播完之后**，而播报最后几帧的余音时间戳比标记还新 —— 挡不住。
+
+**修复**：改成两个窗口，都在**播报开始前**架起来：
+
+| 窗口 | 覆盖范围 | 行为 |
+| --- | --- | --- |
+| `echo_guard_until` | 播完 + `echo_settle` | 音频**整个丢弃**，不看电平 |
+| `echo_reject_until` | 播完 + `echo_settle` + `echo_quiet_timeout` | 音频照收，但 VAD 不认作人声，直到房间安静下来 |
+
+两个窗口必须**分开** —— 用同一个时间戳的话，守卫期把音频全丢了，等守卫
+结束时拒绝期也正好到期，「等安静」的逻辑就永远不会触发。
+
+「等安静」还要求**连续 3 块安静**才认账（`ECHO_QUIET_BLOCKS`）：余音是断断
+续续的，声音之间有间隙，只看一块安静就放开会在间隙里误触发。
+
+**配置**（`configs/pipeline.yaml`）：
+
+```yaml
+asr:
+  # 沉降期: 播完之后等多久才接受用户语音
+  # 要盖住「播完 → 房间安静」的时间。小房间 0.4~0.6s 够，大房间调大。
+  echo_settle: 0.5
+  # 等安静的最长等待: 沉降期后最多再等这么久确认房间安静, 超时强制恢复
+  # (免得房间一直吵导致机器人变聋)
+  echo_quiet_timeout: 2.0
+```
+
+**自检**：
+
+```bash
+cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
+/home/gxh/miniconda3/envs/asrt/bin/python tools/check_echo_guard.py   # 11 项
+/home/gxh/miniconda3/envs/asrt/bin/python tools/check_continuous.py    # 含回声场景
+```
+
+**调节建议**：
+
+| 现象 | 调整 |
+| --- | --- |
+| 还是能听到自己的播报 | 调大 `echo_settle`（0.5 → 1.0） |
+| 机器人反应变迟钝 | 调小 `echo_settle`，或调小 `echo_quiet_timeout` |
+| 房间很吵时机器人不响应 | `echo_quiet_timeout` 到点会强制恢复；不够就调大 |
+
 cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
 /home/gxh/miniconda3/envs/asrt/bin/python tools/check_asr.py /path/to/your.wav
 ```
@@ -588,14 +647,23 @@ cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
 - 安装一个带 `Gr.fst` 的小模型，走语法受限识别，唤醒更准、误触发更少
 - 链路自检用 `--no-wake` 绕开（推荐，不影响真实使用）
 
+| `--echo-settle <秒>` | 回声沉降期（默认取配置文件，0.5） |
+| `--echo-quiet-timeout <秒>` | 等安静的最长等待（默认取配置文件，2.0） |
 ---
 
 ## 7. 常见问题
 
 ### Agent 报 401 / 未配置密钥
 
-密钥在 `configs/.env`（`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`），可用环境变量覆盖。
-`curl http://127.0.0.1:8800/health` 看 `api_key_configured` 字段。
+密钥在 `configs/.env`，按 provider 分开配（`AGNES_API_KEY` / `DEEPSEEK_API_KEY` …），
+由 `configs/agent.yaml` 的 `llm.providers.<name>.api_key_env` 指向。
+
+```bash
+curl http://127.0.0.1:8800/health   # 看 api_key_configured / roles / providers
+conda run -n botagent python tools/check_providers.py --list
+```
+
+细节见 [`llm-providers.md`](llm-providers.md)。
 
 ### 回应太慢
 

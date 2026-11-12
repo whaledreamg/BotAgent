@@ -141,6 +141,15 @@ def patched_vosk():
         self._session_started_ts = 0.0
         self._waiting_speech = False
         self._voice_run = 0
+        # 回声抑制相关 (与 server.VoiceASR.__init__ 保持一致)
+        self.echo_settle_sec = float(getattr(a, "echo_settle", 0.0) or 0.0)
+        self.echo_quiet_timeout = float(
+            getattr(a, "echo_quiet_timeout", 2.0) or 0.0
+        )
+        self.echo_guard_until = 0.0
+        self.echo_reject_until = 0.0
+        self.echo_quiet_at = 0.0
+        self._quiet_run = 0
         self.model = None
         FakeASR.__init__(self, a)
 
@@ -170,6 +179,8 @@ def build_voice_asr(cfg, timeout: float) -> server_mod.VoiceASR:
         save=False,
         quiet=True,
         continuous_timeout=timeout,
+        echo_settle=cfg.asr.echo_settle,
+        echo_quiet_timeout=cfg.asr.echo_quiet_timeout,
     )
     pipeline = Pipeline(cfg)
     return server_mod.VoiceASR(args, pipeline)
@@ -259,6 +270,72 @@ def main() -> int:
         app5.open_session()
         results.append(check("timeout=0 不开启窗口", app5._session_until is None))
         results.append(check("timeout=0 不在连续会话中", not app5.in_continuous_session))
+
+        # ---------------------------------------------------- 6. 回声抑制
+        #
+        # 这是用户实际遇到的问题:
+        #   播报「没听清内容，请再说一遍」-> 麦克风把播报录进去
+        #   -> 下一轮把「没听清内容请在说起」当成用户说的话
+        #   -> 机器人自己跟自己对话
+        print("\n6) 回声抑制: TTS 播报不被当成用户说话")
+        app6 = build_voice_asr(cfg, timeout=30.0)
+
+        # 6a. 播报**之前**架守卫 (真实的调用顺序)
+        app6.arm_echo_guard()
+        guard_armed = app6.echo_guard_until > time.time()
+        results.append(check("播报前守卫已架起", guard_armed,
+                              f"剩 {app6.echo_guard_until - time.time():.2f}s"))
+
+        # 6b. 播报期间的高电平音频必须被丢弃, 不进环形缓冲
+        app6.open_session()
+        app6._waiting_speech = True
+        ts6 = time.time()
+        app6.process_block(make_speech(), ts6)
+        during_idle = app6.state == "IDLE"
+        results.append(check("播报期间不进入录音", during_idle,
+                              f"state={app6.state}"))
+
+        # 6c. 播报结束 -> 守卫延伸到沉降期 + 等安静期
+        app6.finalize_echo_guard()
+        results.append(check(
+            "守卫期早于拒绝期",
+            app6.echo_guard_until <= app6.echo_reject_until,
+            f"guard剩 {app6.echo_guard_until - time.time():.2f}s / "
+            f"reject剩 {app6.echo_reject_until - time.time():.2f}s",
+        ))
+
+        # 6d. 余音 (中电平) 不能触发录音
+        app6._waiting_speech = True
+        ts6b = time.time()
+        for i in range(4):
+            app6.process_block(make_speech(freq=180.0), ts6b + i * 0.3)
+        echo_idle = app6.state == "IDLE"
+        results.append(check("余音不触发录音", echo_idle, f"state={app6.state}"))
+
+        # 6e. 房间安静后, 用户说话必须能触发
+        for i in range(4):
+            app6.process_block(make_silence(), ts6b + 1.5 + i * 0.3)
+        for i in range(3):
+            app6.process_block(make_speech(freq=320.0), ts6b + 3.0 + i * 0.3)
+        user_started = app6.state == "RECORDING"
+        results.append(check("用户说话能正常触发录音", user_started,
+                              f"state={app6.state}"))
+
+        # 6f. 前滚里不能有播报期间的音频
+        app6b = build_voice_asr(cfg, timeout=30.0)
+        app6b.arm_echo_guard()
+        app6b.finalize_echo_guard()
+        t0b = time.time()
+        tts_chunk = make_speech(freq=180.0)
+        app6b.ring.append((t0b, tts_chunk))
+        app6b.open_session()
+        ts6c = time.time()
+        app6b.ring.append((ts6c, make_speech(freq=320.0)))
+        app6b._waiting_speech = False
+        app6b._start_continuous_recording(ts6c)
+        no_tts = not any(c == tts_chunk for c in app6b.rec_chunks)
+        results.append(check("前滚排除了守卫期内的音频", no_tts,
+                              f"chunks={len(app6b.rec_chunks)}"))
 
     print()
     if all(results):
