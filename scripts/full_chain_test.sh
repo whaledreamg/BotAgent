@@ -48,7 +48,8 @@ sleep 2
 
 echo "=== 启动 TTS ==="
 cd "$ROOT/services/tts_service"
-/home/gxh/miniconda3/envs/chattts/bin/python examples/ws_server/main.py > /tmp/fc_tts.log 2>&1 &
+conda run --no-capture-output -n "${TTS_CONDA_ENV:-chattts}" \
+    python examples/ws_server/main.py > /tmp/fc_tts.log 2>&1 &
 TTS_PID=$!
 for i in $(seq 1 60); do
     curl -sf --max-time 2 "http://127.0.0.1:${TTS_PORT}/health" >/dev/null 2>&1 && break
@@ -58,7 +59,8 @@ curl -sf --max-time 5 "http://127.0.0.1:${TTS_PORT}/health" | head -c 200; echo
 
 echo "=== 启动 Agent ==="
 cd "$ROOT/services/agent_service"
-/home/gxh/miniconda3/envs/botagent/bin/python -m uvicorn app:app --host 127.0.0.1 --port "${AGENT_PORT}" > /tmp/fc_agent.log 2>&1 &
+conda run --no-capture-output -n "${AGENT_CONDA_ENV:-botagent}" \
+    python -m uvicorn app:app --host 127.0.0.1 --port "${AGENT_PORT}" > /tmp/fc_agent.log 2>&1 &
 AGENT_PID=$!
 for i in $(seq 1 30); do
     curl -sf --max-time 2 "http://127.0.0.1:${AGENT_PORT}/health" >/dev/null 2>&1 && break
@@ -69,12 +71,14 @@ curl -sf --max-time 5 "http://127.0.0.1:${AGENT_PORT}/health" | head -c 200; ech
 echo "=== 生成测试 wav ==="
 REAL="${1:-/home/gxh/workspace/project/ASRT/recordings/rec_20261106_182400.wav}"
 cd "$ROOT/services/tts_service"
-/home/gxh/miniconda3/envs/chattts/bin/python tools/make_test_wav.py \
+conda run --no-capture-output -n "${TTS_CONDA_ENV:-chattts}" \
+    python tools/make_test_wav.py \
     --out /tmp/fc_test_16k.wav --real "$REAL" --skip-wake-audio | tail -3
 
 echo "=== 启动 ASR (回放模式, 跳过唤醒词以验证下游链路) ==="
 cd "$ROOT/services/asr_service"
-/home/gxh/miniconda3/envs/asrt/bin/python server.py \
+conda run --no-capture-output -n "${ASR_CONDA_ENV:-asrt}" \
+    python server.py \
     --replay /tmp/fc_test_16k.wav --no-wake --keep-alive 60 \
     --host 127.0.0.1 --port "${ASR_PORT}" > /tmp/fc_asr.log 2>&1 &
 ASR_PID=$!

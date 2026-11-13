@@ -18,9 +18,26 @@ export VISION_SERVER_PORT="${VISION_SERVER_PORT:-8803}"
 #
 # 所以这里指向源码编译出来的库 (OB_BUILD_USB_PAL=ON), 它带 USB PAL。
 # 编译方法见 docs/vision-service.md。
-ORBBEC_LIB="${ORBBEC_LIB:-/home/gxh/workspace/project/OrbbecSDK_v2/build/linux_x86_64/lib}"
+ORBBEC_LIB="${ORBBEC_LIB:-}"
+if [ -z "$ORBBEC_LIB" ]; then
+    # 依次探测常见位置, 避免写死某台机器的绝对路径
+    for cand in \
+        "$ROOT/../OrbbecSDK_v2/build/linux_x86_64/lib" \
+        "$ROOT/../../OrbbecSDK_v2/build/linux_x86_64/lib" \
+        "/home/gxh/workspace/project/OrbbecSDK_v2/build/linux_x86_64/lib" \
+        "/opt/OrbbecSDK_v2/build/linux_x86_64/lib"
+    do
+        if [ -f "$cand/libOrbbecSDK.so.2" ]; then
+            ORBBEC_LIB="$cand"
+            break
+        fi
+    done
+fi
 if [ -f "$ORBBEC_LIB/libOrbbecSDK.so.2" ]; then
     export LD_LIBRARY_PATH="$ORBBEC_LIB:${LD_LIBRARY_PATH:-}"
+elif [ -z "$ORBBEC_LIB" ]; then
+    echo "[vision] 警告: 未找到 libOrbbecSDK.so.2 —— pip 装的 pyorbbecsdk2 没有 USB PAL,"
+    echo "         相机枚举会得到 0 个设备。请编译 OrbbecSDK 并设 ORBBEC_LIB, 见 docs/vision-service.md"
 fi
 
 mkdir -p "$LOG_DIR"

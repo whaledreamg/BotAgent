@@ -1,0 +1,47 @@
+# TTS 服务依赖 (Python 3.11)
+#
+# ⚠️ torch 三件套不在这里 —— 见 scripts/setup_envs.sh。
+#   它们必须**先**从 pytorch 索引装:
+#     pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+#         --index-url https://download.pytorch.org/whl/cu124
+#
+# 为什么用不带 local version 的 `torch==2.6.0`:
+#   `torch==2.6.0+cu124` 里的 `+cu124` 是 local version identifier,
+#   只有 pytorch 官方索引认, PyPI 上**不存在** -> 换机器必失败。
+#
+# 为什么先装 torch 再装这堆:
+#   vllm / xformers 这类包会要求 `torch==2.1.2` 精确匹配,
+#   跟 torch 2.6 一起进 resolver 会死锁。
+#   本项目 configs/tts.yaml 的 use_vllm 默认关闭, 所以这两个包根本不需要。
+
+# --- 文本前端 (中文 G2P) ---
+# pynini 编译需要 OpenFst + C++ 工具链, 见 docs/environment-setup.md
+pynini==2.1.5
+WeTextProcessing==1.0.3
+nemo-text-processing==1.0.2
+
+# --- 模型 ---
+transformers==5.22.1
+tokenizers==0.23.3
+safetensors==0.8.0
+huggingface-hub==2.4.0
+sentencepiece==0.2.3
+vocos==0.1.0
+vector-quantize-pytorch==1.32.2
+pybase16384==0.3.9
+
+# --- 数值 ---
+numpy==2.4.6
+numba==0.68.1
+
+# --- 音频 IO ---
+av==18.1.0
+pydub==0.25.1
+
+# --- Web 服务 ---
+fastapi==0.125.0
+uvicorn==0.54.0
+websockets==17.4
+python-multipart==0.0.33
+pyyaml==6.0.3
+requests==2.34.2

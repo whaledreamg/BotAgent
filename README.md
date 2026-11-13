@@ -12,15 +12,22 @@
 ## 快速开始
 
 ```bash
-# 一键启动五个服务（会等健康检查通过）
+# 0. 新机器：先建四个 conda 环境（幂等，已存在会跳过）
+./scripts/setup_envs.sh
+
+# 1. 一键启动五个服务（会等健康检查通过）
 ./scripts/start_all.sh
 
-# 端到端自检（自动拉起服务、回放真实录音、断言分流与播放）
+# 2. 端到端自检（自动拉起服务、回放真实录音、断言分流与播放）
 ./scripts/full_chain_test.sh
 
 # 停止
 ./scripts/stop_all.sh
 ```
+
+> **新机器部署请先看 [docs/environment-setup.md](docs/environment-setup.md)** ——
+> 里面说明了为什么不能用 `conda env export` 的 yml（会写死 build 号 / prefix /
+> torch 的 `+cu124` 本地版本，换机器必挂），以及三个 pip 解析冲突的解法。
 
 ## 服务一览
 
@@ -32,7 +39,8 @@
 | Arm | `botagent` | 3.11 | 8802 | 机械臂动作序列播放 + 安全门阀 |
 | Vision | `yolo` | 3.11 | 8803 | Orbbec RGBD + YOLO 物体识别 + 位姿估计 |
 
-vosk 中文模型已在 `~/.cache/vosk/`，无需下载。
+依赖清单在 `requirements/`（手写，可移植），建环境脚本是 `scripts/setup_envs.sh`。
+vosk 中文模型需在 `~/.cache/vosk/`，部署步骤见 [docs/environment-setup.md](docs/environment-setup.md)。
 
 > **Vision 服务已包含在 `start_all.sh` 里**（排在 Arm 之后 —— 它的动态
 > 外参要连 `arm_service` 拿臂基座位姿）。相机是**独占**的，所以
@@ -59,9 +67,13 @@ configs/
   vision.yaml     视觉服务配置（相机 / 检测器 / 解算 / 手眼外参）
   calibration.yaml 标定板规格（尺寸必须量实际打印结果）
   .env            密钥，不入库
-scripts/          启停与自检脚本
+requirements/     手写的可移植依赖清单（asrt / agent / tts / vision）
+envs/legacy/      旧的 conda env export 产物（仅存档，不要用来建环境）
+scripts/
+  setup_envs.sh   新机器建四个 conda 环境（幂等）
 docs/
   architecture.md         架构与接口契约
+  environment-setup.md    环境部署（为什么不用 conda env export / 三个 pip 冲突）
   action-integration.md   动作接入（Agnes 原生 function calling）
   arm-service.md          机械臂服务（协议约束 / 安全门阀）
   vision-service.md       视觉服务（相机编译 / D2C 对齐 / 深度采样）

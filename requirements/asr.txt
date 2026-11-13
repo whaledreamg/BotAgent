@@ -1,0 +1,42 @@
+# ASR 服务依赖 (Python 3.10)
+#
+# 这里是**手写的**依赖清单, 不是 `conda env export` 的产物 ——
+# export 会写死 build 号 / prefix / torch 的 local version, 换机器必挂。
+# 详见 docs/environment-setup.md。
+#
+# numpy 必须 <2.0:
+#   1) vosk 0.3.45 与 onnx 生态的旧版 ABI;
+#   2) opencv/其它音频栈在本环境无需求, 保持 1.x 最稳。
+
+numpy==1.23.5
+
+# --- 音频采集/播放 ---
+# PyAudio 需要系统 portaudio19-dev (见 docs/environment-setup.md)
+pyaudio==0.2.14
+sounddevice==0.5.6
+
+# --- 语音识别 ---
+# 关键: vosk 之前只装在 user-site (~/.local/lib/...), conda 导出时漏掉了,
+# 换机器后 ASR 服务启动即 ModuleNotFoundError。
+vosk==0.3.45
+
+# --- 重采样 (resample_wav.py 的 Python 后端) ---
+# 代码里是 try/except ImportError 包着的, 缺了会走 ffmpeg 后端;
+# 但装上更省事, 避免依赖系统 ffmpeg。
+scipy==1.10.0
+soundfile==0.8.1
+
+# --- HTTP 客户端 (agent_client / tts_client) ---
+requests==2.28.2
+urllib3==1.26.14
+
+# --- 配置与工具 ---
+pyyaml==6.0.3
+pypinyin==0.55.0
+pillow==12.3.0
+tabulate==0.10.0
+edge-tts==7.3.1
+Werkzeug==2.2.2
+
+# --- 传输 ---
+websockets==16.1.1

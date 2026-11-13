@@ -1,0 +1,47 @@
+# Vision 服务依赖 (Python 3.11)
+#
+# ⚠️ 不要直接 `pip install -r requirements/vision.txt` —— 会有解析冲突。
+#    请用 `./scripts/setup_envs.sh vision`, 它按正确顺序分三步装。
+#
+# 原因: pyorbbecsdk2==2.1.3 的元数据要求 `numpy<2.0.0` (Python < 3.12 时),
+#       而 opencv-python 5.x 要求 `numpy>=2`。
+#       两者同时进 resolver 必然失败。
+#
+# 脚本的解法:
+#   1. 先装 torch + opencv + numpy + ultralytics
+#   2. 再 `pip install --no-deps pyorbbecsdk2==2.1.3`  (绕开它的 numpy 约束)
+#   3. 再装其余 Web 服务依赖
+#
+# 另外两个坑:
+#   * pyorbbecsdk2 的 wheel **没有编译 USB PAL**, 直接用会报
+#     "Usb pal is not exist, please check the build config that you have
+#      enabled BUILD_USB_PAL"
+#     必须源码编译 OrbbecSDK 并设 LD_LIBRARY_PATH, 见 docs/vision-service.md
+#   * ultralytics 在 Linux 上的 numpy 约束是
+#     `!=2.0.*,!=2.1.*,...,!=2.3.4,>=1.23.0` —— numpy 2.4.6 满足
+
+# --- 检测 ---
+ultralytics==8.4.208
+ultralytics-thop==2.2.5
+
+# --- 视觉 ---
+# 用 4.x 而不是 5.x: 4.x 对 numpy 1.x / 2.x 都兼容, 换机器时不用赌 resolver
+opencv-python==4.14.0.94
+numpy==2.4.6
+
+# --- 深度学习 ---
+# torchvision 0.29.2 要求 torch>=2.14.0, 与 torch 2.15.0 匹配
+torch==2.15.0
+torchvision==0.29.2
+
+# --- Orbbec 相机 ---
+# 必须用 --no-deps 安装, 否则它会把 numpy 拉回 <2.0 与 opencv 冲突
+pyorbbecsdk2==2.1.3
+
+# --- Web 服务 ---
+fastapi==0.162.4
+uvicorn==0.54.0
+websockets==17.4
+pyyaml==6.0.3
+requests==2.34.2
+pydantic==2.14.3
