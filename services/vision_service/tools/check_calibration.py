@@ -136,6 +136,78 @@ def make_board_object_points(spec: BoardSpec) -> np.ndarray:
     return board_object_points(spec)
 
 
+def make_joint_synthetic_samples(
+    n: int = 20,
+    noise_px: float = 0.3,
+    seed: int = 7,
+):
+    """造一组**工具偏置不为单位阵**的合成采样。
+
+    用来测 ``solve_joint`` —— 常规解算在这个场景下会失败 (因为
+    ``T_tool_board`` 不知道), 只有联合解算能救回来。
+    """
+    import cv2
+
+    from calibration.board import board_object_points
+
+    rng = np.random.default_rng(seed)
+    board = board_object_points(BoardSpec())
+
+    # 真值外参: 相机在躯干上, 朝前略向下
+    true_cam = np.eye(4)
+    true_cam[:3, :3] = rpy_to_matrix([0.15, 0.25, 0.0])
+    true_cam[:3, 3] = np.array([0.05, 0.0, 1.45])
+
+    # 真值工具偏置: 板装在工具外 340mm, 法线朝 +Z (板面朝上)
+    true_tb = np.eye(4)
+    true_tb[:3, :3] = rpy_to_matrix([0.0, 0.0, 0.7])
+    true_tb[:3, 3] = np.array([-0.185, 0.278, 0.069])
+
+    cam_matrix = np.array([[900.0, 0, 640.0], [0, 900.0, 400.0], [0, 0, 1.0]])
+
+    samples: List[PoseSample] = []
+    for i in range(n):
+        dist = 0.4 + 0.8 * rng.random()
+        ang = np.array(
+            [
+                rng.uniform(-0.6, 0.6),
+                rng.uniform(-0.6, 0.6),
+                rng.uniform(-3.0, 3.0),
+            ]
+        )
+        rot, _ = cv2.Rodrigues(ang)
+        t_cam_board = np.eye(4)
+        t_cam_board[:3, :3] = rot
+        t_cam_board[:3, 3] = np.array(
+            [rng.uniform(-0.3, 0.3), rng.uniform(-0.25, 0.25), dist]
+        )
+
+        # T_world_cam = T_world_tool · T_tool_board · T_board_cam
+        # => T_world_tool = T_world_cam · T_cam_board · inv(T_tool_board)
+        t_world_tool = true_cam @ t_cam_board @ invert_transform(true_tb)
+
+        proj, _ = cv2.projectPoints(
+            board, t_cam_board[:3, :3], t_cam_board[:3, 3], cam_matrix, None
+        )
+        img_pts = proj.reshape(-1, 2)
+        if noise_px > 0:
+            img_pts = img_pts + rng.normal(0, noise_px, img_pts.shape)
+
+        samples.append(
+            PoseSample(
+                t_cam_board=t_cam_board,
+                t_world_tool=t_world_tool,
+                t_tool_board=np.eye(4),  # **故意给错的** (单位阵)
+                obj_points=board.copy(),
+                img_points=img_pts,
+                corner_count=len(img_pts),
+                label=f"synthetic-{i}",
+            )
+        )
+
+    return samples, true_cam, true_tb, cam_matrix
+
+
 # ------------------------------------------------------------ 检查项
 
 
@@ -530,6 +602,66 @@ def check_rigid_provider() -> None:
     check("工厂: 头位姿没给时不可用", provider.get() is None)
 
 
+def check_joint_solver() -> None:
+    print("\n[11] 联合解算 (T_tool_board + T_world_cam 同时求)")
+    from calibration.handeye import solve_joint
+
+    samples, true_cam, true_tb, cam_matrix = make_joint_synthetic_samples(n=20)
+
+    # 先确认常规解算在偏置未知时确实会失败 (否则这个测试没意义)
+    normal = solve_handeye(samples, refine=False)
+    check(
+        "偏置未知时常规解算失败 (这正是要联合解的场景)",
+        normal is None or normal.sample_count < 15,
+        f"常规解算采样数 {normal.sample_count if normal else 'None'}",
+    )
+
+    joint = solve_joint(
+        samples, cam_matrix, np.zeros(5), initial_tool_board=np.eye(4)
+    )
+    if joint is None:
+        check("联合解算成功", False)
+        return
+    cam, tb, rms = joint
+
+    check("联合解算成功", True, f"重投影 RMS {rms:.3f} px")
+    check("重投影残差 < 2 px", rms < 2.0, f"RMS {rms:.3f} px")
+
+    pos_cam = float(np.linalg.norm(cam[:3, 3] - true_cam[:3, 3]))
+    check(
+        "T_world_cam 平移解回真值 (< 5 mm)",
+        pos_cam < 0.005,
+        f"误差 {pos_cam * 1000:.3f} mm",
+    )
+    rot_cam = rotation_error_rad(cam[:3, :3], true_cam[:3, :3])
+    check(
+        "T_world_cam 旋转解回真值 (< 0.5°)",
+        rot_cam < math.radians(0.5),
+        f"误差 {math.degrees(rot_cam):.4f}°",
+    )
+
+    pos_tb = float(np.linalg.norm(tb[:3, 3] - true_tb[:3, 3]))
+    check(
+        "T_tool_board 平移解回真值 (< 10 mm)",
+        pos_tb < 0.010,
+        f"误差 {pos_tb * 1000:.3f} mm",
+    )
+    rot_tb = rotation_error_rad(tb[:3, :3], true_tb[:3, :3])
+    check(
+        "T_tool_board 旋转解回真值 (< 1.0°)",
+        rot_tb < math.radians(1.0),
+        f"误差 {math.degrees(rot_tb):.4f}°",
+    )
+
+    # 解出来的旋转必须是真的旋转 (det = +1), 不能是垃圾
+    det = float(np.linalg.det(tb[:3, :3]))
+    check(
+        "T_tool_board 是纯旋转 (det = +1)",
+        abs(det - 1.0) < 1e-6,
+        f"det={det:+.9f}",
+    )
+
+
 def main() -> int:
     print("=" * 62)
     print("标定流程自检 (合成数据)")
@@ -545,6 +677,7 @@ def main() -> int:
     check_chirality_detection()
     check_provider()
     check_rigid_provider()
+    check_joint_solver()
 
     print()
     print("=" * 62)

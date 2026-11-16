@@ -168,6 +168,8 @@ class SafetyConfig:
     require_connection: bool = True
     #: 检查故障锁定 (faulted / faultCode)
     check_fault: bool = True
+    #: 检查整机操作模式必须是 auto (手动模式控制器拒绝入控, 10074)
+    require_auto_mode: bool = True
     #: 允许动作的运行模式 (只有 CSPPassthrough 能接受实时位置流)
     allowed_modes: List[str] = field(default_factory=lambda: ["CSPPassthrough"])
     #: 门阀检查超时 (毫秒); 超时按「不通过」处理
@@ -248,6 +250,8 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         require_enabled=bool(sf.get("require_enabled", True)),
         require_connection=bool(sf.get("require_connection", True)),
         check_fault=bool(sf.get("check_fault", True)),
+        # 检查整机操作模式是 auto (手动模式控制器拒绝入控: 10074)
+        require_auto_mode=bool(sf.get("require_auto_mode", True)),
         allowed_modes=[
             str(x) for x in (sf.get("allowed_modes") or ["CSPPassthrough"])
         ],

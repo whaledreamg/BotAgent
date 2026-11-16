@@ -10,7 +10,7 @@ flowchart LR
     Sem -->|"route=chat"| Chat[ChatHandler]
     Sem -->|"route=tool"| Tool[ToolHandler]
     Sem -->|"route=device"| Dev[DeviceHandler]
-    Chat --> LLM[Agnes LLM<br/>原生 function calling]
+    Chat --> LLM[LLM (OpenAI 兼容)<br/>原生 function calling]
     Tool --> Exec[动作执行]
     Dev --> Exec
     Chat -->|"speak=true"| ASRSvc
@@ -54,7 +54,7 @@ Bot Agent/
 │   └── agent_service/        # 新增
 │       ├── app.py            # FastAPI 路由
 │       ├── config.py         # 读 configs/agent.yaml + configs/.env
-│       ├── llm.py            # Agnes 客户端 (含原生 tool calling)
+│       ├── llm.py            # LLM 客户端 (OpenAI 兼容, 多 provider + 按角色路由)
 │       ├── session.py        # 会话历史
 │       ├── router.py         # 意图分流 (规则 + tool calling)
 │       ├── registry.py       # 分支注册表
@@ -146,7 +146,18 @@ IDLE ──唤醒词──> RECORDING ──识别完成──> THINK ──spea
 
 ```yaml
 llm:
-  model: agnes-2.5-flash   # agnes-3.0-flash 首字延迟波动大 (1.5s~33s), 语音场景别用
+  default_provider: agnes
+  providers:
+    agnes:
+      base_url: https://api.agnes-ai.cn/v1
+      # agnes-3.0-flash 首字延迟波动大 (1.5s~33s), 语音场景别用
+      model: agnes-2.5-flash
+      api_key_env: AGNES_API_KEY
+  # 三个角色默认用同一个 provider; 需要时按角色拆开
+  roles:
+    chat:     { provider: agnes }
+    classify: { provider: agnes }
+    tool:     { provider: agnes }
   max_tokens: 256          # 限制生成长度 -> 直接降低 TTFT 和 TTS 合成时长
 router:
   mode: hybrid            # rules | llm | hybrid
@@ -156,7 +167,6 @@ router:
   # 原生 function calling: 规则没命中时才走, 一次问出「调哪个工具、参数」
   tool_calling:
     enabled: true
-    model: agnes-2.5-flash
     timeout: 5.0
     tool_choice: auto     # 不要用 required
   rules:
@@ -165,8 +175,10 @@ router:
       exclude: ["怎么样", "如何", "为什么"]
 ```
 
-> `configs/.env` 里的 `LLM_MODEL` **会覆盖** YAML 的 `llm.model`。
-> 改完 YAML 记得同步改 `.env`，否则「配置改了没效果」。
+> 多 provider 的完整说明见 [`llm-providers.md`](llm-providers.md)。
+>
+> `configs/.env` 里的 `LLM_MODEL` **会覆盖** `default_provider` 对应预设的模型名。
+> 改完 YAML 记得同步检查 `.env`，否则「配置改了没效果」。
 
 ### `configs/actions.yaml`（机械臂说法映射）
 
@@ -329,14 +341,16 @@ router:
 
 ### 第 2 级：tool calling 升级路径
 
-规则没命中（或命中了但分支认不出具体动作）时，用 **Agnes 原生 function
-calling** 一次问出「调哪个工具、参数是什么」。
+规则没命中（或命中了但分支认不出具体动作）时，用 **原生 function calling**
+一次问出「调哪个工具、参数是什么」。
 
 ```yaml
+llm:
+  roles:
+    tool: { provider: agnes, model: agnes-2.5-flash }
 router:
   tool_calling:
     enabled: true
-    model: agnes-2.5-flash
     timeout: 5.0
     tool_choice: auto      # 不要用 required, 否则闲聊也会调工具
 ```
@@ -423,7 +437,9 @@ ChatTTS 首次加载 853MB 权重较慢，`/health` 在 `model_loaded=true` 之�
 
 **Agent 报 401 / 未配置密钥**
 
-密钥在 `configs/.env`（`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`），可用环境变量覆盖。`/health` 里的 `api_key_configured` 可快速确认。
+密钥在 `configs/.env`，按 provider 分开配（`AGNES_API_KEY` / `DEEPSEEK_API_KEY` …）。
+`/health` 里的 `api_key_configured` 可快速确认，完整说明见
+[`llm-providers.md`](llm-providers.md)。
 
 **工具分支的播报规则**
 

@@ -15,13 +15,16 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from camera import CameraError, Frame, OrbbecCamera
+from camera_adapter import CameraError, Frame
+from camera_factory import create_camera_adapter
 from detector import Detection, Detector, DetectorError
 from solver import PoseSolver, Target3D
+from tracing import DetectionTracer
 import class_names
 
 logger = logging.getLogger("vision.service")
@@ -61,7 +64,9 @@ class VisionService:
 
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
-        self.camera = OrbbecCamera(cfg.camera)
+        # 使用工厂创建相机适配器
+        camera_type = getattr(cfg.camera, "camera_type", "head")
+        self.camera = create_camera_adapter(cfg, camera_type)
         self.detector = Detector(cfg.detector)
         self.solver = PoseSolver(cfg.solver, cfg.extrinsic)
 
@@ -76,6 +81,10 @@ class VisionService:
         self._timestamp_us: int = 0
         self._errors: List[str] = []
         self._started = False
+
+        # 追溯系统
+        trace_dir = Path(getattr(cfg, "trace_dir", "traces"))
+        self._tracer = DetectionTracer(trace_dir)
 
     # ------------------------------------------------------------ 动态外参
 
@@ -288,6 +297,20 @@ class VisionService:
                 ]
             objects.append(obj)
 
+            # 追溯记录 (异步保存, 不阻塞响应)
+            try:
+                self._tracer.record(
+                    label=det.label,
+                    confidence=float(det.confidence),
+                    bbox=det.bbox,
+                    image=capture.color,
+                    pose=pose3d,
+                    frame=frame,
+                    extra={"keypoints_count": len(det.keypoints) if det.keypoints else 0},
+                )
+            except Exception as exc:
+                logger.debug("记录识别追溯失败: %s", exc)
+
         elapsed = int((time.time() - started) * 1000)
 
         # 顶层 frame 报**实际拿到的**坐标系, 不是请求的那个。
@@ -452,7 +475,11 @@ class VisionService:
             return []
 
         # 中文 -> YOLO 类名
-        names = [c.lower() for c in class_names.candidates(label)]
+        #
+        # 把模型当前的实际类名也传进去 —— 这样自定义类名 (比如自己训的
+        # 「螺丝」) 也能对上带修饰词的说法 ("那个螺丝"、"一颗螺丝")。
+        names = [c.lower() for c in
+                 class_names.candidates(label, self._model_classes())]
 
         with self._lock:
             cached = list(self._last_objects)
@@ -469,6 +496,26 @@ class VisionService:
             return []
 
         return self._reframe(self._match_label(result["objects"], names), frame)
+
+    def _model_classes(self) -> List[str]:
+        """模型当前的实际类名列表。
+
+        自定义模型训练完, 类名可能是「螺丝」「工件A」这种自定义词 ——
+        内置的 `ZH_TO_CLASS` 映射表里没有, 靠它匹配不上。
+
+        拿到模型自己的 `names` 就能解决: 用户说「螺丝」时, 直接拿
+        模型类名去比。
+        """
+        detector = getattr(self, "detector", None)
+        if detector is None:
+            return []
+        try:
+            names = detector.class_names
+        except Exception:
+            return []
+        if not names:
+            return []
+        return [str(v) for v in names.values()]
 
     def _find_conf(self) -> float:
         """按名字查找时的置信度阈值。

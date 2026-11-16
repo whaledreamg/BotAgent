@@ -69,6 +69,19 @@ class PoseSample:
     corner_count: int = 0
     #: 备注 (比如 "左臂")
     label: str = ""
+    #: 这一帧原始彩色图的路径 (相对 session 目录)。
+    #:
+    #: **为什么存图**: 标定最花时间的是「摆位姿 -> 拍照 -> 发现这帧是坏的 ->
+    #: 重摆」。存了图之后, 离线就能重新检测角点、重新解算、剔除坏样本 ——
+    #: 全程不用再动机械臂。
+    image_path: str = ""
+    #: 这一帧的板在相机系的距离 (米), 便于筛选/剔除太近或太远的帧
+    board_distance_m: float = 0.0
+    #: 这一帧的原始彩色图 (BGR, numpy 数组)。
+    #:
+    #: **不写进 session.json** —— 图片太大, 落盘后只在 JSON 里存路径。
+    #: 落盘由 :func:`calibration.session.save_session` 负责。
+    image: Optional[np.ndarray] = None
 
     def t_world_cam(self) -> np.ndarray:
         """这一帧推出来的「相机系 -> 世界系」变换。"""
@@ -355,6 +368,169 @@ def _refine(
     return refined
 
 
+# ------------------------------------------------------------ 联合解算
+
+
+def solve_joint(
+    samples: Sequence[PoseSample],
+    camera_matrix: np.ndarray,
+    dist_coeffs: Optional[np.ndarray] = None,
+    initial_tool_board: Optional[np.ndarray] = None,
+    max_iter: int = 300,
+) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+    """**同时**解出 ``T_tool_board`` 和 ``T_world_cam``。
+
+    返回 ``(T_world_cam, T_tool_board, rms_px)``, 失败返回 None。
+
+    **什么时候需要这个**
+
+    常规手眼标定的假设是: ``T_tool_board`` **已知** (板怎么装在工具上是
+    事先量好的), 只求 ``T_world_cam``。
+
+    但有两种情况这个假设不成立:
+
+    1. **偏置没填对 / 根本没填** —— 比如 ``--tool-offset`` 的文件不存在,
+       脚本静默用了单位阵 (板原点 = 工具原点), 而板实际装在工具外 285mm。
+       这时常规解算会报「剔野值后只剩 0 个采样」, 或者给出完全错的结果。
+    2. **板装的位置本来就没量准** —— 现场装配, 只知道大概。
+
+    这时把两个量一起解出来, 数据自己会告诉我们答案。
+
+    **数学依据**: 重投影误差对 ``T_world_cam`` 和 ``T_tool_board``
+    是**对称**的 —— 板在世界系下的位姿是 ``T_world_tool · T_tool_board``,
+    相机在世界系下的位姿是 ``T_world_cam``, 两者的相对关系才是观测量。
+    所以联合优化是有解的, 而且比 AX=XB 稳 (用的是全部角点, 不是相对运动)。
+
+    **风险**: 两个量一起解有 6 个自由度是耦合的, 采样姿态不够多样时
+    可能解得「偏」但残差看起来还行。所以这里:
+    - 用**留一法自检** (见 ``calib_handeye.py``) 验证稳定性
+    - 返回的 RMS 是重投影残差 (像素), 正常应该 < 2px
+    """
+    import cv2
+
+    usable = [
+        s for s in samples
+        if s.obj_points is not None and s.img_points is not None
+    ]
+    if len(usable) < 3:
+        logger.error("可用采样太少 (%d), 至少要 3 个", len(usable))
+        return None
+
+    intr = np.asarray(camera_matrix, dtype=np.float64)
+    dist = (
+        None if dist_coeffs is None
+        else np.asarray(dist_coeffs, dtype=np.float64).ravel()
+    )
+
+    # ---- 初值 ----
+    tb0 = (
+        np.eye(4, dtype=np.float64)
+        if initial_tool_board is None
+        else np.asarray(initial_tool_board, dtype=np.float64)
+    )
+    # 用第一帧的 t_cam_board 反推 T_world_cam 的初值
+    s0 = usable[0]
+    tw0 = s0.t_world_tool
+    cb0 = s0.t_cam_board
+    c0 = tw0 @ tb0 @ _invert(cb0)
+
+    def unpack(p: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        c = np.eye(4, dtype=np.float64)
+        c[:3, :3] = _rodrigues_to_matrix(p[3:6])
+        c[:3, 3] = p[0:3]
+        x = np.eye(4, dtype=np.float64)
+        x[:3, :3] = _rodrigues_to_matrix(p[9:12])
+        x[:3, 3] = p[6:9]
+        return c, x
+
+    def residuals(p: np.ndarray) -> np.ndarray:
+        c, x = unpack(p)
+        out: List[float] = []
+        for s in usable:
+            t_cb = _invert(c) @ s.t_world_tool @ x
+            rvec = _rodrigues(t_cb[:3, :3])
+            tvec = t_cb[:3, 3]
+            proj = _project(s.obj_points, rvec, tvec, intr, dist)
+            out.extend((proj - s.img_points).ravel().tolist())
+        return np.array(out, dtype=np.float64) if out else np.zeros(1)
+
+    p = np.hstack([
+        c0[:3, 3],
+        _rodrigues(c0[:3, :3]),
+        tb0[:3, 3],
+        _rodrigues(tb0[:3, :3]),
+    ])
+
+    r0 = residuals(p)
+    if not np.any(r0):
+        return None
+    rms_before = math.sqrt(float(np.dot(r0, r0)) / max(1, len(r0) // 2))
+
+    # Gauss-Newton + LM 阻尼
+    lam = 1e-3
+    current = p
+    current_cost = float(np.dot(r0, r0))
+
+    for _iter in range(max_iter):
+        r = residuals(current)
+        cost = float(np.dot(r, r))
+        if not np.isfinite(cost):
+            break
+
+        jac = np.zeros((len(r), 12), dtype=np.float64)
+        eps = 1e-7
+        for k in range(12):
+            p2 = current.copy()
+            p2[k] += eps
+            jac[:, k] = (residuals(p2) - r) / eps
+
+        jtj = jac.T @ jac
+        jtr = jac.T @ r
+        jtj += lam * np.diag(np.maximum(np.diag(jtj), 1e-12))
+
+        try:
+            delta = np.linalg.solve(jtj, -jtr)
+        except np.linalg.LinAlgError:
+            break
+
+        candidate = current + delta
+        r_new = residuals(candidate)
+        cost_new = float(np.dot(r_new, r_new))
+
+        if cost_new < current_cost:
+            current = candidate
+            current_cost = cost_new
+            lam = max(lam * 0.5, 1e-10)
+            if float(np.linalg.norm(delta)) < 1e-11:
+                break
+        else:
+            lam *= 5.0
+            if lam > 1e6:
+                break
+
+    c, x = unpack(current)
+    rms_after = math.sqrt(current_cost / max(1, len(r0) // 2))
+    logger.info(
+        "联合解算: 重投影残差 %.3f -> %.3f px", rms_before, rms_after
+    )
+    return c, x, rms_after
+
+
+def _invert(m: np.ndarray) -> np.ndarray:
+    """4x4 刚体变换求逆。"""
+    from ._compat import invert_transform
+
+    return invert_transform(np.asarray(m, dtype=np.float64))
+
+
+def _rodrigues_to_matrix(rvec: np.ndarray) -> np.ndarray:
+    """旋转向量 (3,) -> 3x3 旋转矩阵。"""
+    import cv2
+
+    rot, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    return np.asarray(rot, dtype=np.float64)
+
+
 def _board_pose_in_camera(
     matrix: np.ndarray, sample: PoseSample
 ) -> Optional[np.ndarray]:
@@ -447,4 +623,10 @@ def solve_pose(
     return m
 
 
-__all__ = ["HandEyeResult", "PoseSample", "solve_handeye", "solve_pose"]
+__all__ = [
+    "HandEyeResult",
+    "PoseSample",
+    "solve_handeye",
+    "solve_joint",
+    "solve_pose",
+]

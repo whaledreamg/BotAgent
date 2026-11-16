@@ -27,7 +27,7 @@ from library import ActionLibrary, ActionNotFound, ActionUnit
 from notifier import ArmNotifier
 from robot.connection import RobotConnection
 from robot.controller import ArmController, ControllerError, Phase
-from safety import SafetyGate, SafetyReport
+from safety import SafetyCheck, SafetyGate, SafetyReport
 from timeline.model import JOINT_COUNT, JointState
 from timeline.playback import PlaybackEngine
 
@@ -45,6 +45,10 @@ async def await_run(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
     控制器的 WebSocket 握手、HTTP 响应都是阻塞的, 直接调会把 FastAPI 的
     事件循环卡住, 期间所有 HTTP 请求都超时。
+
+    **在 ``async def`` 里要用这个**, 不要用 :func:`run_blocking` ——
+    后者是同步的, ``await`` 它会报
+    "object dict can't be used in 'await' expression"。
     """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_EXECUTOR, lambda: fn(*args, **kwargs))
@@ -55,6 +59,8 @@ def run_blocking(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
     用于本来就在后台线程 (播放线程) 里的场景 —— 那里阻塞是允许的,
     但仍要保证不会卡住事件循环。
+
+    **这是同步函数** —— 在 ``async def`` 里要 await 请用 :func:`await_run`。
     """
     future = _EXECUTOR.submit(fn, *args, **kwargs)
     return future.result()
@@ -77,6 +83,7 @@ class ArmService:
             timeout=self.arm_cfg.connect_timeout,
             on_state=self._on_robot_state,
             on_event=self._on_controller_event,
+            on_reconnect=self._on_reconnected,
         )
 
         self._controller = ArmController(
@@ -120,6 +127,8 @@ class ArmService:
         self._started = False
         #: 最近一次查询 robot/status 的臂名 (应答里没有 name 字段, 只能记住)
         self._status_query_arm = ""
+        #: 后台重连线程 (控制器启动时连不上时用)
+        self._reconnect_thread: Optional[threading.Thread] = None
 
         # ---- 运动学快照 (手眼标定用) ----
         #
@@ -165,6 +174,9 @@ class ArmService:
 
         控制器连不上不阻止服务启动 —— /health 会反映 controller_connected=false,
         这样没有真机时也能验证动作库与协议逻辑。
+
+        **连不上也会一直重试** —— 之前只试一次, 控制器晚启动 (或者
+        开机时还没上电) 就永远连不上了, 得手动重启服务。
         """
         self.library.load()
 
@@ -175,19 +187,64 @@ class ArmService:
         if connected:
             self._on_connected()
         else:
-            logger.warning("[服务] 控制器不可达 (%s), 服务以降级模式运行",
-                           self.arm_cfg.controller_ws)
+            logger.warning("[服务] 控制器不可达 (%s), 服务以降级模式运行, "
+                           "后台会持续重连", self.arm_cfg.controller_ws)
+            # 后台重连 —— 控制器起来后自动接上, 不用重启服务
+            self._start_reconnect_worker()
+
+    def _start_reconnect_worker(self) -> None:
+        """起一个后台线程, 一直尝试连上控制器。"""
+        if self._reconnect_thread is not None and self._reconnect_thread.is_alive():
+            return
+
+        def worker() -> None:
+            backoff = 2.0
+            while self._started and not self._conn.connected:
+                time.sleep(backoff)
+                if not self._started or self._conn.connected:
+                    return
+                try:
+                    if self._conn.connect():
+                        logger.info("[服务] 控制器已连上")
+                        self._on_connected()
+                        return
+                except Exception as exc:
+                    logger.warning("[服务] 重连控制器失败: %s", exc)
+                backoff = min(backoff * 2, 30.0)
+
+        self._reconnect_thread = threading.Thread(
+            target=worker, daemon=True, name="arm-reconnect"
+        )
+        self._reconnect_thread.start()
 
     def shutdown(self) -> None:
         self._started = False
         self._stop_playback(silent=True)
         self._controller.shutdown()
         self._conn.disconnect()
+        # 重连线程靠 _started 标志退出, 这里不用 join (它是 daemon)
+        self._reconnect_thread = None
 
     # ------------------------------------------------------------ 控制器事件
 
     def _on_connected(self) -> None:
         """连上控制器: 拉机器人清单以识别左右臂。"""
+        self._conn.list_robots()
+
+    def _on_reconnected(self) -> None:
+        """重连成功后: 重新订阅状态推送 + 重新拉机器人清单。
+
+        **为什么必须重新订阅**: 状态推送 (``robotState/sub``) 是**按连接**
+        建立的 —— 新连接上并没有订阅, 不重新订阅就收不到状态,
+        ``cartesian`` / 关节角会一直是旧值。
+
+        **为什么还要清空运动学快照**: 断连期间的位姿是过期的, 留着会
+        让标定脚本拿到「看起来正常其实是陈旧」的数据。清掉之后,
+        新连接上的第一次推送会重新填上。
+        """
+        logger.info("[服务] 控制器已重连, 重新订阅状态推送")
+        with self._kin_lock:
+            self._kin.clear()
         self._conn.list_robots()
 
     def _on_robot_state(self, state: Dict[str, Any]) -> None:
@@ -482,6 +539,20 @@ class ArmService:
             err = response.get("err") or {}
             code = err.get("code", "?")
             message = err.get("message", "未知错误")
+            # 汇总错误 (24077/24078) 里藏着每条臂自己的错误码与原因,
+            # 只有一个汇总 message 是查不出根因的 —— 这里把明细打出来。
+            if isinstance(db, dict):
+                for item in db.get("results") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    item_err = item.get("err") or {}
+                    logger.warning(
+                        "[服务] 入控失败明细: %s ok=%s code=%s message=%s",
+                        item.get("robot"),
+                        item.get("ok"),
+                        item_err.get("code", "?"),
+                        item_err.get("message", "无"),
+                    )
             self._controller._fail(f"入控失败 ({code}): {message}")
             return
 
@@ -647,6 +718,10 @@ class ArmService:
 
         检查**所有**臂 —— 任何一条臂有异常, 都不该动 (双臂共用一条通道时,
         一条臂异常意味着另一条也处于不确定状态)。
+
+        另外检查**整机操作模式** (``device/getOpsMode``): 手动模式下
+        控制器会拒绝外部实时接口入控 (10074 「未开启远程模式」)。
+        这项是整机属性, 不分臂, 所以在臂的循环外面查。
         """
         report = SafetyReport()
 
@@ -665,6 +740,29 @@ class ArmService:
             return report
 
         all_checks = []
+
+        # ---- 整机操作模式 ----
+        #
+        # 手动模式下手动的限速更严, 而且外部实时接口根本入不了控
+        # (10074)。提前查一次, 别等入控失败才报一个天书般的错。
+        #
+        # 查不到 (None) 一律放行 —— 这个接口是「锦上添花」的检查,
+        # 控制器版本不支持时不该把整个动作链路堵死。
+        ops_mode = self._conn.get_ops_mode() if self.cfg.safety.require_auto_mode else "auto"
+        ops_ok = ops_mode != "manual"
+        all_checks.append(
+            SafetyCheck(
+                code="ops_mode",
+                ok=ops_ok,
+                message="控制器处于手动模式, 请切到自动模式" if not ops_ok else "",
+                detail=f"opsMode={ops_mode or 'unknown'}",
+            )
+        )
+        if not ops_ok:
+            report.ok = False
+            report.code = "ops_mode"
+            report.reason = "控制器处于手动模式, 请切到自动模式"
+
         for arm_name in arms:
             status = self._fetch_status(arm_name)
             sub = self._gate.check(status, connected=self._conn.connected)
@@ -672,7 +770,7 @@ class ArmService:
             for c in sub.checks:
                 c.detail = f"[{arm_name}] {c.detail}".strip()
             all_checks.extend(sub.checks)
-            if not sub.ok:
+            if not sub.ok and report.ok:
                 report.ok = False
                 report.code = sub.code
                 report.reason = sub.reason
@@ -1117,13 +1215,47 @@ class ArmService:
                 "没有头/相机安装座位姿 (headFrame) —— 头会动的话需要控制器提供"
             )
 
+        connected = self._conn.connected
+
+        # ---- 陈旧检测 ----
+        #
+        # **这是标定翻车的头号原因**: 控制器断连后, 服务还在跑, 接口还返回
+        # 200, 但 ``_kin`` 里的快照永远冻结在断连那一刻。之前 25 个采样的
+        # ``T_world_tool`` 完全相同, 解算时被当成野值剔到只剩 1 个。
+        #
+        # 这里显式告诉调用方「这份数据是不是新鲜的」。
+        stale = False
+        age_ms = 0
+        if not connected:
+            stale = True
+            notes.append(
+                "**控制器已断开** —— 下面的位姿是断连前的陈旧快照, 不能用于标定"
+            )
+        elif arms:
+            newest = max(
+                (int(data.get("timestamp_ms") or 0) for data in arms.values()),
+                default=0,
+            )
+            if newest:
+                age_ms = int(time.monotonic() * 1000) - newest
+                # 状态推送周期 50ms, 超过 2s 基本就是卡住了
+                if age_ms > 2000:
+                    stale = True
+                    notes.append(
+                        f"运动学快照已 {age_ms} ms 没更新 —— 数据可能是陈旧的"
+                    )
+
         return {
-            "ok": bool(arms),
+            "ok": bool(arms) and not stale,
             "arms": arms,
             "lifting_column": column,
             "head_frame": head_frame,
             "head_frame_kind": head_frame_kind,
-            "controller_connected": self._conn.connected,
+            "controller_connected": connected,
+            #: 数据是否是新鲜的 (False = 陈旧, 不能用于标定)
+            "stale": stale,
+            #: 快照距今多少毫秒
+            "age_ms": age_ms,
             "timestamp_ms": int(time.monotonic() * 1000),
             "notes": notes,
         }
@@ -1133,9 +1265,21 @@ class ArmService:
 
         标定脚本用这个: 每采一个位姿就调一次, 拿到的是**当下**的
         TCP 位姿 (状态推送有延迟, 推送周期 50ms, 快速运动时不够准)。
+
+        **关键**: 必须等到**新**的数据回来, 不能只看「有没有数据」。
+        之前这里只判断 ``if arms:`` —— 而 ``_kin`` 一直是满的 (状态推送
+        在填), 所以每次只等 50ms 就返回**旧数据**。加上「时间戳变了
+        才算收到」之后, 才真的拿到的是刚刚那一刻的位姿。
         """
         if not self._conn.connected:
             return self.kinematics()
+
+        # 记下请求前的快照时间戳 —— 应答到了之后它必须变
+        with self._kin_lock:
+            before = {
+                name: int(data.get("timestamp_ms") or 0)
+                for name, data in self._kin.items()
+            }
 
         for name in self._controller.active_arms():
             self._conn.get_robot_status(name)
@@ -1151,16 +1295,21 @@ class ArmService:
         elif not column:
             self._conn.send_command("liftingColumn/list", {})
 
-        # 等一小会儿让应答回来 (应答在读线程里处理)
+        # 等应答回来 (在读线程里处理)
+        #
+        # **判据是「时间戳变了」, 不是「有数据」** —— 后者会立刻返回旧快照。
         deadline = time.time() + 0.6
         while time.time() < deadline:
             with self._kin_lock:
-                arms = dict(self._kin)
-            if arms:
-                # 关节角更新过就说明应答到了
-                time.sleep(0.05)
+                now = {
+                    name: int(data.get("timestamp_ms") or 0)
+                    for name, data in self._kin.items()
+                }
+            if any(
+                ts > before.get(name, 0) for name, ts in now.items()
+            ):
                 break
-            time.sleep(0.05)
+            time.sleep(0.02)
 
         return self.kinematics()
 

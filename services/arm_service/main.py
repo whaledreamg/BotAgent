@@ -47,7 +47,7 @@ from models import (  # noqa: E402
     StopResponse,
 )
 from robot.controller import ControllerError  # noqa: E402
-from service import ArmService, run_blocking  # noqa: E402
+from service import ArmService, await_run  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -156,7 +156,13 @@ async def kinematics(refresh: bool = False) -> Dict[str, Any]:
     """
     svc = _svc()
     if refresh:
-        return await run_blocking(svc.refresh_kinematics)
+        # `refresh_kinematics` 会阻塞 (等控制器应答), 放到线程池里跑,
+        # 别把 FastAPI 的事件循环卡住。
+        #
+        # **注意**: 必须用 `await_run` (async 版), 不能用 `run_blocking`
+        # (同步版) —— 后者直接返回结果, await 它会报
+        # "object dict can't be used in 'await' expression"。
+        return await await_run(svc.refresh_kinematics)
     return svc.kinematics()
 
 

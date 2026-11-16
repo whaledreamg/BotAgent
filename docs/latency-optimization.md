@@ -93,9 +93,11 @@ conda run -n asrt python tools/profile_latency.py
 
 **修复**：默认模型切到 `agnes-2.5-flash`。
 
-> **踩坑**：`configs/.env` 里的 `LLM_MODEL` 会覆盖 `configs/agent.yaml` 的 `llm.model`。
+> **踩坑**：`configs/.env` 里的 `LLM_MODEL` 会覆盖 `configs/agent.yaml` 里
+> `default_provider` 对应预设的模型名。
 > 第一次只改了 YAML，服务日志仍显示 `model=agnes-3.0-flash`，排查后才发现。
-> **改完 YAML 一定要同步改 `.env`。**
+> **改完 YAML 一定要同步检查 `.env`**（多 provider 的细节见
+> [`llm-providers.md`](llm-providers.md)）。
 
 ### 问题 2：TTS「流式」其实是整段阻塞生成
 
@@ -301,23 +303,39 @@ vosk 纯计算 RTF=0.21，不是系统开销。若还想更快，
 
 ```yaml
 llm:
-  model: agnes-2.5-flash
+  default_provider: agnes
+  providers:
+    agnes:
+      base_url: https://api.agnes-ai.cn/v1
+      model: agnes-2.5-flash
+      api_key_env: AGNES_API_KEY
+  roles:
+    chat:     { provider: agnes }
+    classify: { provider: agnes }
+    tool:     { provider: agnes }
   timeout: 20
   max_retries: 2
   max_tokens: 256
 
 router:
   mode: hybrid
-  llm_fallback_model: agnes-2.5-flash
   llm_timeout: 1.2
   trust_rules: true
 ```
 
+> 多 provider 的配置说明见 [`llm-providers.md`](llm-providers.md)。
+
 ### `configs/.env`
 
 ```
-LLM_MODEL=agnes-2.5-flash   # 会覆盖 YAML, 必须同步改
+AGNES_API_KEY=sk-xxx   # 按 provider 分开配
 ```
+
+> **注意**：`LLM_MODEL` / `LLM_BASE_URL` 仍被支持，但**只作用于**
+> `default_provider`，且一旦存在就会覆盖 yaml 里那个预设的地址和模型名。
+> 所以 `.env` 里**故意不设**它们 —— 否则切换 provider 时会被残留值覆盖
+> （「以为在测 DeepSeek，其实请求发给了 Agnes」）。
+> 覆盖发生时服务启动会打 warning。
 
 ### `services/tts_service/examples/ws_server/engine.py`
 

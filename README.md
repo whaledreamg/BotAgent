@@ -74,7 +74,8 @@ scripts/
 docs/
   architecture.md         架构与接口契约
   environment-setup.md    环境部署（为什么不用 conda env export / 三个 pip 冲突）
-  action-integration.md   动作接入（Agnes 原生 function calling）
+  action-integration.md   动作接入（OpenAI 兼容 function calling）
+  llm-providers.md       LLM Provider 接入（多 provider / 按角色配置 / 降级）
   arm-service.md          机械臂服务（协议约束 / 安全门阀）
   vision-service.md       视觉服务（相机编译 / D2C 对齐 / 深度采样）
   calibration.md          标定指南（内参 / 手眼 / 左右手性检查）
@@ -91,13 +92,13 @@ docs/
 
 ## 动作接入
 
-Agent 用 **Agnes 的原生 function calling** 识别动作，机械臂动作与设备工具
+Agent 用 **OpenAI 兼容的原生 function calling** 识别动作，机械臂动作与设备工具
 共用同一套 tool schema。
 
 ```
 用户话语 → 规则匹配 (零延迟)
               │ 命中 → 直接执行，不调 LLM
-              └ 未命中 → Agnes function calling → 选工具 + 填参数 → 执行
+              └ 未命中 → function calling → 选工具 + 填参数 → 执行
 ```
 
 - **规则命中是 0ms 快速通道** —— 语音体感的基础，不能动
@@ -105,6 +106,26 @@ Agent 用 **Agnes 的原生 function calling** 识别动作，机械臂动作与
 - **机械臂动作必经安全门阀** —— 换成 tool calling 不会绕过安全检查
 
 详见 [`docs/action-integration.md`](docs/action-integration.md)。
+
+### 更换 LLM
+
+所有 LLM 接入都走 **OpenAI 兼容协议**，`configs/agent.yaml` 里配好 provider 预设
+即可换模型 —— Agnes、DeepSeek、Qwen、Kimi、OpenAI、Ollama 都能接，不用改代码。
+
+```yaml
+llm:
+  default_provider: agnes
+  providers:
+    agnes:    { base_url: ..., model: ..., api_key_env: AGNES_API_KEY }
+    deepseek: { base_url: ..., model: ..., api_key_env: DEEPSEEK_API_KEY }
+  # 三个角色 (chat/classify/tool) 默认用同一个 provider, 需要时按角色拆开
+  roles:
+    chat:     { provider: agnes }
+    classify: { provider: agnes }
+    tool:     { provider: agnes }
+```
+
+详见 [`docs/llm-providers.md`](docs/llm-providers.md)。
 
 ### 自定义工具
 
@@ -250,6 +271,27 @@ python tools/check_recognition.py          # 相机识别到了什么（模式�
 > 自动探测 `/health` 并改走 HTTP 检查，不会去抢相机。想看「相机识别到了
 > 什么」用 `tools/check_recognition.py`（`--http` 走服务，`--live` 直接
 > 开相机）。
+
+### 训练自定义物体模型
+
+默认权重是 COCO 预训练模型，**类别固定在 80 类**。抓自己的工件必须自己训
+—— 完整流程见 **[docs/vision-training.md](docs/vision-training.md)**。
+
+```bash
+# 0. 确认 GPU 可用（不行就修：sudo ./scripts/fix_gpu.sh）
+python tools/train_model.py --check
+
+# 1. 采图（相机独占，先停视觉服务）
+python tools/capture_dataset.py --count 300
+
+# 2. 建目录 + 数据集体检
+python tools/setup_dataset.py --out /path/to/dataset --names 杯子,瓶子,螺丝
+
+# 3. 标注（LabelImg，框要贴紧）
+
+# 4. 训练（训完自动写回 detector.weights，代码零改动）
+python tools/train_model.py
+```
 
 ## 坐标系与标定（相机 → 机械臂）
 

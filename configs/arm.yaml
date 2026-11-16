@@ -40,11 +40,15 @@ arm:
   #   safety_phase     正在减速中
   #   enabled          机械臂已上使能
   #   mode             运行模式在允许列表里
+  #   ops_mode         整机操作模式是 auto (手动模式控制器拒绝入控: 10074)
   safety:
     enabled: true
     require_enabled: true
     require_connection: true
     check_fault: true
+    # 控制器被切到手动模式时, 外部实时接口入控会被拒 (10074「未开启远程模式」)。
+    # 提前查一次, 直接告诉用户「请切到自动模式」。
+    require_auto_mode: true
     allowed_modes: ["CSPPassthrough"]
     # 门阀查询状态的超时 (毫秒); 超时按「不通过」处理 (不能盲动)
     timeout_ms: 3000

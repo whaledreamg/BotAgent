@@ -34,11 +34,14 @@ class RobotConnection:
         timeout: float = 5.0,
         on_state: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_reconnect: Optional[Callable[[], None]] = None,
     ) -> None:
         self.url = url
         self.timeout = timeout
         self._on_state = on_state
         self._on_event = on_event
+        #: 重连成功后的回调 —— 上层要在上面重新订阅状态推送
+        self._on_reconnect = on_reconnect
 
         self._ws = None
         self._message_id = 1
@@ -96,6 +99,68 @@ class RobotConnection:
         logger.info("[控制面] 已连接 %s", self.url)
         return True
 
+    def _connect_once(self) -> bool:
+        """只做一次连接尝试 (供重连循环用)。"""
+        try:
+            from websockets.sync.client import connect
+        except ImportError as exc:  # pragma: no cover
+            raise ControllerError(f"缺少 websockets 依赖: {exc}") from exc
+
+        kwargs = {"open_timeout": self.timeout}
+        if _supports_proxy_arg(connect):
+            kwargs["proxy"] = None
+
+        try:
+            self._ws = connect(self.url, **kwargs)
+        except Exception as exc:
+            logger.warning("[控制面] 连接失败 %s: %s", self.url, exc)
+            self._ws = None
+            return False
+
+        self._host = _host_from_url(self.url)
+        self._connected = True
+        self._closing = False
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        logger.info("[控制面] 已连接 %s", self.url)
+        return True
+
+    def _reconnect_loop(self) -> None:
+        """断连后自动重连 (指数退避)。
+
+        **为什么必须有这个**: 之前读线程一收到异常就 ``break`` 退出,
+        ``_connected`` 永久变成 False —— 服务还活着, 接口还返回 200,
+        但**运动学快照永远冻结在断连那一刻**。
+
+        手眼标定就栽在这上面: 25 个采样的 ``T_world_tool`` 完全相同,
+        解算时被当成野值剔到只剩 1 个。
+
+        退避: 1s -> 2s -> 4s -> 8s -> 16s -> 30s (封顶), 一直重试到
+        有人调 :meth:`disconnect`。
+        """
+        backoff = 1.0
+        while not self._closing:
+            time.sleep(backoff)
+            if self._closing:
+                return
+
+            try:
+                if self._connect_once():
+                    backoff = 1.0
+                    # 重连成功 -> 通知上层重新订阅状态推送
+                    if self._on_reconnect is not None:
+                        try:
+                            self._on_reconnect()
+                        except Exception as exc:  # pragma: no cover - 防御
+                            logger.warning("[控制面] 重连回调失败: %s", exc)
+                    return
+            except Exception as exc:  # pragma: no cover - 防御
+                logger.warning("[控制面] 重连异常: %s", exc)
+
+            backoff = min(backoff * 2, 30.0)
+
+        logger.info("[控制面] 重连循环已退出")
+
     def disconnect(self) -> None:
         self._closing = True
         self._connected = False
@@ -109,7 +174,11 @@ class RobotConnection:
         logger.info("[控制面] 已断开")
 
     def _read_loop(self) -> None:
-        """后台读线程: 分发响应与状态推送。"""
+        """后台读线程: 分发响应与状态推送。
+
+        **断连不退出**: 收到异常后交给 :meth:`_reconnect_loop` 自动重连。
+        之前这里是直接 ``break``, 导致连接永久断开、数据永久冻结。
+        """
         while not self._closing:
             ws = self._ws
             if ws is None:
@@ -122,7 +191,9 @@ class RobotConnection:
                 if not self._closing:
                     logger.warning("[控制面] 读取失败: %s", exc)
                     self._connected = False
-                break
+                    # 不再 break —— 交给重连循环
+                    self._reconnect_loop()
+                return
 
             if isinstance(message, bytes):
                 continue
@@ -280,6 +351,25 @@ class RobotConnection:
     def get_realtime_status(self) -> None:
         """查询 realtime 会话状态 (端口 / 会话列表 / 推送目标)。"""
         self.send_command("realtime/getStatus", {"robot": None})
+
+    def get_ops_mode(self, timeout: float = 3.0) -> Optional[str]:
+        """读整机操作模式 (``device/getOpsMode``)。
+
+        返回 ``"auto"`` / ``"manual"``; 查不到返回 None。
+
+        **为什么关心它**: 控制器处于手动模式时, 外部实时接口入控会被
+        直接拒掉 —— 错误码 **10074 「未开启远程模式」**。这个错只在
+        ``realtime/startControl`` 的响应里出现, 且被 24077 汇总包着,
+        排查起来很绕。提前读一次, 就能在门阀处直接说人话。
+        """
+        resp = self.request_sync("device/getOpsMode", {}, timeout)
+        if not isinstance(resp, dict) or resp.get("err"):
+            return None
+        db = resp.get("db")
+        if not isinstance(db, dict):
+            return None
+        mode = db.get("mode")
+        return str(mode) if mode else None
 
     def start_control(
         self, config: Dict[str, Any], robots: Optional[List[str]] = None

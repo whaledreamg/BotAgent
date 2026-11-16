@@ -5,6 +5,9 @@
 2. configs/agent.yaml
 3. 环境变量 (LLM_API_KEY / LLM_BASE_URL / LLM_MODEL)
 4. configs/.env (仅当环境变量未设置时生效)
+
+LLM 部分支持**多 provider 预设** (configs/agent.yaml 的 `llm.providers`),
+按角色 (chat / classify / tool) 分别绑定, 默认三个角色指向同一个 provider。
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("agent.config")
 
@@ -106,7 +109,87 @@ def load_dotenv(path: Path = ENV_PATH) -> Dict[str, str]:
 
 
 @dataclass
+class ProviderConfig:
+    """一个 LLM provider 预设 (OpenAI 兼容协议)。
+
+    一份 provider 预设描述「去哪家、用哪个模型、怎么鉴权」。
+    多个角色 (chat / classify / tool) 可以各自绑定不同的 provider,
+    也可以全部指向同一个 —— 默认就是后者。
+    """
+
+    #: 预设名 (configs/agent.yaml 里 `llm.providers` 的 key)
+    name: str = ""
+    #: OpenAI 兼容接口根地址, 形如 https://api.xxx.com/v1
+    base_url: str = ""
+    #: 默认模型名
+    model: str = ""
+    #: 直接写在 yaml 里的 key (本地无鉴权服务用占位值即可)
+    api_key: str = ""
+    #: 从哪个环境变量读 key (优先于上面的 api_key, 避免密钥进版本库)
+    api_key_env: str = ""
+    #: 超时秒数 (0 表示继承全局)
+    timeout: float = 0.0
+    #: 重试次数 (0 表示继承全局)
+    max_retries: int = 0
+    #: 温度 (None 表示继承全局)
+    temperature: Optional[float] = None
+    #: 生成长度上限 (0 表示继承全局)
+    max_tokens: int = 0
+    #: 是否支持原生 function calling
+    supports_tools: bool = True
+    #: 是否支持流式输出
+    supports_stream: bool = True
+    #: 备注 (如「本地服务, 无需 key」)
+    notes: str = ""
+
+    @property
+    def has_key(self) -> bool:
+        """是否配了可用的 key。"""
+        return bool(self.api_key)
+
+    def describe(self) -> str:
+        """一行摘要 (不含密钥), 给日志和 /health 用。"""
+        return f"{self.name} @ {self.base_url} model={self.model}"
+
+
+@dataclass
+class RoleConfig:
+    """一个角色的 LLM 绑定。
+
+    角色决定「这个用途用哪家模型」:
+    - chat     -> 闲聊回复
+    - classify -> 意图分类 (router 的 LLM 兜底)
+    - tool     -> 原生 function calling
+    """
+
+    #: 主 provider 名
+    provider: str = ""
+    #: 覆盖该 provider 的默认模型 (留空则用 provider 的)
+    model: str = ""
+    #: 主 provider 失败后依次尝试的备用 provider
+    fallback: List[str] = field(default_factory=list)
+    #: 角色级温度覆盖 (None 表示继承)
+    temperature: Optional[float] = None
+    #: 角色级生成长度覆盖 (0 表示继承)
+    max_tokens: int = 0
+
+
+@dataclass
 class LLMConfig:
+    """LLM 配置容器。
+
+    `providers` 是全部预设, `roles` 是角色 -> provider 的绑定。
+    下面这些扁平字段是**全局默认**, 供 provider 未单独指定时继承,
+    同时保持对旧代码 (cfg.llm.model 等) 的兼容。
+    """
+
+    #: 全部 provider 预设
+    providers: Dict[str, ProviderConfig] = field(default_factory=dict)
+    #: 角色 -> 绑定
+    roles: Dict[str, RoleConfig] = field(default_factory=dict)
+    #: 默认 provider 名 (角色未显式指定时用它)
+    default_provider: str = ""
+    #: 扁平字段 = 默认 provider 的取值 (兼容旧调用)
     base_url: str = "https://api.agnes-ai.cn/v1"
     model: str = "agnes-3.0-flash"
     api_key: str = ""
@@ -114,6 +197,32 @@ class LLMConfig:
     max_retries: int = 3
     temperature: float = 0.7
     max_tokens: int = 2048
+
+    @property
+    def provider_names(self) -> List[str]:
+        return list(self.providers.keys())
+
+    def role(self, name: str) -> RoleConfig:
+        """取角色配置; 没配就返回一个指向 default_provider 的空壳。"""
+        cfg = self.roles.get(name)
+        if cfg is not None:
+            return cfg
+        return RoleConfig(provider=self.default_provider)
+
+    def role_names(self) -> List[str]:
+        return list(self.roles.keys())
+
+
+@dataclass
+class ThinkingConfig:
+    """Thinking Mode 配置 (仅在 NLU 阶段使用, 改进复合意图理解)。"""
+
+    #: 是否启用 Thinking Mode
+    enabled: bool = False
+    #: 思考预算 (tokens)
+    budget_tokens: int = 8000
+    #: 最少任务数才启用 thinking (简单查询不用 thinking 节省成本)
+    min_complexity: int = 2
 
 
 @dataclass
@@ -145,6 +254,8 @@ class ToolCallingConfig:
     #: **不能直接用 system_prompt** —— 那是聊天用的, 会让模型用文字
     #: 「描述」动作已完成, 而不是真的去调工具 (假确认)。
     system_prompt: str = ""
+    #: Thinking Mode 配置 (改进复合意图理解)
+    thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
 
 
 @dataclass
@@ -385,6 +496,148 @@ class Config:
         return [h for h in self.handlers.values() if h.enabled]
 
 
+#: 三个角色的名字 —— 缺省时全部指向 default_provider。
+DEFAULT_ROLES = ("chat", "classify", "tool")
+
+
+def _resolve_api_key(
+    name: str,
+    raw: Dict[str, Any],
+    default_key: str = "",
+) -> str:
+    """解析一个 provider 的 API key。
+
+    顺序: yaml 里的 api_key -> api_key_env 指定的环境变量
+    -> `<NAME>_API_KEY` -> `LLM_API_KEY`。
+    """
+    direct = str(raw.get("api_key") or "").strip()
+    if direct:
+        return direct
+
+    env_name = str(raw.get("api_key_env") or "").strip()
+    if env_name:
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+
+    for candidate in (f"{name.upper().replace('-', '_')}_API_KEY", "LLM_API_KEY"):
+        value = os.environ.get(candidate, "").strip()
+        if value:
+            return value
+
+    return default_key
+
+
+def _load_providers(
+    llm_raw: Dict[str, Any],
+) -> Dict[str, ProviderConfig]:
+    """解析 `llm.providers` 预设表。
+
+    **兼容旧写法**: 没有 `providers` 段时, 用扁平的 `llm.base_url` /
+    `llm.model` 自动合成一个名为 `agnes` 的预设 —— 现有配置零改动仍能跑。
+    """
+    raw_providers = llm_raw.get("providers") or {}
+    providers: Dict[str, ProviderConfig] = {}
+
+    if isinstance(raw_providers, dict):
+        for name, item in raw_providers.items():
+            if not isinstance(item, dict):
+                logger.warning("[LLM] provider %r 定义不是字典, 跳过", name)
+                continue
+            pname = str(name).strip()
+            if not pname:
+                continue
+            providers[pname] = ProviderConfig(
+                name=pname,
+                base_url=str(item.get("base_url") or "").rstrip("/"),
+                model=str(item.get("model") or ""),
+                api_key=_resolve_api_key(pname, item),
+                api_key_env=str(item.get("api_key_env") or "").strip(),
+                timeout=float(item.get("timeout") or 0),
+                max_retries=int(item.get("max_retries") or 0),
+                temperature=(
+                    float(item["temperature"])
+                    if item.get("temperature") is not None
+                    else None
+                ),
+                max_tokens=int(item.get("max_tokens") or 0),
+                supports_tools=bool(item.get("supports_tools", True)),
+                supports_stream=bool(item.get("supports_stream", True)),
+                notes=str(item.get("notes") or ""),
+            )
+
+    if providers:
+        return providers
+
+    # ---- 旧写法兜底 ----
+    legacy_url = str(llm_raw.get("base_url") or "").rstrip("/")
+    legacy_model = str(llm_raw.get("model") or "")
+    providers["agnes"] = ProviderConfig(
+        name="agnes",
+        base_url=legacy_url,
+        model=legacy_model,
+        api_key=os.environ.get("LLM_API_KEY", ""),
+    )
+    logger.info("[LLM] 未配置 llm.providers, 按旧写法合成预设 agnes")
+    return providers
+
+
+def _load_roles(
+    llm_raw: Dict[str, Any],
+    providers: Dict[str, ProviderConfig],
+    default_provider: str,
+) -> Tuple[Dict[str, RoleConfig], set]:
+    """解析 `llm.roles` 角色绑定。
+
+    **缺省时三个角色全部指向同一个 provider** —— 这就是「默认每个角色
+    用相同的 LLM」。想拆开就在 yaml 里显式写 `llm.roles.<role>.provider`。
+
+    返回 (角色表, 显式配置过的角色名集合)。显式配置过的角色**不再**
+    受 deprecated 的 `router.llm_fallback_model` / `router.tool_calling.model`
+    影响 —— 后者的优先级更低。
+    """
+    raw_roles = llm_raw.get("roles") or {}
+    roles: Dict[str, RoleConfig] = {}
+    explicit: set = set()
+
+    if isinstance(raw_roles, dict):
+        for name, item in raw_roles.items():
+            if not isinstance(item, dict):
+                logger.warning("[LLM] 角色 %r 定义不是字典, 跳过", name)
+                continue
+            rname = str(name).strip()
+            if not rname:
+                continue
+            explicit.add(rname)
+            provider = str(item.get("provider") or default_provider).strip()
+            roles[rname] = RoleConfig(
+                provider=provider,
+                model=str(item.get("model") or ""),
+                fallback=[str(x).strip() for x in (item.get("fallback") or []) if str(x).strip()],
+                temperature=(
+                    float(item["temperature"])
+                    if item.get("temperature") is not None
+                    else None
+                ),
+                max_tokens=int(item.get("max_tokens") or 0),
+            )
+
+    # 缺省补齐 —— 三个角色都用 default_provider
+    for rname in DEFAULT_ROLES:
+        if rname not in roles:
+            roles[rname] = RoleConfig(provider=default_provider)
+
+    # 校验: 引用了不存在的 provider 要**启动即报错**, 别等到运行时才发现
+    for rname, rc in roles.items():
+        for pname in [rc.provider] + list(rc.fallback):
+            if pname and pname not in providers:
+                raise RuntimeError(
+                    f"[LLM] 角色 {rname!r} 引用了未定义的 provider {pname!r}; "
+                    f"可用: {', '.join(sorted(providers)) or '(无)'}"
+                )
+    return roles, explicit
+
+
 def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
     """加载配置。YAML 缺失或格式错误时回退到默认值。"""
     data: Dict[str, Any] = {}
@@ -398,18 +651,93 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
     load_dotenv()
 
     llm_raw = merged.get("llm", {})
+    providers = _load_providers(llm_raw)
+
+    # 默认 provider: yaml 的 llm.default_provider -> 环境变量 LLM_PROVIDER
+    # -> 预设表第一个
+    default_provider = str(llm_raw.get("default_provider") or "").strip()
+    default_provider = os.environ.get("LLM_PROVIDER", default_provider).strip()
+    if not default_provider:
+        default_provider = next(iter(providers), "")
+    if default_provider and default_provider not in providers:
+        raise RuntimeError(
+            f"[LLM] 默认 provider {default_provider!r} 未定义; "
+            f"可用: {', '.join(sorted(providers)) or '(无)'}"
+        )
+
+    # 全局默认 (provider 未单独指定时继承)
+    g_timeout = float(llm_raw.get("timeout", 60))
+    g_max_retries = int(llm_raw.get("max_retries", 3))
+    g_temperature = float(llm_raw.get("temperature", 0.7))
+    g_max_tokens = int(llm_raw.get("max_tokens", 2048))
+
+    # 环境变量只覆盖 default_provider —— 避免「以为在测 A 家, 模型名还是 B 家」
+    if default_provider:
+        dp = providers[default_provider]
+        env_base = os.environ.get("LLM_BASE_URL", "").strip()
+        env_model = os.environ.get("LLM_MODEL", "").strip()
+        env_key = os.environ.get("LLM_API_KEY", "").strip()
+        if env_base:
+            dp.base_url = env_base.rstrip("/")
+            logger.warning(
+                "[LLM] 环境变量 LLM_BASE_URL 覆盖了 %s 的 base_url -> %s",
+                default_provider, dp.base_url,
+            )
+        if env_model:
+            dp.model = env_model
+            logger.warning(
+                "[LLM] 环境变量 LLM_MODEL 覆盖了 %s 的模型名 -> %s",
+                default_provider, dp.model,
+            )
+        if env_key:
+            dp.api_key = env_key
+
+    roles, explicit_roles = _load_roles(llm_raw, providers, default_provider)
+
+    # 扁平字段 = default_provider 的取值, 兼容旧代码 (cfg.llm.model 等)
+    dp = providers.get(default_provider)
     llm = LLMConfig(
-        base_url=os.environ.get("LLM_BASE_URL", llm_raw.get("base_url", "")).rstrip("/"),
-        model=os.environ.get("LLM_MODEL", llm_raw.get("model", "")),
-        api_key=os.environ.get("LLM_API_KEY", ""),
-        timeout=float(llm_raw.get("timeout", 60)),
-        max_retries=int(llm_raw.get("max_retries", 3)),
-        temperature=float(llm_raw.get("temperature", 0.7)),
-        max_tokens=int(llm_raw.get("max_tokens", 2048)),
+        providers=providers,
+        roles=roles,
+        default_provider=default_provider,
+        base_url=(dp.base_url if dp else ""),
+        model=(dp.model if dp else ""),
+        api_key=(dp.api_key if dp else ""),
+        timeout=g_timeout,
+        max_retries=g_max_retries,
+        temperature=g_temperature,
+        max_tokens=g_max_tokens,
+    )
+
+    # provider 未单独指定的项继承全局默认
+    for p in providers.values():
+        if not p.timeout:
+            p.timeout = g_timeout
+        if not p.max_retries:
+            p.max_retries = g_max_retries
+        if p.temperature is None:
+            p.temperature = g_temperature
+        if not p.max_tokens:
+            p.max_tokens = g_max_tokens
+
+    logger.info(
+        "[LLM] provider=%s roles=%s 可用预设=%s",
+        default_provider,
+        {k: v.provider for k, v in roles.items()},
+        ", ".join(sorted(providers)) or "(无)",
     )
 
     router_raw = merged.get("router", {})
     tc_raw = router_raw.get("tool_calling") or {}
+    
+    # 解析 thinking 配置
+    thinking_raw = tc_raw.get("thinking") or {}
+    thinking_config = ThinkingConfig(
+        enabled=bool(thinking_raw.get("enabled", False)),
+        budget_tokens=int(thinking_raw.get("budget_tokens", 8000)),
+        min_complexity=int(thinking_raw.get("min_complexity", 2)),
+    )
+    
     tool_calling = ToolCallingConfig(
         enabled=bool(tc_raw.get("enabled", False)),
         model=str(tc_raw.get("model") or ""),
@@ -420,10 +748,34 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
         max_rounds=int(tc_raw.get("max_rounds", 1)),
         feedback_round=bool(tc_raw.get("feedback_round", False)),
         system_prompt=str(tc_raw.get("system_prompt") or DEFAULT_TOOL_CALLING_PROMPT),
+        thinking=thinking_config,
     )
+
+    # **deprecated 的模型名** —— `router.llm_fallback_model` 与
+    # `router.tool_calling.model` 是旧写法, 优先级**低于** `llm.roles`。
+    # 只有当对应角色没在 llm.roles 里显式指定模型时, 才用它来补上。
+    deprecated_fallback = str(router_raw.get("llm_fallback_model") or "").strip()
+    deprecated_tool = str(tc_raw.get("model") or "").strip()
+
+    if "classify" in explicit_roles:
+        # 角色显式配了 -> 忽略 deprecated 值
+        classify_model = roles["classify"].model
+    else:
+        classify_model = deprecated_fallback
+        if classify_model:
+            roles["classify"].model = classify_model
+
+    if "tool" in explicit_roles:
+        tool_model = roles["tool"].model
+    else:
+        tool_model = deprecated_tool
+        if tool_model:
+            roles["tool"].model = tool_model
+
     router = RouterConfig(
         mode=router_raw.get("mode", "hybrid"),
-        llm_fallback_model=router_raw.get("llm_fallback_model") or llm.model,
+        # deprecated: 优先级低于 llm.roles.classify
+        llm_fallback_model=classify_model or llm.model,
         default_route=router_raw.get("default_route", "chat"),
         rules=list(router_raw.get("rules") or []),
         llm_timeout=float(router_raw.get("llm_timeout", 3.0)),

@@ -82,7 +82,11 @@ tools:
   - name: query_weather
     kind: query
     label: 查天气
-    description: 查询指定城市的当前天气。用户没说城市时用默认城市。
+    description: >-
+      查询天气的实况与今日预报 (天气现象、当前气温、体感温度、湿度、
+      风速、今日最高/最低温、降水概率)。
+      用户说了城市就查那个城市; 没说城市就把 city 传空字符串,
+      系统会反问用户要查哪个城市。
     action_map:
       "": weather
     parameters:
@@ -90,7 +94,8 @@ tools:
       properties:
         city:
           type: string
-          description: 城市名, 如 北京、上海。没提到就用「默认城市」
+          description: >-
+            城市名, 如 北京、上海。用户没提城市时传空字符串 ""。
 
   # ---- 查时间 ----
   - name: query_time

@@ -94,7 +94,7 @@ class VoiceAssistant(wakeup_asr.WakeupASR):
 
     # ------------------------------------------------------------ 对话
 
-    def on_recording_complete(self, text, wav_path=None):
+    def on_recording_complete(self, text, wav_path=None, words=None):
         """录音结束后把文本发给模型并输出回复。"""
         if not text:
             print("[助手] 没听清, 请再说一遍。")

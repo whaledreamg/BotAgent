@@ -30,6 +30,8 @@ DEFAULTS: Dict[str, Any] = {
     "vision": {
         "server": {"host": "0.0.0.0", "port": 8803},
         "camera": {
+            "camera_brand": "",  # 空表示笔记本摄像头
+            "camera_type": "head",
             "serial_number": "",
             "width": 0,
             "height": 0,
@@ -59,6 +61,19 @@ DEFAULTS: Dict[str, Any] = {
             "mode": "live",
             "conf": 0.05,
             "frames": 5,
+        },
+        "training": {
+            "data": "",
+            "base_weights": "",
+            "epochs": 100,
+            "imgsz": 640,
+            "batch": 16,
+            "patience": 30,
+            "device": "0",
+            "project": "",
+            "name": "myobjects",
+            "auto_apply": True,
+            "min_map50": 0.5,
         },
         "extrinsic": {
             "enabled": False,
@@ -110,8 +125,20 @@ def _parse_calibrated_intrinsics(raw: Any) -> Optional[Dict[str, float]]:
 
 @dataclass
 class CameraConfig:
-    """Orbbec 相机配置。"""
+    """相机配置。
 
+    支持的相机品牌 (camera_brand):
+      - "" (空): 使用笔记本内置摄像头（通过 OpenCV）
+      - "orbbec": Orbbec 3D 相机（使用 pyorbbecsdk）
+      - "usb3vision": USB3Vision 相机（通过 GenTL SDK）
+      - "realsense": Intel RealSense 相机（通过 pyrealsense2）
+    """
+
+    #: 相机品牌: "" (笔记本) / "orbbec" / "usb3vision" / "realsense" / ...
+    #: 空字符串表示使用笔记本内置摄像头
+    camera_brand: str = ""
+    #: 相机类型: head (头部) / left_wrist (左腕) / right_wrist (右腕)
+    camera_type: str = "head"
     #: 序列号; 空 = 用枚举到的第一个设备
     serial_number: str = ""
     width: int = 0
@@ -177,6 +204,45 @@ class RecognitionConfig:
 
 
 @dataclass
+class TrainingConfig:
+    """YOLO 自定义模型训练参数。
+
+    见 ``configs/vision.yaml`` 的 ``vision.training`` 段和
+    ``docs/vision-training.md``。
+    """
+
+    #: 数据集描述文件 (ultralytics 的 data.yaml)
+    data: str = ""
+    #: 迁移学习的起点权重 (或 .yaml 表示从零训)
+    base_weights: str = ""
+    epochs: int = 100
+    imgsz: int = 640
+    #: 批大小; -1 = 自动按显存估算
+    batch: int = 16
+    #: 早停耐心值
+    patience: int = 30
+    #: "0" 用第一块 GPU / "cpu" / "-1" 自动
+    device: str = "0"
+    #: ultralytics 输出根目录
+    project: str = ""
+    #: 实验名
+    name: str = "myobjects"
+    #: 颜色扰动 (工业件颜色常是关键特征, 调小)
+    hsv_h: float = 0.01
+    hsv_s: float = 0.4
+    hsv_v: float = 0.4
+    #: mosaic 增强 (小数据集上很有效)
+    mosaic: float = 1.0
+    #: 最后 N 轮关掉 mosaic
+    close_mosaic: int = 10
+    seed: int = 0
+    #: 训练完是否自动把 best.pt 写回 detector.weights
+    auto_apply: bool = True
+    #: mAP50 低于这个值就警告
+    min_map50: float = 0.5
+
+
+@dataclass
 class ExtrinsicConfig:
     """手眼外参: 相机系 -> 目标坐标系。
 
@@ -232,10 +298,13 @@ class ExtrinsicConfig:
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
+    #: 多相机配置（key 为相机类型: head / left_wrist / right_wrist）
+    camera_configs: Dict[str, CameraConfig] = field(default_factory=dict)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     solver: SolverConfig = field(default_factory=SolverConfig)
     extrinsic: ExtrinsicConfig = field(default_factory=ExtrinsicConfig)
     recognition: RecognitionConfig = field(default_factory=RecognitionConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
 
 
 def load_config(path: Optional[Path] = None) -> Config:
@@ -266,7 +335,15 @@ def load_config(path: Optional[Path] = None) -> Config:
 
     c = v.get("camera", {})
     cal_intr = c.get("calibrated_intrinsics") or c.get("intrinsics") or None
+    camera_brand = os.environ.get(
+        "VISION_CAMERA_BRAND", str(c.get("camera_brand", "") or "")
+    )
+    camera_type = os.environ.get(
+        "VISION_CAMERA_TYPE", str(c.get("camera_type", "head") or "head")
+    )
     camera = CameraConfig(
+        camera_brand=camera_brand,
+        camera_type=camera_type,
         serial_number=os.environ.get(
             "VISION_CAMERA_SERIAL", str(c.get("serial_number", "") or "")
         ),
@@ -311,6 +388,27 @@ def load_config(path: Optional[Path] = None) -> Config:
         output_dir=str(rc.get("output_dir", "logs") or "logs"),
     )
 
+    tr = v.get("training", {})
+    training = TrainingConfig(
+        data=str(tr.get("data", "") or ""),
+        base_weights=str(tr.get("base_weights", "") or ""),
+        epochs=int(tr.get("epochs", 100)),
+        imgsz=int(tr.get("imgsz", 640)),
+        batch=int(tr.get("batch", 16)),
+        patience=int(tr.get("patience", 30)),
+        device=str(tr.get("device", "0") or "0"),
+        project=str(tr.get("project", "") or ""),
+        name=str(tr.get("name", "myobjects") or "myobjects"),
+        hsv_h=float(tr.get("hsv_h", 0.01)),
+        hsv_s=float(tr.get("hsv_s", 0.4)),
+        hsv_v=float(tr.get("hsv_v", 0.4)),
+        mosaic=float(tr.get("mosaic", 1.0)),
+        close_mosaic=int(tr.get("close_mosaic", 10)),
+        seed=int(tr.get("seed", 0)),
+        auto_apply=bool(tr.get("auto_apply", True)),
+        min_map50=float(tr.get("min_map50", 0.5)),
+    )
+
     e = v.get("extrinsic", {})
     extrinsic = ExtrinsicConfig(
         enabled=bool(e.get("enabled", False)),
@@ -328,13 +426,34 @@ def load_config(path: Optional[Path] = None) -> Config:
         ),
     )
 
+    # 加载多相机配置（如果有的话）
+    camera_configs: Dict[str, CameraConfig] = {}
+    cameras_section = v.get("cameras", {})
+    for cam_type in ("head", "left_wrist", "right_wrist"):
+        if cam_type in cameras_section:
+            cam_cfg = cameras_section[cam_type]
+            cal_intr = cam_cfg.get("calibrated_intrinsics") or cam_cfg.get("intrinsics") or None
+            camera_configs[cam_type] = CameraConfig(
+                camera_brand=str(cam_cfg.get("camera_brand", "") or ""),
+                camera_type=cam_type,
+                serial_number=str(cam_cfg.get("serial_number", "") or ""),
+                width=int(cam_cfg.get("width", 0) or 0),
+                height=int(cam_cfg.get("height", 0) or 0),
+                fps=int(cam_cfg.get("fps", 0) or 0),
+                frame_timeout_ms=int(cam_cfg.get("frame_timeout_ms", 2000)),
+                align_depth_to_color=bool(cam_cfg.get("align_depth_to_color", True)),
+                calibrated_intrinsics=_parse_calibrated_intrinsics(cal_intr),
+            )
+
     return Config(
         server=server,
         camera=camera,
+        camera_configs=camera_configs,
         detector=detector,
         solver=solver,
         extrinsic=extrinsic,
         recognition=recognition,
+        training=training,
     )
 
 
@@ -346,5 +465,6 @@ __all__ = [
     "RecognitionConfig",
     "ServerConfig",
     "SolverConfig",
+    "TrainingConfig",
     "load_config",
 ]

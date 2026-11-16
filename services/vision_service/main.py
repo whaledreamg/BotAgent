@@ -35,7 +35,7 @@ if now_dir not in sys.path:
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 
-from camera import CameraError  # noqa: E402
+from camera_adapter import CameraError  # noqa: E402
 from config import load_config  # noqa: E402
 from detector import DetectorError  # noqa: E402
 from models import (  # noqa: E402
@@ -262,6 +262,77 @@ async def calibration() -> Dict[str, Any]:
         },
         "frame": st.get("frame", "camera"),
     }
+
+
+@app.get("/v1/traces/stats")
+async def traces_stats() -> Dict[str, Any]:
+    """获取追溯系统统计信息。"""
+    svc = _svc()
+    return {
+        "stats": svc._tracer.get_stats(),
+    }
+
+
+@app.get("/v1/traces/query")
+async def traces_query(
+    label: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """查询识别记录。
+
+    Args:
+        label: 按物体类别查询 (如 "cup", "person")
+        start_time: 按时间范围查询 (ISO 8601, 如 "2024-01-01T12:00:00")
+        end_time: 时间范围结束 (需与 start_time 一起使用)
+        limit: 返回记录数上限 (默认 50)
+
+    Returns:
+        匹配的记录列表 (每行包含 record_id, timestamp, label, confidence, 
+        bbox, pose, image_filename 等)
+    """
+    svc = _svc()
+    tracer = svc._tracer
+
+    records = []
+    if label:
+        records = tracer.query_by_label(label, limit=limit)
+    elif start_time and end_time:
+        records = tracer.query_by_time_range(start_time, end_time)
+
+    return {
+        "query": {
+            "label": label,
+            "start_time": start_time,
+            "end_time": end_time,
+            "limit": limit,
+        },
+        "count": len(records),
+        "records": records,
+    }
+
+
+@app.get("/v1/traces/image/{filename}")
+async def traces_image(filename: str):
+    """获取追溯图像。
+
+    Args:
+        filename: 图像文件名 (从 /v1/traces/query 返回的 image_filename)
+
+    Returns:
+        图像文件 (JPEG)
+    """
+    from fastapi.responses import FileResponse
+
+    svc = _svc()
+    tracer = svc._tracer
+
+    filepath = tracer.get_image_path(filename)
+    if filepath is None or not filepath.exists():
+        raise HTTPException(status_code=404, detail="图像不存在")
+
+    return FileResponse(filepath, media_type="image/jpeg")
 
 
 @app.websocket("/ws")

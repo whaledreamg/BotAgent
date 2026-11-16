@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent_client import AgentClient, AgentError
 from config import Config
+from hotwords import HotwordCorrector, load_corrector
 from tts_client import TTSClient, TTSError
 
 logger = logging.getLogger("pipeline")
@@ -46,6 +47,8 @@ class LastTurn:
     at: float = 0.0
     #: 分阶段耗时 (毫秒)
     timings: Dict[str, int] = field(default_factory=dict)
+    #: 最近一次热词纠错的明细 (before/after/hits); 没纠错过就是空的
+    hotword_fix: Dict[str, Any] = field(default_factory=dict)
 
 
 class Pipeline:
@@ -74,6 +77,15 @@ class Pipeline:
         #: ASR 侧用它把回声守卫延伸到「播报结束 + 沉降期」——
         #: 播之前只知道「要播了」, 播完才知道余音窗口到底在哪。
         self.on_after_speak: Optional[Callable[[], None]] = None
+        #: **热词纠错器** (专业名词本地拼音纠错)。
+        #:
+        #: 现在的 ASR 是 Vosk 大模型, 只有静态 HCLG.fst, **不支持运行时
+        #: 语法图** —— 没法在解码时把「公司名」塞进词表加权。所以改在
+        #: **识别之后、交给 Agent 之前** 做纠错: 纯本地, 零网络延迟。
+        #:
+        #: Agent 那边有 LLM 兜底, 但语音场景对延迟极敏感 (一次 LLM 往返
+        #: 1~3 秒), 所以热词纠错必须放在**不花网络往返**的位置。
+        self.hotwords = load_corrector(cfg.hotwords)
 
     # ------------------------------------------------------------ 状态
 
@@ -147,6 +159,11 @@ class Pipeline:
             "last_reply": last.reply,
             "last_action": last.action,
             "timings": last.timings,
+            "hotword_fix": last.hotword_fix,
+            "hotwords_enabled": self.hotwords is not None,
+            "hotword_count": (
+                len(self.hotwords.known_words()) if self.hotwords else 0
+            ),
             "errors": errors[-10:],
         }
 
@@ -157,11 +174,17 @@ class Pipeline:
 
     # ------------------------------------------------------------ 主流程
 
-    def submit(self, text: str, record_ms: int = 0) -> None:
+    def submit(self, text: str, record_ms: int = 0, words: Optional[List[Dict[str, Any]]] = None) -> None:
         """提交一轮识别结果, 在后台线程里跑完整条链路。
 
         立刻置 THINK 状态, 主循环随即停止识别 (避免把自己说的话再识别一遍),
         同时避免主线程被 TTS 播放阻塞。
+
+        Args:
+            text: 识别出的文本。
+            record_ms: 录音+识别阶段耗时 (毫秒)。
+            words: 词级识别结果 (``[{"word":..., "conf":...}]``),
+                用于热词纠错的置信度打分。
         """
         text = (text or "").strip()
         if not text:
@@ -169,6 +192,11 @@ class Pipeline:
             self._record_error(self._empty_result_message())
             self._prompt_empty_result()
             return
+
+        # ---- 热词纠错 (本地, 零延迟) ----
+        # 必须在交给 Agent **之前**做: Agent 的规则匹配和 tool calling 都靠
+        # 文本里的专业名词才能匹配上 (公司名、产品名往往就是命令里的关键词)。
+        text = self._correct_hotwords(text, words)
 
         self._set_state(State.THINK)
         with self._lock:
@@ -180,6 +208,25 @@ class Pipeline:
             daemon=True,
         )
         worker.start()
+
+    def _correct_hotwords(
+        self, text: str, words: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        """热词纠错: 把识别文本里的专业名词换成规范写法。
+
+        纠错失败**不能影响主流程** —— 抛异常就原样放行。
+        """
+        if self.hotwords is None:
+            return text
+        try:
+            result = self.hotwords.correct(text, words)
+        except Exception as exc:  # pragma: no cover - 兜底
+            logger.warning("[热词纠错] 异常, 原样放行: %s", exc)
+            return text
+        if result.changed:
+            with self._lock:
+                self.last.hotword_fix = result.as_dict()
+        return result.after
 
     def _empty_result_message(self) -> str:
         """没听清时的提示文案。
@@ -331,9 +378,14 @@ class Pipeline:
         # 让机器人自己说话的时间不占用用户的 30 秒。
         self._notify_turn_complete()
 
-    def on_recording_complete(self, text: str, record_ms: int = 0) -> None:
+    def on_recording_complete(
+        self,
+        text: str,
+        record_ms: int = 0,
+        words: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         """识别完成后的编排入口。由 WakeupASR 子类调用。"""
-        self.submit(text, record_ms=record_ms)
+        self.submit(text, record_ms=record_ms, words=words)
 
     def wait_idle(self, timeout: float = 300.0, turn: int = 0) -> bool:
         """等待指定的那一轮 (Agent + TTS) 跑完。

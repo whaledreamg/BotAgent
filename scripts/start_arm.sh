@@ -9,7 +9,13 @@ LOG_DIR="$ROOT/logs"
 
 export ARM_SERVER_HOST="${ARM_SERVER_HOST:-0.0.0.0}"
 export ARM_SERVER_PORT="${ARM_SERVER_PORT:-8802}"
-export ARM_CONTROLLER_WS="${ARM_CONTROLLER_WS:-ws://192.168.100.16:9000}"
+# 控制器地址以 configs/arm.yaml 为准, 这里不再硬编码默认值。
+# 只有外部显式设置 ARM_CONTROLLER_WS 时才用环境变量覆盖 (配置优先级:
+# 默认值 < configs/arm.yaml < 环境变量)。
+if [ -n "${ARM_CONTROLLER_WS:-}" ]; then
+    export ARM_CONTROLLER_WS
+    echo "[arm] 控制器地址由环境变量指定: $ARM_CONTROLLER_WS"
+fi
 
 mkdir -p "$LOG_DIR"
 cd "$SERVICE_DIR"

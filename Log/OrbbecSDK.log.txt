@@ -1,0 +1,25 @@
+[11/12 17:55:18.785695][warning][53674][ObException.cpp:32] A unrecoverable_exception has occurred!
+ - where: UsbEnumeratorLibusb.cpp(342)
+ - msg: libusb_init failed
+ - type: PLATFORM
+ - status: 1
+[11/12 17:55:18.785734][warning][53674][Platform.cpp:42] Execute failure! A libobsensor_exception has occurred!
+ - where: Platform.cpp(42):Platform
+ - msg: libusb_init failed
+ - type: N11libobsensor23unrecoverable_exceptionE
+ - status: 1
+[11/12 17:55:18.785736][warning][53674][Platform.cpp:42] Failed to create usb pal!
+[11/12 17:55:18.785895][info][53674][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[11/12 17:55:18.785944][warning][53674][ObException.cpp:32] A unrecoverable_exception has occurred!
+ - where: Platform.cpp(77)
+ - msg: Usb pal is not exist, please check the build config that you have enabled BUILD_USB_PAL
+ - type: PLATFORM
+ - status: 114
+[11/12 17:55:18.785961][warning][53674][DeviceManager.cpp:64] Execute failure! A libobsensor_exception has occurred!
+ - where: DeviceManager.cpp(64):DeviceManager
+ - msg: Usb pal is not exist, please check the build config that you have enabled BUILD_USB_PAL
+ - type: N11libobsensor23unrecoverable_exceptionE
+ - status: 114
+[11/12 17:55:18.785963][info][53674][DeviceManager.cpp:25] Current found device(s): (0)
+[11/12 17:55:18.785964][info][53674][DeviceManager.cpp:488] Enable net device enumeration: true
+[11/12 17:55:19.789207][info][53674][DeviceManager.cpp:25] Current device(s) list: (0)

@@ -2,11 +2,51 @@
 # 密钥在 configs/.env (不入库), 这里只放非敏感配置
 
 llm:
-  base_url: https://api.agnes-ai.cn/v1
-  # agnes-3.0-flash 实测首字延迟在 1.5s~33s 之间剧烈波动 (三次抽样),
-  # agnes-2.5-flash 实测稳定在 TTFT ~450ms / 总耗时 ~700ms。
-  # 语音场景对延迟极敏感, 因此默认用 2.5-flash。
-  model: agnes-2.5-flash
+  # 默认 provider —— 三个角色默认都用这一家。
+  # 想按角色拆开 (比如分类走快模型、工具调用走强模型) 就改下面的 llm.roles。
+  default_provider: agnes
+  # provider 预设表 —— 每家一个条目, 全部走 OpenAI 兼容协议。
+  # 密钥不放这里, 用 api_key_env 指向环境变量 (见 configs/.env)。
+  providers:
+    agnes:
+      base_url: https://api.agnes-ai.cn/v1
+      # agnes-3.0-flash 实测首字延迟在 1.5s~33s 之间剧烈波动 (三次抽样),
+      # agnes-2.5-flash 实测稳定在 TTFT ~450ms / 总耗时 ~700ms。
+      # 语音场景对延迟极敏感, 因此默认用 2.5-flash。
+      model: agnes-2.5-flash
+      api_key_env: AGNES_API_KEY
+    # ---- 以下为示例预设, 暂未配 key; 需要时在 configs/.env 填上再启用 ----
+    deepseek:
+      base_url: https://api.deepseek.com/v1
+      model: deepseek-v4-pro
+      api_key_env: DEEPSEEK_API_KEY
+    qwen:
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      model: qwen-plus
+      api_key_env: DASHSCOPE_API_KEY
+    kimi:
+      base_url: https://api.moonshot.cn/v1
+      model: moonshot-v1-8k
+      api_key_env: MOONSHOT_API_KEY
+    openai:
+      base_url: https://api.openai.com/v1
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+    ollama:
+      base_url: http://127.0.0.1:11434/v1
+      model: qwen2.5:7b
+      # 本地服务无鉴权, 填个占位值让客户端带上 Authorization 头
+      api_key: ollama
+      notes: 本地服务, 无需真实 key
+
+  # 角色绑定 —— 三个角色默认都用 agnes。
+  # fallback 是备用 provider 列表 (主 provider 限流/超时/鉴权错时依次尝试),
+  # 当前留空 —— 只有 agnes 一家在服务, 配了空的 fallback 才不会误切换。
+  roles:
+    chat:     { provider: agnes }
+    classify: { provider: agnes }
+    tool:     { provider: agnes }
+
   timeout: 20
   max_retries: 2
   temperature: 0.7
@@ -16,8 +56,10 @@ llm:
 # 语义识别 / 意图分流
 router:
   mode: hybrid                 # rules | llm | hybrid
-  # 兜底分类用最快的模型: 分类只需几十个 token, 延迟直接决定体感
-  llm_fallback_model: agnes-2.5-flash
+  # **deprecated**: 意图分类用哪个模型。现在应该在 llm.roles.classify 里配:
+  #   llm.roles.classify: { provider: agnes, model: xxx }
+  # 这里只在 llm.roles.classify **没显式配置模型**时才作为兜底生效。
+  llm_fallback_model: ""
   default_route: chat
   # LLM 兜底分类的超时秒数; 语音场景对延迟敏感, 超时直接回落 default_route
   llm_timeout: 1.2
@@ -31,8 +73,10 @@ router:
   # 规则命中时完全不进这条路, 快速通道仍是零延迟。
   tool_calling:
     enabled: true
-    # 沿用 2.5-flash: 实测 TTFT ~690ms, 比 3.0-flash 稳定
-    model: agnes-2.5-flash
+    # **deprecated**: 工具调用用哪个模型。现在应该在 llm.roles.tool 里配:
+    #   llm.roles.tool: { provider: agnes, model: xxx }
+    # 这里只在 llm.roles.tool **没显式配置模型**时才作为兜底生效。
+    model: ""
     # 超时直接回落默认分支 (语音场景对延迟敏感)
     timeout: 5.0
     temperature: 0.0
@@ -45,32 +89,50 @@ router:
     # 执行工具后是否让模型再生成一句口语化总结。
     # false = 用本地固定文案: 零额外延迟, TTS 合成也更快。
     feedback_round: false
+    
+    # Thinking Mode 配置（改进复合意图理解）
+    thinking:
+      enabled: true
+      budget_tokens: 8000
+      # 最少任务数才启用 thinking (简单查询不用，节省成本)
+      min_complexity: 2
+    
     # tool calling 专用的系统提示词。
     # **不能用 system_prompt** —— 那是聊天用的, 模型会用文字「描述」动作已完成
     # (假确认), 而不是真的去调工具。
+    # Phase 6：改进为支持动态插入工具列表的模板，{tools_list} 会被替换为实际工具
     system_prompt: |
-      你是一个语音助手, 可以通过工具控制机器人和家电设备。
-
-      **必须调用工具来执行动作, 不要用文字代替。**
-      - 用户要求机械臂做动作时, 调用 play_arm_action。
-      - 用户要求开关家电、查询信息时, 调用对应的工具。
-      - 只有纯闲聊 (讲故事、聊天、解答知识性问题) 才用文字回答。
-
-      调用 play_arm_action 时:
-      - 用户要一个动作 -> actions 填单元素数组, 如 ["挥手"]
-      - 用户要多个动作 -> 按他说的顺序填, 如 ["准备点", "挥手"]
-      - 不要替用户编动作名, 只用工具描述里列出的那些。
-
-      调用 find_object 时:
-      - 用户问某个物体在哪 / 有没有看到某物 -> name 填物体名, 如 "杯子"
-      - 物体名要用用户说的那个词, 不要换成英文或同义词。
-      - **绝对不要凭空编造位置和距离**。你看不到摄像头画面,
-        只有调用 find_object 才能知道物体在哪。
-
-      不确定用户想要什么时, 就直接用文字问, 不要瞎猜一个动作。
+      你是一个语音助手，当前在【{branch_name}】模式。
+      
+      你可以调用以下工具：
+      {tools_list}
+      
+      **必须调用工具来执行动作，不要用文字代替。**
+      - 用户要求查询信息、控制设备时，调用对应的工具。
+      - 只有纯闲聊（讲故事、聊天、解答知识性问题）才用文字回答。
+      - 如果用户的请求超出了可用工具的范围，直接说明。
+      
+      根据用户意图选择合适的工具调用。
   rules:
+    # ---- 天气单独一条规则 ----
+    #
+    # 「今天天气怎么样」带「怎么样」, 会被下面那条 tool 规则的 exclude
+    # 挡掉 -> 走 LLM tool calling, 白白多花一次往返。
+    #
+    # 天气是**独立**语义 (查当前城市/指定城市的天气), 不该跟
+    # 「打开/关闭」这类动作指令共用排除词, 所以单独一条, 不带 exclude。
     - intent: tool
-      keywords: ["打开", "关闭", "设置", "播放", "查询", "查一下", "开灯", "关灯", "开空调", "关空调", "启动", "调大", "调小", "几点", "几号", "现在时间", "在哪", "在哪儿", "找一下", "找找", "看看有没有", "几个", "有几"]
+      keywords: ["天气", "气温", "下雨", "下雪", "台风", "温度"]
+    # ---- 时间和日期查询 ----
+    # Phase 7：新增时间/日期查询规则
+    # 「几点」「几号」「周几」这类是查询型，独立规则不带 exclude
+    - intent: tool
+      keywords: ["几点", "现在几点", "现在时间", "什么时间", "报时", "几号", "今天几号", "周几", "星期几", "今天星期", "日期"]
+    # Phase 4：清理 Skill 级关键词，只保留分支级宽泛词
+    # 移除的 Skill 级关键词：「看到」、「什么东西」、「有什么」、「有几」、「几个」
+    # 这些关键词会由 Tool calling 从自然语言示例中学到，无需在规则中硬编码
+    - intent: tool
+      keywords: ["打开", "关闭", "设置", "播放", "查询", "查一下", "开灯", "关灯", "开空调", "关空调", "启动", "调大", "调小"]
       # 排除词: 命中则这条规则不生效 (区分闲聊与动作)
       exclude: ["怎么样", "怎么样?", "如何", "为什么", "什么是", "是什么", "多少", "介绍"]
     # 机械臂动作: 关键词由 configs/actions.yaml 的说法生成 (见 device_handler),
@@ -101,6 +163,16 @@ handlers:
       vision_base_url: "http://127.0.0.1:8803"
       # 调用视觉服务的超时 (秒) —— 相机采集 + 推理, 留够时间
       vision_timeout: 15.0
+      # ---- 天气 (Open-Meteo, 免 key) ----
+      # **必须由用户说出城市名** —— 语音里「今天天气怎么样」很常见,
+      # 但没说城市就查不了。IP 定位在移动网络/代理下经常偏几百公里,
+      # 报出来的城市是错的, 所以这里宁可**反问用户**一句。
+      #
+      # 想固定成一个城市 (例如部署在固定场地), 把 weather_default_city
+      # 填成城市名即可 —— 填了之后用户不说城市就查这个城市。
+      weather_default_city: ""
+      # 调用天气接口的超时 (秒) —— 语音场景要快, 别等太久
+      weather_timeout: 5.0
   device:
     module: handlers.device_handler
     class: DeviceHandler
@@ -129,9 +201,19 @@ system_prompt: |
   不要使用 markdown 语法、列表或表情符号, 只输出要说出口的话。
 
 # 语义识别用的提示词 (router LLM 兜底时使用)
+# Phase 6：改进为轻量级分支级分类（只分 3 个分支，不是 100+ intent）
 router_prompt: |
-  你是一个语音指令分类器。请判断用户这句话的意图, 只输出 JSON:
-  {"intent": "chat" | "tool" | "device"}
-  chat: 闲聊、问答、知识性提问
-  tool: 需要执行动作或查询信息的指令, 例如打开设备、播放音乐、查询信息、查天气、查时间
-  device: 控制机器人本体, 例如移动、拍照、关节动作
+  你是智能路由器。根据用户输入，判断属于以下哪个分支，只返回 JSON:
+  {"branch": "chat" | "tool" | "device"}
+  
+  分支说明：
+  - "chat": 闲聊、问答、知识性提问（纯对话，不涉及动作或查询）
+    例如: "你好", "今天天气怎么样啊", "介绍一下你自己", "讲个笑话"
+  
+  - "tool": 查询信息、小工具操作
+    例如: "现在几点", "查一下天气", "看看有什么东西", "打开摄像头", "有没有人"
+  
+  - "device": 机械臂控制、动作指令
+    例如: "挥手", "伸左手", "做个动作", "转身", "抓杯子"
+  
+  **关键**: 只返回分支名，不要返回其他内容。如果不确定，返回 "chat"。

@@ -9,7 +9,7 @@ YOLO 的 COCO 类别是英文 ("cup", "bottle", "person"), 用户说的是中文
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 #: 中文 -> YOLO 类别名
 ZH_TO_CLASS: Dict[str, str] = {
@@ -164,18 +164,85 @@ def translate(name: str) -> str:
     return name
 
 
-def candidates(name: str) -> List[str]:
-    """所有可能的类名候选 (原名 + 翻译)。
+def candidates(name: str, known_classes: Optional[Iterable[str]] = None) -> List[str]:
+    """所有可能的类名候选 (原名 + 翻译 + 剥修饰词)。
 
     视觉服务那边会挨个试, 避免「保温杯」这种组合词查不到。
+
+    ``known_classes`` 是模型当前的实际类名 (来自 ``model.names``)。
+    给了它就能额外做一件事: **把带修饰词的说法还原成模型里的类名** ——
+    比如模型类名是「螺丝」, 用户说「那个螺丝」/「一颗螺丝」, 剥掉
+    修饰词后就能对上。
+
+    没给这个参数时行为和以前一样 (只查内置映射表), 所以不影响
+    现有调用方。
     """
     out: List[str] = []
     raw = (name or "").strip()
     if raw:
         out.append(raw)
+
     mapped = translate(raw)
     if mapped and mapped not in out:
         out.append(mapped)
+
+    # ---- 剥修饰词 ----
+    #
+    # 内置映射表覆盖不到自定义类名 ("螺丝" 不在表里), 但用户的说法
+    # 往往带修饰词 ("那个螺丝"、"一个瓶子")。所以拿模型的实际类名
+    # 再试一遍剥修饰词。
+    if known_classes:
+        known = {str(k).strip().lower() for k in known_classes if str(k).strip()}
+        for trimmed in _strip_modifiers(raw):
+            if not trimmed:
+                continue
+            low = trimmed.lower()
+            # 原样对上
+            if low in known and low not in [o.lower() for o in out]:
+                out.append(trimmed)
+            # 中文说法 -> 英文类名 (模型类名是英文时的翻译)
+            trans = translate(trimmed)
+            if trans and trans.lower() in known and trans not in out:
+                out.append(trans)
+
+    return out
+
+
+def _strip_modifiers(name: str) -> List[str]:
+    """剥掉常见的中文修饰词, 列出所有可能的「裸类名」。
+
+    例: "那个螺丝" -> ["螺丝", "那个螺丝"]
+    """
+    out: List[str] = []
+    if not name:
+        return out
+
+    key = name.strip()
+    if not key:
+        return out
+
+    # 前缀修饰词 (可以叠加, 如 "那个大的螺丝" —— 逐层剥)
+    prefixes = ("那个", "这个", "那些", "这些", "一只", "一个", "一颗",
+                "一根", "一把", "一台", "一个的", "那个的")
+    changed = True
+    while changed:
+        changed = False
+        for p in prefixes:
+            if key.startswith(p) and len(key) > len(p):
+                key = key[len(p):]
+                out.append(key)
+                changed = True
+                break
+
+    # 后缀修饰词 ("螺丝啊"、"杯子呢")
+    for s in ("啊", "呀", "呢", "吗", "吧", "哦", "了"):
+        if key.endswith(s) and len(key) > len(s):
+            key = key[:-len(s)]
+            out.append(key)
+
+    if key and key not in out:
+        out.append(key)
+
     return out
 
 

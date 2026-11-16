@@ -137,6 +137,13 @@ class KinematicsResponse(BaseModel):
     head_frame_kind: str = ""
     #: 控制器连上了没
     controller_connected: bool = False
+    #: 数据是否陈旧 (True = 控制器断开或快照很久没更新)
+    #:
+    #: **标定必须检查这个** —— 陈旧数据会让所有采样的位姿一样,
+    #: 解算时被当成野值剔光。宁可没有数据, 也不能给假的。
+    stale: bool = False
+    #: 快照距今多少毫秒 (越大越陈旧)
+    age_ms: int = 0
     #: 快照时间 (毫秒, 单调时钟)
     timestamp_ms: int = 0
     #: 提示信息 (比如某项拿不到)

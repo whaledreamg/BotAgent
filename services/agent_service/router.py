@@ -67,10 +67,11 @@ class Decision:
 class Router:
     """把请求路由到具体分支。"""
 
-    def __init__(self, cfg: Config, registry: Registry, llm: Any) -> None:
+    def __init__(self, cfg: Config, registry: Registry, llm: Any, skill_catalog: Optional[Any] = None) -> None:
         self.cfg = cfg
         self.registry = registry
         self.llm = llm
+        self.skill_catalog = skill_catalog  # Phase 1-7：添加 Skill 目录
         self._compiled: List[Tuple[re.Pattern, str, str, List[re.Pattern]]] = []
         self._compile_rules()
         # tool calling 的工具目录 —— 机械臂动作 + 设备工具
@@ -80,9 +81,10 @@ class Router:
             tool_handler=registry.get("tool"),
         )
         logger.info(
-            "router 就绪: tools=%s tool_calling=%s",
+            "router 就绪: tools=%s tool_calling=%s skills=%s",
             [s.name for s in self.catalog.specs],
             "on" if self._tool_calling_enabled() else "off",
+            len(skill_catalog.get_all_specs()) if skill_catalog else 0,
         )
 
     def _tool_calling_enabled(self) -> bool:
@@ -95,7 +97,101 @@ class Router:
             return None
         return tc
 
-    # ------------------------------------------------------------ 规则
+    # Phase 2：动态工具发现 - 从 registry 获取指定分支的 Skill
+    def get_branch_tools(self, branch: str) -> List[Any]:
+        """从 registry 获取指定分支的所有 Skill。
+        
+        用于 Tool calling 时只显示该分支的工具，避免混淆。
+        
+        Args:
+            branch: 分支名 ("chat" / "tool" / "device")
+        
+        Returns:
+            该分支的 SkillSpec 列表
+        """
+        if not hasattr(self.registry, 'find_by_branch'):
+            # 兼容旧版本的 registry，直接返回空列表
+            return []
+        return self.registry.find_by_branch(branch)
+
+    def build_tool_list_for_branch(self, branch: str) -> List[Dict[str, Any]]:
+        """生成指定分支的 tool calling 工具定义列表。
+        
+        Args:
+            branch: 分支名 ("chat" / "tool" / "device")
+        
+        Returns:
+            该分支的工具定义列表（OpenAI function calling 格式）
+        """
+        if not hasattr(self.registry, 'to_openai_tools_by_branch'):
+            # 兼容旧版本，直接返回空列表
+            return []
+        return self.registry.to_openai_tools_by_branch(branch)
+
+    def build_dynamic_prompt(self, branch: str, tools: List[Any]) -> str:
+        """根据分支和该分支的 Skill，生成动态 prompt。
+        
+        示例（branch="tool" 时）:
+        ```
+        你是语音助手，当前在【工具查询】模式。
+        
+        可用的工具有：
+        1. vision.recognize - 识别摄像头看到的物体
+           - 用法示例: "看到了什么", "有什么东西"
+        2. weather_query - 查询天气
+           - 用法示例: "天气怎样", "查天气"
+        ```
+        
+        Args:
+            branch: 分支名
+            tools: 该分支的 SkillSpec 列表
+        
+        Returns:
+            根据该分支生成的 prompt
+        """
+        tool_descriptions = []
+        for i, tool in enumerate(tools, 1):
+            examples = []
+            if hasattr(tool, 'natural_language_examples'):
+                examples = tool.natural_language_examples[:2]
+            
+            examples_text = ", ".join(f'"{ex}"' for ex in examples) if examples else "无"
+            tool_descriptions.append(
+                f"{i}. {tool.id} - {tool.description}\n"
+                f"   用法示例: {examples_text}"
+            )
+        
+        branch_desc = self._get_branch_description(branch)
+        tools_list = "\n".join(tool_descriptions)
+        
+        template = getattr(self.cfg.router.tool_calling, 'system_prompt', '')
+        if not template or '{' not in template:
+            # 使用默认模板
+            template = """你是一个语音助手，当前在【{branch_name}】模式。
+
+你可以调用以下工具：
+{tools_list}
+
+根据用户意图选择合适的工具调用。
+
+**重要**: 
+- 必须调用工具来完成用户的请求，不要用文字代替。
+- 如果用户的请求超出了可用工具的范围，直接说明。"""
+        
+        return template.format(
+            branch_name=branch_desc,
+            branch=branch,
+            tools_list=tools_list
+        )
+
+    def _get_branch_description(self, branch: str) -> str:
+        """获取分支的中文描述。"""
+        descriptions = {
+            "chat": "闲聊对话",
+            "tool": "工具查询",
+            "device": "机械臂控制",
+        }
+        return descriptions.get(branch, branch)
 
     def _compile_rules(self) -> None:
         self._compiled = []
@@ -183,9 +279,9 @@ class Router:
             data = await asyncio.wait_for(
                 self.llm.json_completion_stream(
                     messages,
-                    model=self.cfg.router.llm_fallback_model or None,
                     temperature=0.0,
                     max_tokens=64,
+                    role="classify",
                 ),
                 timeout=timeout,
             )
@@ -572,9 +668,9 @@ class Router:
                     self._tool_messages(req),
                     tools,
                     tool_choice=getattr(tc, "tool_choice", "auto"),
-                    model=getattr(tc, "model", "") or None,
                     temperature=getattr(tc, "temperature", 0.0),
                     max_tokens=getattr(tc, "max_tokens", 256),
+                    role="tool",
                 ),
                 timeout=timeout,
             )
@@ -725,9 +821,9 @@ class Router:
                     self._tool_messages(req),
                     tools,
                     tool_choice="required",
-                    model=getattr(tc, "model", "") or None,
                     temperature=getattr(tc, "temperature", 0.0),
                     max_tokens=getattr(tc, "max_tokens", 256),
+                    role="tool",
                 ),
                 timeout=timeout,
             )
@@ -776,4 +872,154 @@ class Router:
             tool_calls=[c for c, _ in known],
             content=(result.content or "").strip(),
             trace=trace,
+        )
+
+    # Phase 3：优化 Tool Calling，实现动态工具发现
+    async def tool_calling_from_branch(
+        self, 
+        req: AgentRequest, 
+        tools: List[Any], 
+        branch: str,
+        trace: List[Dict[str, Any]]
+    ) -> Optional[Decision]:
+        """Tool calling：从工具列表中选择 Skill + 参数（⑤选择 + ⑥调用校验）。
+        
+        支持：
+        1. 单个工具调用（原有流程）
+        2. 多个工具编排（新增，需要启用 thinking mode）
+        
+        相比 _decide_by_tools，这个方法：
+        1. 只在指定分支的工具列表中选择（避免混淆）
+        2. 使用动态生成的 prompt（融入工具的自然语言示例）
+        3. 调用前进行校验（检查工具是否存在）
+        
+        Args:
+            req: 用户请求
+            tools: 该分支的所有 SkillSpec（从 registry 动态获取）
+            branch: 分支名 (tool/device)
+            trace: 分流 trace 列表
+        
+        Returns:
+            Decision 或 None
+        """
+        if not tools:
+            logger.warning(f"分支 {branch} 没有可用工具")
+            return None
+        
+        tc = self._tool_calling_cfg()
+        if tc is None or self.llm is None:
+            return None
+        
+        # 第 1 步：生成动态 prompt（融合该分支 Skill 的定义）
+        system_prompt = self.build_dynamic_prompt(branch, tools)
+        
+        # 第 2 步：转换为 OpenAI function calling 格式
+        tool_defs = self.build_tool_list_for_branch(branch)
+        if not tool_defs:
+            return None
+        
+        # 第 3 步：调用 LLM 选择工具
+        messages = self._tool_messages(req)
+        # 替换 system message 为动态生成的版本
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_prompt
+        else:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+        
+        timeout = max(0.5, float(getattr(tc, "timeout", 5.0)))
+        started = time.time()
+        
+        # 准备 thinking 模式参数
+        thinking_param = None
+        if hasattr(tc, 'thinking') and tc.thinking and tc.thinking.enabled:
+            thinking_param = {
+                "type": "enabled",
+                "budget_tokens": tc.thinking.budget_tokens,
+            }
+        
+        try:
+            result = await asyncio.wait_for(
+                self.llm.tool_call(
+                    messages,
+                    tool_defs,
+                    tool_choice=getattr(tc, "tool_choice", "auto"),
+                    temperature=getattr(tc, "temperature", 0.0),
+                    max_tokens=getattr(tc, "max_tokens", 256),
+                    role="tool_calling_branch",
+                    thinking=thinking_param,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Tool calling 超时 (%.1fs), 分支 {branch}", timeout)
+            trace.append({
+                "step": "tool_calling_branch",
+                "ms": timeout * 1000,
+                "detail": "timeout"
+            })
+            return None
+        except LLMError as exc:
+            logger.warning(f"Tool calling 失败, 分支 {branch}: {exc}")
+            trace.append({
+                "step": "tool_calling_branch",
+                "ms": 0.0,
+                "detail": "error"
+            })
+            return None
+        
+        elapsed = round((time.time() - started) * 1000, 1)
+        
+        # 第 4 步：校验选中的工具是否存在（调用校验，对应你的⑥）
+        if not result.has_calls or not result.calls:
+            # 模型没调工具，返回其文本内容
+            content = (result.content or "").strip()
+            trace.append({
+                "step": "tool_calling_branch",
+                "ms": elapsed,
+                "detail": f"chat:{len(content)}chars"
+            })
+            return Decision(
+                intent=branch,
+                by="tool_calling_branch",
+                content=content,
+                trace=trace
+            )
+        
+        # 第 5 步：从工具列表中查找并校验
+        tool_call = result.calls[0]
+        skill_spec = None
+        
+        # 从 tools 列表中查找
+        for tool in tools:
+            if tool.id == tool_call.name:
+                skill_spec = tool
+                break
+        
+        if not skill_spec:
+            logger.warning(
+                f"Tool calling 选了不存在的工具或不在分支内: {tool_call.name}"
+            )
+            trace.append({
+                "step": "tool_calling_branch",
+                "ms": elapsed,
+                "detail": f"unknown-tool:{tool_call.name}"
+            })
+            return None
+        
+        # 返回决策（包含选中的工具和参数）
+        trace.append({
+            "step": "tool_calling_branch",
+            "ms": elapsed,
+            "detail": f"{skill_spec.id}:success"
+        })
+        
+        return Decision(
+            intent=branch,
+            matched=skill_spec.id,
+            by="tool_calling_branch",
+            tool=skill_spec,
+            tool_args=tool_call.arguments or {},
+            tool_calls=result.calls,
+            content=(result.content or "").strip(),
+            trace=trace
         )

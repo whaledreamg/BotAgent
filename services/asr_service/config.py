@@ -19,6 +19,8 @@ except ImportError:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parents[2]
 PIPELINE_CONFIG_PATH = ROOT / "configs" / "pipeline.yaml"
+#: 热词词表 (专业名词纠错)
+HOTWORDS_CONFIG_PATH = ROOT / "configs" / "hotwords.yaml"
 
 DEFAULTS: Dict[str, Any] = {
     "asr": {
@@ -155,6 +157,27 @@ class Config:
     agent: AgentEndpoint = field(default_factory=AgentEndpoint)
     tts: TTSConfig = field(default_factory=TTSConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    #: 热词配置 (专业名词纠错), 来自 configs/hotwords.yaml
+    hotwords: Dict[str, Any] = field(default_factory=dict)
+
+
+def load_hotwords(path: Path = HOTWORDS_CONFIG_PATH) -> Dict[str, Any]:
+    """加载热词配置。
+
+    词表放在**独立文件** (configs/hotwords.yaml) 而不是塞进 pipeline.yaml ——
+    词表会频繁增删, 混在服务配置里容易改坏。
+
+    读取失败不致命 —— 返回空配置, 服务照常启动 (只是没有热词纠错)。
+    """
+    if yaml is None or not path or not Path(path).is_file():
+        return {}
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception:  # pragma: no cover - 配置文件坏了不该让服务起不来
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data.get("hotwords") or {}
 
 
 def load_config(path: Path = PIPELINE_CONFIG_PATH) -> Config:
@@ -222,4 +245,10 @@ def load_config(path: Path = PIPELINE_CONFIG_PATH) -> Config:
         port=int(os.environ.get("SERVER_PORT", s.get("port", 8801))),
     )
 
-    return Config(asr=asr, agent=agent, tts=tts, server=server)
+    return Config(
+        asr=asr,
+        agent=agent,
+        tts=tts,
+        server=server,
+        hotwords=load_hotwords(),
+    )

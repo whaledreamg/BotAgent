@@ -31,7 +31,7 @@ class ChatHandler(Handler):
 
         started = time.time()
         try:
-            reply = await self.llm.chat(messages)
+            reply = await self.llm.chat(messages, role="chat")
         except LLMError as exc:
             return BranchResult(
                 reply="抱歉，我这边服务暂时不可用，请稍后再试。",

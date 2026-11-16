@@ -1,12 +1,16 @@
-# 动作接入 (Agnes 原生 Function Calling)
+# 动作接入 (OpenAI 兼容 Function Calling)
 
-Agent 用 **Agnes 的原生 function calling** 来识别用户想执行的动作。
+Agent 用 **原生 function calling** 来识别用户想执行的动作。
 机械臂动作与设备工具共用同一套 tool schema —— 一次 LLM 调用同时完成
 「分类意图」和「选动作」。
 
-- 模型: `agnes-2.5-flash` (实测 TTFT ~690ms)
+- 协议: **OpenAI 兼容** (`POST {base_url}/chat/completions` + Bearer 鉴权)
+- 默认模型: `agnes-2.5-flash` (实测 TTFT ~690ms)
 - Endpoint: `POST https://api.agnes-ai.cn/v1/chat/completions`
 - 文档: https://www.agnes-ai.cn/zh-Hans/docs/agnes-25-flash
+
+> **换模型不用改代码** —— 协议是标准的，Agnes / DeepSeek / Qwen / Kimi /
+> OpenAI / Ollama 都能接。配置见 [`llm-providers.md`](llm-providers.md)。
 
 ## 整体流程
 
@@ -15,7 +19,7 @@ flowchart TD
     userInput[用户话语] --> rules["router.match_rules<br/>关键词规则 (零延迟)"]
     rules -->|命中且分支认得| hitHandler["现有 handler<br/>device / tool"]
     rules -->|命中但认不出具体动作| toolPass
-    rules -->|未命中| toolPass["ToolCalling 阶段<br/>Agnes 原生 function calling"]
+    rules -->|未命中| toolPass["ToolCalling 阶段<br/>原生 function calling"]
     toolPass -->|返回 tool_calls| exec["ActionCatalog 执行<br/>参数校验 -> 执行"]
     toolPass -->|无 tool_calls| fakeCheck{"是假确认?"}
     fakeCheck -->|是| retry["tool_choice=required 重试"]
@@ -174,7 +178,7 @@ action_map:
 
 6 个动作就 6 个 function 会让 schema 冗余, 而且模型要在 6 个近似名字里
 挑 —— enum 单函数更准。Agnes 文档也要求「工具描述与 JSON Schema 应保持
-精确、聚焦」。
+精确、聚焦」（各家 OpenAI 兼容服务都是这个建议）。
 
 机械臂的 tool 是**自动生成**的 (不用在 yaml 里写), 动作名从
 `configs/actions.yaml` 读出来枚举成 enum, `description` 里带上说法列表
@@ -213,7 +217,8 @@ function —— 后者让模型一次决定「哪个设备 + 什么状态」, �
 
 ### 2. 参数先校验再执行
 
-Agnes 文档明确要求: 「在应用侧执行会产生副作用的操作前, 应先校验工具参数」。
+Agnes 文档明确要求: 「在应用侧执行会产生副作用的操作前, 应先校验工具参数」
+（这是通用最佳实践，换成别家模型同样适用）。
 
 `validate_args()` 按 JSON Schema 检查 type / enum / required:
 
@@ -282,16 +287,108 @@ tool calling 关闭时保持原行为不变。
 tool calling 失败 (限流 / 超时 / 网络错误) 时, **不再**去调 `classify_llm`
 —— 那只会再失败一次, 白白多一次往返。直接走默认分支。
 
+### 9. 天气是独立规则, 不带 exclude
+
+天气单独一条规则 (`configs/agent.yaml` 的 `router.rules`):
+
+```yaml
+- intent: tool
+  keywords: ["天气", "气温", "下雨", "下雪", "台风", "温度"]
+```
+
+**不带 exclude** —— 「今天天气怎么样」带「怎么样」, 如果跟开关灯共用
+exclude 词就会被挡掉, 白白多花一次 LLM 往返才查到天气。
+
+天气在 `handlers/tool_handler.py` 里也**豁免**了 `QUESTION_PATTERNS`
+(否则「今天天气怎么样」会被当成闲聊)。
+
+## 天气接口
+
+### 数据源
+
+用的是 **Open-Meteo**, 免费且**不需要 API key**:
+
+| 用途 | 接口 |
+|---|---|
+| 城市名 -> 经纬度 | `https://geocoding-api.open-meteo.com/v1/search` |
+| 天气预报 | `https://api.open-meteo.com/v1/forecast` |
+
+不选需要 key 的服务 (和风/高德), 是为了避免「key 没配导致功能直接不可用」
+这种部署坑 —— 拉起服务就能用。
+
+代码在 `services/agent_service/weather_client.py`。
+
+### 必须由用户说出城市名
+
+用户说「今天天气怎么样」时**没说城市**, 这时**反问**一句
+「想查哪个城市的天气呢?」, 而不是靠 IP 定位去猜。
+
+原因: IP 定位在移动网络/代理出口下经常偏几百公里 (实测同一个出口 IP,
+有的库返回「南京」, 有的返回「镇江」), 报出来的城市是错的。
+
+如果部署在固定场地, 可以把 `handlers.tool.options.weather_default_city`
+填成城市名 —— 填了之后用户不说城市就查那个城市。
+
+### 播报内容
+
+当前实况 + 今日预报:
+
+```
+北京现在晴, 气温 6 度, 体感 3 度, 湿度 86%, 风速 5 公里每小时, 今天 0 到 12 度。
+```
+
+- 天气现象按 WMO code 映射成中文 (`weather_client.WMO_CODES`)
+- 体感温度与实测差 1 度以上才播报 (否则是废话)
+- 降水概率为 0 时不播报
+
+### 城市名提取的坑
+
+用户说的话里夹着修饰词, 直接拿整串去查一定查不到。
+`tool_handler._extract_weather_city()` 的做法是**反向删词**:
+先把「天气/怎么样/今天/帮我查…」全删掉, 剩下的才是城市。
+
+删完还要交给 API 校验 (`weather_client._resolve_place()`):
+查不到就**逐级砍尾**重试 (「适合出门」-> 「适合出」-> 「适合」),
+砍尾的候选**要求有人口数据**, 否则「阿巴」会匹配到西藏阿巴县这种
+同名小地名。
+
+地理编码结果还做了**两层过滤**:
+1. 只认中国境内 (`country_code == "CN"`) —— 否则「阿巴」会匹配到埃塞俄比亚
+2. 只认**有常住人口**的城镇 —— 否则「上海」会匹配到浙江/云南一堆同名的村
+
+### 配置
+
+```yaml
+handlers:
+  tool:
+    options:
+      # 填了就固定查这个城市; 留空则必须由用户说出城市名
+      weather_default_city: ""
+      weather_timeout: 5.0
+```
+
+### 自检
+
+```bash
+cd services/agent_service
+python tools/check_weather.py          # 离线: 城市提取 + 匹配
+python tools/check_weather.py --live   # 额外真实调 API
+```
+
 ## 配置
 
 `configs/agent.yaml`:
 
 ```yaml
+llm:
+  # 工具调用用哪个模型 —— 现在统一在 llm.roles 里配
+  roles:
+    tool: { provider: agnes, model: agnes-2.5-flash }
+
 router:
   trust_rules: true          # 规则命中直接采信, 零延迟
   tool_calling:
     enabled: true
-    model: agnes-2.5-flash   # 实测 TTFT ~690ms, 比 3.0-flash 稳定
     timeout: 5.0             # 超时直接回落默认分支
     temperature: 0.0
     max_tokens: 256
@@ -311,7 +408,7 @@ router:
 | 参数 | 建议 | 原因 |
 |---|---|---|
 | `enabled` | `true` | 关掉就退回原来的两段式 LLM 分类 |
-| `model` | `agnes-2.5-flash` | 实测比 `agnes-3.0-flash` 延迟稳定 |
+| `llm.roles.tool.model` | `agnes-2.5-flash` | 实测比 `agnes-3.0-flash` 延迟稳定 |
 | `timeout` | `5.0` | 语音场景宁可回落到 chat 也不能卡住 |
 | `tool_choice` | `auto` | `required` 会让闲聊也去调工具 |
 | `max_rounds` | `1` | 每多一轮就多一次往返 (~850ms) |
@@ -381,4 +478,6 @@ curl -s -X POST http://127.0.0.1:8800/v1/dispatch \
 | `services/agent_service/llm.py` | `tool_call()` / `complete_with_tools()` |
 | `services/agent_service/app.py` | `dispatch()` 接入 `decide()` |
 | `services/agent_service/handlers/device_handler.py` | `execute()`: 安全门阀 + 下发 |
+| `services/agent_service/weather_client.py` | 天气接口客户端 (Open-Meteo) |
 | `services/agent_service/tools/check_tool_calling.py` | 自检脚本 |
+| `services/agent_service/tools/check_weather.py` | 天气自检脚本 |

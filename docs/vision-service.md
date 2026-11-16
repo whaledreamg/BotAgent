@@ -74,8 +74,12 @@ flowchart TD
 | `services/vision_service/service.py` | 编排: 采帧 -> 检测 -> 解算 -> 缓存 |
 | `services/vision_service/main.py` | FastAPI 入口 |
 | `services/vision_service/tools/check_*.py` | 分项自检 + 总体自检 |
+| `services/vision_service/tools/capture_dataset.py` | **训练** 采图工具 (覆盖度统计 / 负样本混采) |
+| `services/vision_service/tools/setup_dataset.py` | **训练** 数据集目录搭建 + 质量体检 |
+| `services/vision_service/tools/train_model.py` | **训练** 训练脚本 (预检 + 自动写回权重) |
 | `configs/vision.yaml` | 配置 |
 | `scripts/start_vision.sh` | 启动脚本 |
+| `scripts/fix_gpu.sh` | 修 GPU 设备节点缺失 (训练硬阻塞) |
 | `services/agent_service/vision_client.py` | Agent 侧的 HTTP 客户端 |
 
 ---
@@ -640,9 +644,9 @@ vision:
     align_depth_to_color: true   # 关掉就退化成「按内参映射 bbox」(精度差)
     calibrated_intrinsics: {}    # 标定好的内参 (见标定指南)
   detector:
-    weights: "/home/gxh/workspace/project/ultralytics/yolo26n.pt"
+    weights: "/home/gxh/workspace/data/model/yolo/yolo26n.pt"
     pose_weights: ""             # 留空 = 不启用姿态估计
-    conf: 0.35
+    conf: 0.15                   # 别设太高 —— 实测桌面物体只有 0.15~0.30
     find_conf: 0.15              # 按名字查找时的阈值 (比 conf 宽松)
     iou: 0.5
     device: auto                 # auto / cpu / 0
@@ -653,6 +657,20 @@ vision:
     min_valid_ratio: 0.05        # 深度稀疏, 阈值不能高
     depth_min: 0.1
     depth_max: 5.0
+  recognition:
+    mode: "live"                # live / http (测试脚本用哪个模式)
+    conf: 0.05
+    frames: 5
+    output_dir: "logs"
+  training:                     # 训练自定义模型 (见 docs/vision-training.md)
+    data: "/home/gxh/workspace/project/datasets/myobjects/data.yaml"
+    base_weights: "/home/gxh/workspace/project/ultralytics/yolo26n.pt"
+    epochs: 100
+    imgsz: 640
+    batch: 16                   # 显存不够写 -1
+    patience: 30
+    device: "0"
+    auto_apply: true            # 训完自动写回 detector.weights
   extrinsic:
     enabled: false
     matrix: []                   # 4x4 齐次矩阵 (相机系 -> matrix_frame 描述的系)
@@ -713,13 +731,52 @@ conda run -n yolo python services/vision_service/tools/check_vision.py --only co
 | 内参/外参未标定 | 默认用 SDK 标称内参 + 相机系输出。响应里明确标 `"frame": "camera"`, `/v1/calibration` 能查状态 |
 | 姿态模型未启用 | `pose_weights` 留空, 需要时填 `yolo26n-pose.pt` |
 | 不做机械臂控制 | 本阶段只产出位置数据 |
+| **类别固定在 COCO 80 类** | 默认权重 `yolo26n.pt` 只能认那 80 类。抓取自定义工件必须自己训 —— 见 [训练指南](vision-training.md) |
 
 ---
 
-## 12. 下一步
+## 12. 自定义模型 (自己训练)
+
+默认权重是 COCO 预训练的 `yolo26n.pt`，**类别集合固定在 80 类**。
+抓取自己的工件时 YOLO 在原理上就检不出来 —— 调阈值无解，必须自己训。
+
+完整流程见 **[docs/vision-training.md](vision-training.md)**。
+
+速览：
+
+```bash
+cd services/vision_service
+
+# 0. 确认 GPU 可用 (不行就 sudo ../scripts/fix_gpu.sh)
+python tools/train_model.py --check
+
+# 1. 采图 (相机独占, 先停视觉服务)
+conda run -n yolo python tools/capture_dataset.py --count 300
+
+# 2. 建目录 + 体检
+conda run -n yolo python tools/setup_dataset.py \
+  --out /home/gxh/workspace/project/datasets/myobjects --names 杯子,瓶子,螺丝
+
+# 3. 标注 (LabelImg, 框要贴紧)
+conda run -n yolo pip install labelImg
+conda run -n yolo labelImg
+
+# 4. 训练 (训完自动写回 detector.weights)
+conda run -n yolo python tools/train_model.py
+```
+
+**类名决定 `find_object` 能不能匹配上** —— 自定义类别建议直接用中文命名，
+详细说明见 [vision-training.md 第 5 节](vision-training.md#5-类名必须匹配)。
+
+---
+
+## 13. 下一步
 
 1. **完成标定**: 按 [标定指南](calibration.md) 标内参 + 手眼标定,
    然后把 `extrinsic.enabled` 打开, 让 `/v1/objects/{name}?frame=arm_base`
    能返回基座坐标
-2. **接入机械臂**: 用 `find_object` 返回的基座坐标驱动机械臂抓取
-3. **多相机/多目标跟踪**: 目前每帧独立检测, 没有跟踪
+2. **训练自定义模型**: 按 [训练指南](vision-training.md) 训自己的抓取目标,
+   突破 COCO 80 类的限制
+3. **接入机械臂**: 用 `find_object` 返回的基座坐标驱动机械臂抓取
+4. **多相机/多目标跟踪**: 目前每帧独立检测, 没有跟踪
+

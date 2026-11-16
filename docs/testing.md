@@ -27,6 +27,7 @@ cd ../arm_service
 python tools/check_arm.py                   # 协议级: 时序 / 报文 / 对齐 / 停控
 python tools/check_arm_service.py           # 端到端: mock 控制器 + 真实 HTTP/WS
 python tools/check_safety.py                # 安全门阀: 逐项判定 + 播报文案
+python tools/check_reconnect.py             # 断连重连 + 陈旧数据标记
 
 cd ../tts_service
 python examples/ws_server/check_tts_config.py      # TTS 音色 / 模型配置读取
@@ -42,6 +43,7 @@ python examples/ws_server/check_tts_behavior.py    # 客户端覆盖 vs 服务�
 | `check_arm.py` | 关节流时序、报文格式、起点对齐、停控 | 否（mock 控制器） |
 | `check_arm_service.py` | HTTP/WS 接口 + 播放编排 | 否（mock 控制器） |
 | `check_safety.py` | 门阀逐项判定 + 拒绝文案 | 否 |
+| `check_reconnect.py` | 断连自动重连、`stale` 标记、启动时重连 | 否（mock 控制器） |
 | `check_tts_config.py` | 音色 / 模型配置读取、客户端覆盖识别 | 否 |
 | `check_tts_behavior.py` | 客户端覆盖 vs 服务端默认的选择逻辑 | 否 |
 
@@ -240,6 +242,57 @@ curl -s -X POST http://127.0.0.1:8800/v1/dispatch \
 
 > `chat` 类输入会真实调用 LLM，首次可能需要 10~30 秒（上游延迟）。
 > 超时会自动回落 `default_route`，不会卡死。
+
+### 3.3.1 看 Agent 收发了什么（调试）
+
+默认日志只记**元信息**（耗时、provider、tokens、tool 调用数），不记 prompt 全文。
+想看「发出去的完整 prompt」和「模型原始返回」，打开调试开关：
+
+```bash
+# 方式 A: 启动时打开（重启 Agent 服务生效）
+LLM_DEBUG=1 AGENT_DEBUG=1 ./scripts/start_all.sh
+
+# 方式 B: 只想看 Agent 这一层，不起服务
+cd services/agent_service
+/home/gxh/miniconda3/envs/botagent/bin/python tools/debug_dispatch.py "今天天气怎么样"
+```
+
+两个开关的区别：
+
+| 开关 | 作用 | 日志标记 |
+| --- | --- | --- |
+| `LLM_DEBUG=1` | 打印发给 LLM 的**完整请求体**（含 system prompt、tools schema）和**模型原始返回** | `[LLM-DEBUG]` |
+| `AGENT_DEBUG=1` | 打印「输入 / 分流 trace / 最终回复 / action」 | `[AGENT-DEBUG]` |
+
+日志位置：
+
+```bash
+# 实时跟踪
+tail -f logs/agent.log | grep -E "LLM-DEBUG|AGENT-DEBUG"
+
+# 只看最近一次调用的完整往返
+tail -200 logs/agent.log
+```
+
+调试脚本输出长这样：
+
+```
+====================================================================
+输入       : 今天天气怎么样
+分流结果   : intent=tool  by=tools
+匹配到     : control_light
+工具调用   : [ToolCall(id='call_d5f0...', name='control_light', arguments={'state': 'on'})]
+--------------------------------------------------------------------
+trace:
+  rules               0.0ms  tool:打开
+  rules               0.0ms  tool:no-specific-match
+  tools             610.5ms  control_light:tool:1
+====================================================================
+```
+
+> **注意**：调试日志里含完整 prompt 和用户输入，会比较长。
+> 可用 `LLM_DEBUG_MAX_CHARS=4000` 截断（默认 4000 字符，`0` 表示不截断）。
+> 生产环境别开着。
 
 ### 3.4 看 ASR 当前状态
 
@@ -525,57 +578,6 @@ cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
 /home/gxh/miniconda3/envs/asrt/bin/python tools/check_continuous_live.py
 ```
 
-### 4.9 ASR 服务可用参数
-
-| 参数 | 作用 |
-| --- | --- |
-| `--wake "你好助手"` | 唤醒词，多个用逗号分隔 |
-| `--replay <wav>` | 回放模式，不占麦克风 |
-| `--replay-speed <倍率>` | 回放速度（默认 1.0 = 真实时间，2.0 = 两倍速） |
-| `--device <索引>` | 指定采集设备 |
-| `--duration <秒>` | 单次录音最长时长（默认 30） |
-| `--silence <秒>` | 静音多久结束录音（默认 1.2） |
-| `--no-wake` | 跳过唤醒词判定，**仅链路自测用** |
-| `--continuous-timeout <秒>` | 连续对话窗口（默认取配置文件，30） |
-| `--keep-alive <秒>` | 回放结束后保留 HTTP 服务，便于读 `/state` |
-| `--quiet` | 不显示电平条 |
-
-> **回放速度为什么默认是真实时间？**
-> 基类的回放是加速 5 倍（每 256ms 的音频只 sleep 50ms）。加速回放时，
-> 第二段语音会在第一轮的 Agent/TTS 还没跑完时就到达，被 `busy` 状态挡掉，
-> 测不出「窗口内无需唤醒词」这个行为。改成真实节奏后才是真实的场景。
-
----
-
-## 5. 无音频设备时的表现
-
-没有声卡时系统不会崩，会自动降级：
-
-| 环节 | 降级行为 | 日志 |
-| --- | --- | --- |
-| 麦克风采集 | 不可用，只能用 `--replay` | `找不到音效卡` |
-| TTS 播放 | 只合成不播放，链路其余部分照常 | `[TTS] 无可用输出设备, 只合成不播放` |
-| TTS 统计 | `played=false` | `[TTS] 完成 xxxms frames=N bytes=M played=False` |
-
-所以「扬声器出声」这一项在本机无法验证，其余全部可验证。
-
----
-
-## 6. 关于唤醒词
-
-唤醒词判定属于 **ASR 模型层面**，不在本编排层的职责范围内。
-`services/asr_service/wakeup_asr.py` 与 `project/ASRT` 原版**完全一致**，没有任何改动。
-
-当前状态：
-
-- 使用的 `vosk-model-cn-0.22` **不含 `Gr.fst`**，走通用识别器兜底匹配唤醒词
-- 唤醒词「你好助手」会被切成「你好」+「助手」两个词表单元
-- **真人语音**的识别质量明显好于 **TTS 合成音**
-  （TTS 合成音会被识别成「你好注射」，真人录音识别正常）
-
-### 排查建议
-
-```bash
 ### 4.8.1 回声抑制（TTS 播报不被自己当成用户说话）
 
 **症状**：机器人播报「没听清内容，请再说一遍」，麦克风把这句播报录了进去，
@@ -635,6 +637,59 @@ cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
 | 机器人反应变迟钝 | 调小 `echo_settle`，或调小 `echo_quiet_timeout` |
 | 房间很吵时机器人不响应 | `echo_quiet_timeout` 到点会强制恢复；不够就调大 |
 
+### 4.9 ASR 服务可用参数
+
+| 参数 | 作用 |
+| --- | --- |
+| `--wake "你好助手"` | 唤醒词，多个用逗号分隔 |
+| `--replay <wav>` | 回放模式，不占麦克风 |
+| `--replay-speed <倍率>` | 回放速度（默认 1.0 = 真实时间，2.0 = 两倍速） |
+| `--device <索引>` | 指定采集设备 |
+| `--duration <秒>` | 单次录音最长时长（默认 30） |
+| `--silence <秒>` | 静音多久结束录音（默认 1.2） |
+| `--no-wake` | 跳过唤醒词判定，**仅链路自测用** |
+| `--continuous-timeout <秒>` | 连续对话窗口（默认取配置文件，30） |
+| `--echo-settle <秒>` | 回声沉降期（默认取配置文件，0.5） |
+| `--echo-quiet-timeout <秒>` | 等安静的最长等待（默认取配置文件，2.0） |
+| `--keep-alive <秒>` | 回放结束后保留 HTTP 服务，便于读 `/state` |
+| `--quiet` | 不显示电平条 |
+
+> **回放速度为什么默认是真实时间？**
+> 基类的回放是加速 5 倍（每 256ms 的音频只 sleep 50ms）。加速回放时，
+> 第二段语音会在第一轮的 Agent/TTS 还没跑完时就到达，被 `busy` 状态挡掉，
+> 测不出「窗口内无需唤醒词」这个行为。改成真实节奏后才是真实的场景。
+
+---
+
+## 5. 无音频设备时的表现
+
+没有声卡时系统不会崩，会自动降级：
+
+| 环节 | 降级行为 | 日志 |
+| --- | --- | --- |
+| 麦克风采集 | 不可用，只能用 `--replay` | `找不到音效卡` |
+| TTS 播放 | 只合成不播放，链路其余部分照常 | `[TTS] 无可用输出设备, 只合成不播放` |
+| TTS 统计 | `played=false` | `[TTS] 完成 xxxms frames=N bytes=M played=False` |
+
+所以「扬声器出声」这一项在本机无法验证，其余全部可验证。
+
+---
+
+## 6. 关于唤醒词
+
+唤醒词判定属于 **ASR 模型层面**，不在本编排层的职责范围内。
+`services/asr_service/wakeup_asr.py` 与 `project/ASRT` 原版**完全一致**，没有任何改动。
+
+当前状态：
+
+- 使用的 `vosk-model-cn-0.22` **不含 `Gr.fst`**，走通用识别器兜底匹配唤醒词
+- 唤醒词「你好助手」会被切成「你好」+「助手」两个词表单元
+- **真人语音**的识别质量明显好于 **TTS 合成音**
+  （TTS 合成音会被识别成「你好注射」，真人录音识别正常）
+
+### 排查建议
+
+```bash
 cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
 /home/gxh/miniconda3/envs/asrt/bin/python tools/check_asr.py /path/to/your.wav
 ```
@@ -647,8 +702,6 @@ cd "/home/gxh/workspace/project/Bot Agent/services/asr_service"
 - 安装一个带 `Gr.fst` 的小模型，走语法受限识别，唤醒更准、误触发更少
 - 链路自检用 `--no-wake` 绕开（推荐，不影响真实使用）
 
-| `--echo-settle <秒>` | 回声沉降期（默认取配置文件，0.5） |
-| `--echo-quiet-timeout <秒>` | 等安静的最长等待（默认取配置文件，2.0） |
 ---
 
 ## 7. 常见问题
@@ -702,8 +755,10 @@ curl -s http://127.0.0.1:8801/state | jq .timings
 `agnes-2.5-flash` 实测稳定在 TTFT ~450ms / 总耗时 ~700ms。
 默认模型已切到 `agnes-2.5-flash`。
 
-> **注意**：`configs/.env` 里的 `LLM_MODEL` **会覆盖** `configs/agent.yaml` 的
-> `llm.model`。改完 YAML 记得同步改 `.env`，否则「配置改了没效果」。
+> **注意**：`configs/.env` 里的 `LLM_MODEL` **会覆盖** `configs/agent.yaml` 里
+> `llm.default_provider` 对应预设的模型名。改完 YAML 记得同步检查 `.env`，
+> 否则「配置改了没效果」。多 provider 的配置见
+> [`llm-providers.md`](llm-providers.md)。
 
 **2. TTS 首帧延迟（已解决）**
 
@@ -736,7 +791,10 @@ CPU 上合成速度约等于实时（RTF≈0.74），即音频 12 秒就要合�
 ```yaml
 # configs/agent.yaml
 llm:
-  model: agnes-2.5-flash   # 换更快的模型
+  default_provider: agnes
+  providers:
+    agnes:
+      model: agnes-2.5-flash   # 换更快的模型
   timeout: 20              # 上游单次请求超时
   max_tokens: 256          # 限制生成长度 -> 直接降低 TTFT 和 TTS 时长
 router:

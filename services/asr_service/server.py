@@ -411,14 +411,14 @@ class VoiceASR(wakeup_asr.WakeupASR):
         if self.state == "RECORDING":
             self.stop_recording("回放结束")
 
-    def on_recording_complete(self, text, wav_path=None):
+    def on_recording_complete(self, text, wav_path=None, words=None):
         """识别结束后交给编排器: Agent 分流 -> (必要时) TTS 播放。"""
         # 录音阶段耗时: 从开始录音到识别结束 (不含用户说话本身的时间)
         record_ms = 0
         if getattr(self, "rec_start_ts", None):
             record_ms = int((time.time() - self.rec_start_ts) * 1000)
         logger.info("[计时] ASR 录音+识别阶段 %dms, 识别文本长度 %d", record_ms, len(text or ""))
-        self.pipeline.on_recording_complete(text, record_ms=record_ms)
+        self.pipeline.on_recording_complete(text, record_ms=record_ms, words=words)
 
 
 class HealthHandler(BaseHTTPRequestHandler):

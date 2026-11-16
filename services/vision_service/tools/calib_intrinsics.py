@@ -105,6 +105,14 @@ def capture_images(
             try:
                 key = input("> ")
             except EOFError:
+                # stdin 没了 —— 大概率是 `conda run` 切断的。
+                print(
+                    "\n  **stdin 提前结束 (EOF)** —— 采集中断。\n"
+                    "  如果你还没采够, 这是因为用了 `conda run` (它会切断 stdin)。\n"
+                    "  改用: conda run --no-capture-output -n yolo python ...\n"
+                    "  或:   /home/gxh/miniconda3/envs/yolo/bin/python ...\n",
+                    file=sys.stderr,
+                )
                 break
             if key.strip().lower() in ("q", "quit", "exit"):
                 break
@@ -186,6 +194,13 @@ def main() -> int:
 
     images: List[np.ndarray] = []
     if args.capture:
+        # 先检查 stdin —— 不然 `conda run` 会切断 stdin, 表现为
+        # 「刚打印提示符就立刻退出, 一张图都没拍到」。
+        from calibration.interactive import require_interactive_stdin
+
+        if not require_interactive_stdin("tools/calib_intrinsics.py --capture"):
+            return 2
+
         out_dir = Path("/tmp/calib_intrinsics")
         images = capture_images(args.count, out_dir, spec)
     elif args.images:

@@ -126,5 +126,55 @@ class VisionClient:
         except Exception as exc:
             raise VisionError(f"取坐标系快照失败: {exc}") from exc
 
+    # ------------------------------------------------------------ 追溯
+
+    async def traces_stats(self) -> Dict[str, Any]:
+        """获取追溯系统统计信息。"""
+        try:
+            resp = await self._client.get("/v1/traces/stats")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise VisionError(f"获取追溯统计失败: {exc}") from exc
+
+    async def traces_query(
+        self,
+        label: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """查询识别记录。
+
+        Args:
+            label: 按物体类别查询
+            start_time: 时间范围开始 (ISO 8601)
+            end_time: 时间范围结束 (ISO 8601)
+            limit: 返回记录数上限
+
+        Returns:
+            包含查询参数和匹配记录的字典
+        """
+        try:
+            params: Dict[str, Any] = {"limit": limit}
+            if label:
+                params["label"] = label
+            if start_time:
+                params["start_time"] = start_time
+            if end_time:
+                params["end_time"] = end_time
+
+            resp = await self._client.get("/v1/traces/query", params=params)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise VisionError(f"查询追溯记录失败: {exc}") from exc
+
+    async def traces_image_url(self, filename: str) -> str:
+        """获取追溯图像的 URL。"""
+        if not filename:
+            raise VisionError("文件名不能为空")
+        return f"{self.base_url}/v1/traces/image/{filename}"
+
 
 __all__ = ["VisionClient", "VisionError"]

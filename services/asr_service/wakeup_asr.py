@@ -245,6 +245,8 @@ class WakeupASR:
         self.wake_word_hit = None
         self.kw_text = ""
         self.gen_text = ""
+        #: 词级识别结果 (词 + 置信度), 供热词纠错打分用
+        self.final_words = []
 
         #: **回声屏蔽** 相关的状态 (子类用)。
         #:
@@ -343,6 +345,12 @@ class WakeupASR:
         self.final_texts = []
         self.partial_text = ""
         self.asr_rec = KaldiRecognizer(self.model, SAMPLE_RATE)
+        # 开启词级结果 —— 热词纠错要用逐词置信度打分。
+        #
+        # 置信度**不是**纠错的硬门槛 (Vosk 会对「自信的错误」给高置信度,
+        # 比如把「埃斯顿」听成「埃弗顿」时 conf=1.000), 但它是有用的
+        # 辅助权重 —— 低置信度的词更容易被误纠。
+        self.asr_rec.SetWords(True)
 
         # 重置两个检测器, 避免连续唤醒词立刻二次触发
         self.kw_rec = (KaldiRecognizer(self.model, SAMPLE_RATE, self.grammar)
@@ -375,6 +383,7 @@ class WakeupASR:
             text = res.get("text", "").strip()
             if text:
                 self.final_texts.append(text)
+                self._collect_words(res.get("result"))
                 self.partial_text = ""
                 self._print_line(f"✓ {text}", newline=True)
             else:
@@ -388,6 +397,31 @@ class WakeupASR:
             if self.partial_text:
                 self._print_line(f"… {self.partial_text}", newline=False)
 
+    def _collect_words(self, result) -> None:
+        """收集词级识别结果 (词 + 置信度)。
+
+        ``SetWords(True)`` 之后, ``Result()`` 里会多一个 ``result`` 数组,
+        每项形如 ``{"word": "埃斯顿", "conf": 0.994, "start": .., "end": ..}``。
+
+        这是热词纠错的置信度来源。没有它也能纠 (只是少了辅助权重)。
+        """
+        if not isinstance(result, list):
+            return
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            word = item.get("word")
+            if not word:
+                continue
+            entry = {"word": str(word)}
+            conf = item.get("conf")
+            if conf is not None:
+                try:
+                    entry["conf"] = float(conf)
+                except (TypeError, ValueError):
+                    pass
+            self.final_words.append(entry)
+
     def stop_recording(self, reason):
         if self.state != "RECORDING":
             return
@@ -397,6 +431,7 @@ class WakeupASR:
             text = res.get("text", "").strip()
             if text:
                 self.final_texts.append(text)
+            self._collect_words(res.get("result"))
         except Exception:
             pass
         self.asr_rec = None
@@ -421,10 +456,16 @@ class WakeupASR:
         print("=" * 60 + "\n")
 
         # 扩展点: 子类可在这里接入 LLM 等后处理
-        self.on_recording_complete(full, wav_path)
+        self.on_recording_complete(full, wav_path, self.final_words)
 
-    def on_recording_complete(self, text, wav_path=None):
-        """录音结束回调, 默认什么都不做。子类可覆盖以接入 LLM。"""
+    def on_recording_complete(self, text, wav_path=None, words=None):
+        """录音结束回调, 默认什么都不做。子类可覆盖以接入 LLM。
+
+        Args:
+            text: 识别出的完整文本。
+            wav_path: 录音文件路径 (未落盘时为 None)。
+            words: 词级结果 ``[{"word":..., "conf":...}]``, 供热词纠错用。
+        """
         return None
 
     def save_wav(self):

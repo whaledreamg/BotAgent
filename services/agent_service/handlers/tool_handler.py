@@ -15,10 +15,21 @@ import logging
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from handlers.base import AgentRequest, BranchResult, Handler
 from vision_client import VisionClient, VisionError
+from weather_client import (
+    CityNotFound,
+    CityNotSpecified,
+    WeatherClient,
+    WeatherError,
+)
+from parameter_extraction_manager import ParameterExtractionManager
+from llm_parameter_extractor import SkillSpec, ParameterSpec
+from thinking_logger import ThinkingLogger
+import yaml
 
 logger = logging.getLogger("agent.tools")
 
@@ -57,10 +68,23 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "patterns": [r"(播放|放一?首|来一?首)\s*(歌|音乐|曲)"],
     },
     # ---- 输出型: 结果需要播报 ----
+    #
+    # 天气要覆盖多种说法:
+    # - 「天气怎么样」「今天天气」   -> 查当前城市
+    # - 「北京天气」「查一下上海天气」-> 查指定城市
+    # - 「气温多少」「下雨了吗」      -> 也是天气
     "weather": {
         "kind": KIND_QUERY,
         "label": "查天气",
-        "patterns": [r"(天气|气温|下雨|温度)"],
+        "patterns": [
+            r"天气",
+            r"气温",
+            r"温度",
+            r"下雨",
+            r"下雪",
+            r"刮风",
+            r"台风",
+        ],
     },
     "time": {
         "kind": KIND_QUERY,
@@ -123,6 +147,99 @@ class ToolHandler(Handler):
         super().__init__(config=config, llm=llm)
         self._speak_tools: Optional[set] = None
         self._vision_client: Optional[VisionClient] = None
+        self._weather_client: Optional[WeatherClient] = None
+        # 混合参数提取管理器
+        self._extraction_manager: Optional[ParameterExtractionManager] = None
+        # 思考过程日志记录器
+        self._thinking_logger: Optional[ThinkingLogger] = None
+        # Skill 定义缓存
+        self._skills: Dict[str, SkillSpec] = {}
+        # 加载 Skill 定义
+        self._load_skills()
+
+    # ------------------------------------------------------------ 天气
+
+    @property
+    def weather_client(self) -> WeatherClient:
+        """天气服务客户端 (懒加载)。"""
+        if self._weather_client is None:
+            opts = self._options()
+            self._weather_client = WeatherClient(
+                geocode_url=str(
+                    opts.get("weather_geocode_url")
+                    or "https://geocoding-api.open-meteo.com/v1/search"
+                ),
+                forecast_url=str(
+                    opts.get("weather_forecast_url")
+                    or "https://api.open-meteo.com/v1/forecast"
+                ),
+                timeout=float(opts.get("weather_timeout", 5.0)),
+                default_city=str(opts.get("weather_default_city") or ""),
+            )
+        return self._weather_client
+
+    @property
+    def extraction_manager(self) -> ParameterExtractionManager:
+        """混合参数提取管理器 (懒加载)。"""
+        if self._extraction_manager is None:
+            self._extraction_manager = ParameterExtractionManager(llm=self.llm)
+        return self._extraction_manager
+
+    @property
+    def thinking_logger(self) -> ThinkingLogger:
+        """思考过程日志记录器 (懒加载)。"""
+        if self._thinking_logger is None:
+            self._thinking_logger = ThinkingLogger()
+        return self._thinking_logger
+
+    def _load_skills(self) -> None:
+        """从 configs/param_skills.yaml 加载 Skill 定义。"""
+        try:
+            # 找到项目根目录 (Bot Agent/)
+            root_dir = Path(__file__).resolve().parents[3]
+            skill_config_path = root_dir / "configs" / "param_skills.yaml"
+            
+            if not skill_config_path.exists():
+                logger.warning(f"[Skill加载] 配置文件不存在: {skill_config_path}")
+                return
+            
+            with open(skill_config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            
+            skills_config = config.get("skills", {})
+            for skill_name, skill_data in skills_config.items():
+                parameters = []
+                for param_data in skill_data.get("parameters", []):
+                    param_spec = ParameterSpec(
+                        name=param_data.get("name", ""),
+                        description=param_data.get("description", ""),
+                        param_type=param_data.get("type", "string"),
+                        required=param_data.get("required", False),
+                        examples=param_data.get("examples", []),
+                        notes=param_data.get("notes"),
+                    )
+                    parameters.append(param_spec)
+                
+                skill_spec = SkillSpec(
+                    name=skill_name,
+                    label=skill_data.get("label", skill_name),
+                    description=skill_data.get("description", ""),
+                    category=skill_data.get("category", "query"),
+                    parameters=parameters,
+                )
+                self._skills[skill_name] = skill_spec
+                logger.info(f"[Skill加载] 成功加载 Skill: {skill_name}")
+        
+        except Exception as e:
+            logger.error(f"[Skill加载] 加载失败: {e}")
+
+    async def aclose(self) -> None:
+        if self._vision_client is not None:
+            await self._vision_client.aclose()
+            self._vision_client = None
+        if self._weather_client is not None:
+            await self._weather_client.aclose()
+            self._weather_client = None
 
     # ------------------------------------------------------------ 视觉
 
@@ -136,11 +253,6 @@ class ToolHandler(Handler):
                 timeout=float(self._options().get("vision_timeout", 10.0)),
             )
         return self._vision_client
-
-    async def aclose(self) -> None:
-        if self._vision_client is not None:
-            await self._vision_client.aclose()
-            self._vision_client = None
 
     # ------------------------------------------------------------ 分类判定
 
@@ -177,6 +289,15 @@ class ToolHandler(Handler):
 
     async def handle(self, req: AgentRequest) -> BranchResult:
         started = time.time()
+        
+        # 检查是否是复合查询（包含多个关键词）
+        # 例如：「先查天气再查时间」「查上海和杭州的天气」
+        if self._is_composite_query(req.text):
+            logger.info("[工具处理] 检测到复合查询，尝试使用编排引擎")
+            result = await self._handle_composite(req.text, started)
+            if result:
+                return result
+        
         name, spec, args = self._match(req.text)
         if name is None:
             # 没匹配到具体动作: 明确回报给用户 (要念出来, 否则用户一脸茫然)
@@ -192,6 +313,9 @@ class ToolHandler(Handler):
                 trace=[self._trace("match", (time.time() - started) * 1000, "no-tool")],
             )
 
+        # 使用 LLM-First 参数提取（异步）
+        args = await self._extract_args_async(name, req.text, args)
+        
         status, detail = await self.execute(name, args)
         label = spec.get("label", name)
         speak = self.is_output_tool(name)
@@ -227,9 +351,23 @@ class ToolHandler(Handler):
     # ------------------------------------------------------------ 匹配
 
     def _match(self, text: str) -> Tuple[Optional[str], Dict[str, Any], Dict[str, Any]]:
-        # 疑问句式视为闲聊, 不当动作指令
-        if any(re.search(p, text) for p in self.QUESTION_PATTERNS):
+        name, spec, args = self._match_tool(text)
+        if name is None:
             return None, {}, {}
+
+        # 疑问句式视为闲聊, 不当动作指令
+        #
+        # **天气是例外**: 「今天天气怎么样」就是标准的查天气说法,
+        # 而且用户没提城市时问的正是**当前城市**的天气。
+        # 把它当闲聊挡掉, 用户永远等不到天气结果。
+        if name != "weather" and any(
+            re.search(p, text) for p in self.QUESTION_PATTERNS
+        ):
+            return None, {}, {}
+        return name, spec, args
+
+    def _match_tool(self, text: str) -> Tuple[Optional[str], Dict[str, Any], Dict[str, Any]]:
+        """按 TOOLS 表的正则找工具 (不看疑问句式)。"""
         for name, spec in TOOLS.items():
             for pattern in spec.get("patterns", []):
                 if re.search(pattern, text):
@@ -249,27 +387,200 @@ class ToolHandler(Handler):
         return any(part in text for part in _ARM_PARTS)
 
     def _extract_args(self, name: str, text: str) -> Dict[str, Any]:
+        """同步参数提取（兼容旧代码）。"""
         args: Dict[str, Any] = {"raw": text}
         if name == "weather":
-            m = re.search(r"([一-龥]{2,6}?)(?:的)?天气", text)
-            if m:
-                city = m.group(1)
-                # "今天/明天" 这类时间词不是城市
-                if city in ("今天", "明天", "昨天", "现在", "目前"):
-                    city = "默认城市"
-                # "查询北京天气" 里的 "查询" 是动词不是城市名, 要剥掉
-                for verb in ("查询", "查一下", "查查", "帮我查", "请问"):
-                    if city.startswith(verb):
-                        city = city[len(verb):]
-                # 剥完可能就空了 (如 "查天气" -> "查")
-                if len(city) < 2:
-                    city = "默认城市"
-            else:
-                city = "默认城市"
-            args["city"] = city
+            # 使用混合提取器提取城市（同步调用正则版本）
+            city = self.extraction_manager.extract_without_llm("city", text)
+            args["city"] = city or ""
         elif name == "find_object":
-            args["name"] = self._guess_label(text)
+            # 使用混合提取器提取物体
+            obj = self.extraction_manager.extract_without_llm("object", text)
+            args["name"] = obj or ""
         return args
+
+    async def _extract_args_async(
+        self, 
+        name: str, 
+        text: str, 
+        base_args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """异步 LLM-First 参数提取。
+        
+        使用三层架构：缓存 → LLM → 正则
+        """
+        args = base_args.copy()
+        
+        try:
+            if name == "weather" and name in self._skills:
+                # 使用 LLM-First 提取城市
+                skill_spec = self._skills[name]
+                start_time = time.time()
+                
+                params, confidence, reasoning = await self.extraction_manager.llm_first_extract(
+                    text=text,
+                    skill_spec=skill_spec,
+                )
+                
+                elapsed_ms = (time.time() - start_time) * 1000
+                
+                if params:
+                    city = params.get("city", "")
+                    args["city"] = city or ""
+                    logger.info(
+                        f"[LLM-First] 天气参数提取: city={city}, "
+                        f"confidence={confidence:.2f}, elapsed={elapsed_ms:.1f}ms"
+                    )
+                    
+                    # 记录思考日志
+                    self.thinking_logger.log_extraction(
+                        skill=name,
+                        user_query=text,
+                        prompt=skill_spec.description,
+                        llm_response={"status": "success"},
+                        extracted_params=params,
+                        confidence=confidence,
+                        reasoning=reasoning,
+                        total_ms=elapsed_ms,
+                        timing_breakdown={"extraction": elapsed_ms},
+                    )
+                else:
+                    # 降级到同步正则提取
+                    city = self.extraction_manager.extract_without_llm("city", text)
+                    args["city"] = city or ""
+                    logger.debug(f"[LLM-First] 天气参数提取失败，使用正则降级")
+                    
+            elif name == "find_object" and name in self._skills:
+                # 使用 LLM-First 提取物体名称
+                skill_spec = self._skills[name]
+                start_time = time.time()
+                
+                params, confidence, reasoning = await self.extraction_manager.llm_first_extract(
+                    text=text,
+                    skill_spec=skill_spec,
+                )
+                
+                elapsed_ms = (time.time() - start_time) * 1000
+                
+                if params:
+                    obj_name = params.get("object", "")
+                    args["name"] = obj_name or ""
+                    logger.info(
+                        f"[LLM-First] 物体查找参数提取: object={obj_name}, "
+                        f"confidence={confidence:.2f}, elapsed={elapsed_ms:.1f}ms"
+                    )
+                    
+                    # 记录思考日志
+                    self.thinking_logger.log_extraction(
+                        skill=name,
+                        user_query=text,
+                        prompt=skill_spec.description,
+                        llm_response={"status": "success"},
+                        extracted_params=params,
+                        confidence=confidence,
+                        reasoning=reasoning,
+                        total_ms=elapsed_ms,
+                        timing_breakdown={"extraction": elapsed_ms},
+                    )
+                else:
+                    # 降级到同步正则提取
+                    obj = self.extraction_manager.extract_without_llm("object", text)
+                    args["name"] = obj or ""
+                    logger.debug(f"[LLM-First] 物体参数提取失败，使用正则降级")
+                    
+        except Exception as e:
+            logger.error(f"[LLM-First] 异步参数提取异常: {e}", exc_info=True)
+            # 异常时使用同步降级
+            args = self._extract_args(name, text)
+        
+        return args
+
+    async def _extract_city_with_llm(self, text: str) -> str:
+        """使用 LLM 精准提取城市名。
+        
+        对于"先查南京天气再查时间"这样的复杂句子，
+        正则容易失败，但 LLM 能理解意图。
+        """
+        try:
+            # 用 LLM 提取参数
+            prompt = f"""从这句话里提取城市名。
+句子: "{text}"
+
+规则:
+1. 返回只包含城市名, 不要其他文字
+2. 如果没有提到城市, 返回空
+
+城市名:"""
+            
+            # 调用 LLM
+            response = await self.llm_client.complete(
+                prompt,
+                max_tokens=10,
+                temperature=0,
+            )
+            
+            city = response.strip()
+            
+            # 验证是否是合理的城市名（2-4 个汉字）
+            if city and 2 <= len(city) <= 4 and all('\u4e00' <= c <= '\u9fff' or c.isalnum() for c in city):
+                logger.info(f"[参数提取] LLM 提取城市: {city}")
+                return city
+            else:
+                logger.debug(f"[参数提取] LLM 提取结果无效: {city}")
+                return ""
+                
+        except Exception as e:
+            logger.debug(f"[参数提取] LLM 提取失败: {e}")
+            return ""
+
+    @staticmethod
+    def _extract_weather_city(text: str) -> str:
+        """从「查一下北京天气」这类句子里挑出可能的城市名。
+
+        挑不出就返回空串 —— 空串代表「没指定城市」, 由客户端去查
+        当前所在城市 (IP 定位), 而不是随便报一个假城市。
+
+        **这里做的是「粗筛」, 不是最终判定**: 句子里可能混着「适合出门」
+        这种没法穷举的修饰词。所以结果还要交给天气 API 校验 ——
+        查不到这个名字就当「没指定城市」, 回落当前城市。
+        """
+        s = text.strip()
+
+        # 先处理连接词和"再查时间"这样的后续任务标记
+        # 「先查南京天气再查时间」-> 「先查南京天气」
+        s = re.sub(r"(再|然后|接着|和|跟|以及)(查|看|问|说).*$", "", s)
+        
+        # 天气相关的词本身不是城市
+        s = re.sub(r"(天气预报|天气|气温|温度|下雨|下雪|刮风|台风)", "", s)
+        
+        # 疑问词/副词/语气词 —— 都不属于城市名
+        s = re.sub(
+            r"(怎么样|怎么样了|如何|好不好|是否|能不能|可不可以|会不会|要不要"
+            r"|适合|不适合|值得|需要|大概|大约|多少|几"
+            r"|一下|一下的|吗|呢|啊|呀|哈|嘛|的)",
+            "",
+            s,
+        )
+        # 时间词
+        s = re.sub(r"(今天|今日|明天|明日|后天|昨天|现在|目前|此刻|当下|今儿|时间)", "", s)
+
+        # 动词前缀 —— 可能出现在城市名前面, 要**循环剥**:
+        # 「帮我查一下北京」-> 删「一下」后变「帮我查北京」-> 还要再删「帮我查」
+        # 「先查南京」-> 删后变「南京」
+        for _ in range(4):
+            new = re.sub(
+                r"^(帮我|帮忙|给我|替我|请问|请|查询|查一下|查查|查|看看|看下|看下|先|后|想要|让|让我)",
+                "",
+                s,
+            )
+            if new == s:
+                break
+            s = new
+
+        # 只保留中英文数字
+        s = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", s)
+        # 少于 2 个字不可能是地名 —— 当成「没指定城市」
+        return s if len(s) >= 2 else ""
 
     # ------------------------------------------------------------ 执行
 
@@ -297,8 +608,7 @@ class ToolHandler(Handler):
 
         # ---- 输出型工具: detail 直接就是要念给用户听的内容 ----
         if name == "weather":
-            city = args.get("city", "默认城市")
-            return "ok", f"{city}今天天气晴，气温 24 度"
+            return await self._execute_weather(args)
         if name == "time":
             now = datetime.now()
             return "ok", f"现在是{now.hour}点{now.minute}分"
@@ -309,6 +619,48 @@ class ToolHandler(Handler):
         if name == "find_object":
             return await self._execute_find_object(args)
         return "failed", "未知动作"
+
+    # ------------------------------------------------------------ 天气
+
+    async def _execute_weather(self, args: Dict[str, Any]) -> Tuple[str, str]:
+        """查天气 -> 播报当前实况 + 今日预报。
+
+        城市为空 = 用户没说城市 -> **反问用户**「查哪个城市」,
+        而不是靠 IP 定位去猜 (IP 定位常常落在几百公里外, 是错的)。
+        """
+        city = str(args.get("city", "") or "").strip()
+        # 「默认城市」这类占位词也当作「没指定」
+        if city in ("默认城市", "默认", "当前城市", "本地"):
+            city = ""
+
+        try:
+            report = await self.weather_client.query(city)
+        except CityNotSpecified:
+            return "ok", "想查哪个城市的天气呢？"
+        except CityNotFound:
+            logger.warning("[天气] 查不到城市 %r", city)
+            return "failed", f"没找到{city}这个地方，换个城市名试试"
+        except WeatherError as exc:
+            logger.error("[天气] 查询失败: %s", exc)
+            return "failed", "天气服务暂时用不了，请稍后再试"
+        except Exception as exc:  # pragma: no cover - 兜底
+            logger.exception("[天气] 查询异常")
+            return "failed", "天气服务暂时用不了，请稍后再试"
+
+        parts = [
+            f"{report.city}现在{report.condition}",
+            f"气温 {report.temperature:.0f} 度",
+        ]
+        if report.apparent and abs(report.apparent - report.temperature) >= 1:
+            parts.append(f"体感 {report.apparent:.0f} 度")
+        parts.append(f"湿度 {report.humidity}%")
+        if report.wind:
+            parts.append(f"风速 {report.wind:.0f} 公里每小时")
+        parts.append(f"今天 {report.temp_min:.0f} 到 {report.temp_max:.0f} 度")
+        if report.precip_prob:
+            parts.append(f"降水概率 {report.precip_prob}%")
+
+        return "ok", "，".join(parts) + "。"
 
     # ------------------------------------------------------------ 视觉
 
@@ -440,3 +792,136 @@ class ToolHandler(Handler):
         # 只保留中英文数字, 去掉标点
         s = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", s)
         return s.strip()
+
+    # ---- 复合查询处理 ----
+
+    def _is_composite_query(self, text: str) -> bool:
+        """检查是否是复合查询。
+        
+        复合查询特征：
+        - 包含多个工具关键词（如「天气」和「时间」）
+        - 包含「先...再...」「...然后...」等连接词
+        """
+        # 连接词标志
+        connectors = [
+            "先", "再", "然后", "之后", "接着", "随后", "紧接着",
+            "和", "跟", "还有", "以及", "同时", "一起"
+        ]
+        
+        has_connector = any(conn in text for conn in connectors)
+        
+        if not has_connector:
+            return False
+        
+        # 检查是否有多个工具关键词
+        tool_keywords = set()
+        for keyword in ["天气", "时间", "日期", "几号", "星期", "周几"]:
+            if keyword in text:
+                tool_keywords.add(keyword)
+        
+        for keyword in ["查", "看", "告诉", "帮"]:
+            if keyword in text:
+                for obj in ["天气", "时间", "日期"]:
+                    if obj in text:
+                        tool_keywords.add(f"{keyword}-{obj}")
+        
+        return len(tool_keywords) >= 2
+
+    async def _handle_composite(self, text: str, started: float) -> Optional[BranchResult]:
+        """处理复合查询。
+        
+        尝试使用编排引擎解析和执行。
+        """
+        try:
+            from task_parser import parse_task_sequence
+            from parameter_validator import create_default_validator
+            from orchestrator import create_orchestrator
+            
+            # 简单的任务识别逻辑（使用关键词匹配）
+            tasks = []
+            task_order = 1
+            
+            # 检查天气任务
+            if any(w in text for w in ["天气", "温度", "气温", "下雨", "下雪"]):
+                # 优先使用 LLM 精准提取，降级到正则
+                city = await self._extract_city_with_llm(text)
+                if not city:
+                    city = self._extract_weather_city(text)
+                
+                tasks.append({
+                    "tool": "weather",
+                    "params": {"city": city},  # 始终包含 city，即使为空
+                    "order": task_order
+                })
+                task_order += 1
+            
+            # 检查时间任务
+            if any(w in text for w in ["时间", "几点", "现在几点", "几号", "今天几号", "周几", "星期"]):
+                tasks.append({
+                    "tool": "time",
+                    "params": {},
+                    "order": task_order
+                })
+                task_order += 1
+            
+            if len(tasks) < 2:
+                return None  # 没有检测到复合任务
+            
+            # 构造 TaskSequence 格式
+            task_json = {
+                "tasks": tasks,
+                "sequence_type": "sequential"
+            }
+            import json
+            sequence_str = json.dumps(task_json)
+            
+            # 解析任务序列
+            sequence = parse_task_sequence(sequence_str)
+            
+            if not sequence.is_valid or not sequence.tasks:
+                logger.warning("[工具处理] 任务序列解析失败")
+                return None
+            
+            # 参数验证
+            validator = create_default_validator()
+            for task in sequence.tasks:
+                result = validator.validate(task.tool, task.params or {}, text)
+                if result.is_valid:
+                    task.params = result.params
+            
+            # 创建编排器并执行
+            # 多个任务需要足够的时间：DNS 解析 + API 调用 + JSON 解析
+            # 15 秒确保即使网络较慢也能完成
+            orchestrator = create_orchestrator(self._execute_task_wrapper, timeout_per_task=15.0)
+            orch_result = await orchestrator.execute(sequence)
+            
+            if not orch_result or not orch_result.aggregated_text:
+                return None
+            
+            logger.info(f"[工具处理] 复合查询执行成功: {orch_result.aggregated_text}")
+            
+            # 返回聚合结果
+            return BranchResult(
+                reply=orch_result.aggregated_text,
+                speak=True,
+                action={
+                    "name": "composite",
+                    "args": {"tasks": len(sequence.tasks)},
+                    "status": "success" if orch_result.all_success else "partial",
+                    "detail": orch_result.aggregated_text,
+                    "kind": "query",
+                    "speak": True,
+                },
+                trace=[self._trace("composite", (time.time() - started) * 1000, f"{len(sequence.tasks)}-tasks")],
+            )
+        except Exception as e:
+            logger.warning(f"[工具处理] 复合查询处理失败: {e}")
+            return None
+
+    async def _execute_task_wrapper(self, tool: str, params: dict) -> tuple:
+        """编排引擎用的任务执行包装器。"""
+        try:
+            status, detail = await self.execute(tool, params)
+            return ("ok", detail) if status == "ok" else ("failed", detail)
+        except Exception as e:
+            return ("failed", str(e))

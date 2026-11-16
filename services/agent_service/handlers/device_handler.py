@@ -386,7 +386,7 @@ class DeviceHandler(Handler):
 
             data = await asyncio.wait_for(
                 self.llm.json_completion_stream(
-                    messages, temperature=0.0, max_tokens=32
+                    messages, temperature=0.0, max_tokens=32, role="classify"
                 ),
                 timeout=timeout,
             )

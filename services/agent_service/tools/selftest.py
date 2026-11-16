@@ -46,17 +46,21 @@ class FakeLLM:
         self.reply = reply
         self.calls = 0
 
-    async def json_completion(self, messages, model=None, temperature=0.0, max_tokens=128):
-        self.calls += 1
-        return {"intent": self.intent}
-
-    async def json_completion_stream(
-        self, messages, model=None, temperature=0.0, max_tokens=128
+    async def json_completion(
+        self, messages, model=None, temperature=0.0, max_tokens=128, role=None
     ):
         self.calls += 1
         return {"intent": self.intent}
 
-    async def chat(self, messages, model=None, temperature=None, max_tokens=None):
+    async def json_completion_stream(
+        self, messages, model=None, temperature=0.0, max_tokens=128, role=None
+    ):
+        self.calls += 1
+        return {"intent": self.intent}
+
+    async def chat(
+        self, messages, model=None, temperature=None, max_tokens=None, role=None
+    ):
         self.calls += 1
         return self.reply
 
@@ -106,10 +110,13 @@ async def main() -> int:
     print(f"     action={result.action}")
 
     print("\n2) 疑问句走 chat, 不被当成动作指令")
-    intent, trace = await router.route(AgentRequest(text="你好，今天天气怎么样"))
+    #
+    # 注意: 「天气」是**例外** —— 「今天天气怎么样」就是标准的查天气说法,
+    # 所以它会走 tool 分支。这里用一个**真的疑问句**来测。
+    intent, trace = await router.route(AgentRequest(text="这个东西怎么用"))
     check("疑问句分流到 chat", intent == "chat", f"(实际 {intent})")
     tool_handler = registry.get("tool")
-    tool_res = await tool_handler.handle(AgentRequest(text="你好，今天天气怎么样"))
+    tool_res = await tool_handler.handle(AgentRequest(text="这个东西怎么用"))
     check("疑问句不产生动作", tool_res.action.get("status") == "unsupported",
           f"(实际 {tool_res.action})")
 
@@ -121,7 +128,7 @@ async def main() -> int:
     print("\n4) LLM 兜底超时 -> 回落默认分支")
     class SlowLLM(FakeLLM):
         async def json_completion_stream(
-            self, messages, model=None, temperature=0.0, max_tokens=128
+            self, messages, model=None, temperature=0.0, max_tokens=128, role=None
         ):
             import asyncio
 
@@ -148,7 +155,10 @@ async def main() -> int:
 
     print("\n6) LLM 误判时, 分支自检可以否决")
     llm.intent = "tool"      # LLM 把闲聊误判成 tool
-    intent, trace = await router.route(AgentRequest(text="今天天气怎么样"))
+    #
+    # 用真正的闲聊句: 「今天天气怎么样」现在是**查天气**的标准说法,
+    # 会命中天气的规则通道, 走不到这里。
+    intent, trace = await router.route(AgentRequest(text="讲个笑话吧"))
     check("被分支自检否决后回落 chat", intent == "chat", f"(实际 {intent})")
     confirm = [t for t in trace if t["step"] == "confirm"]
     check("trace 里有 confirm 记录", bool(confirm), f"(trace={trace})")
@@ -206,7 +216,7 @@ async def main() -> int:
 
     print("\n11) 闲聊问句不会被当成输出型工具")
     if tool_handler is not None:
-        res = await tool_handler.handle(AgentRequest(text="今天天气怎么样"))
+        res = await tool_handler.handle(AgentRequest(text="这个东西怎么用"))
         check("疑问句不产生动作", (res.action or {}).get("status") == "unsupported")
         check("不支持的动作会告知用户 (speak=true)", res.speak is True,
               f"(实际 {res.speak})")

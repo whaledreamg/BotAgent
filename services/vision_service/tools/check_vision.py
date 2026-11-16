@@ -38,6 +38,7 @@ from solver import PoseSolver  # noqa: E402
 
 PASSED: List[str] = []
 FAILED: List[str] = []
+SKIPPED: List[str] = []
 
 
 def check(desc: str, ok: bool, detail: str = "") -> bool:
@@ -48,6 +49,18 @@ def check(desc: str, ok: bool, detail: str = "") -> bool:
         FAILED.append(desc)
         print(f"  [FAIL] {desc}  {detail}")
     return ok
+
+
+def skip(desc: str, reason: str = "") -> None:
+    """跳过一个检查 (不算失败)。
+
+    **什么时候用**: 依赖外部环境的检查 —— 相机没插、控制器没连 ——
+    这时候报 FAIL 会让人以为代码坏了, 实际上代码是对的, 只是环境没就绪。
+
+    比如相机没插的时候, "相机已连接" 和 "POST /v1/detect" 都不该算失败。
+    """
+    SKIPPED.append(desc)
+    print(f"  [SKIP] {desc}" + (f"  {reason}" if reason else ""))
 
 
 def section(title: str) -> None:
@@ -281,11 +294,19 @@ def check_http(base_url: str) -> None:
     if code != 200:
         return
 
-    check("相机已连接", bool(body.get("camera_connected")), str(body.get("camera_connected")))
+    cam_ok = bool(body.get("camera_connected"))
+    if cam_ok:
+        check("相机已连接", True, str(body.get("camera_name")))
+    else:
+        # 相机没插 / 没接好 —— 这是环境问题, 不是代码问题
+        skip("相机已连接", "相机没插 (USB 层看不到设备) —— 这是环境问题, 不算失败")
     check("模型已加载", bool(body.get("detector_loaded")), str(body.get("detector_loaded")))
 
     code, body = http_post(f"{base_url}/v1/detect", {"conf": 0.05})
-    check("POST /v1/detect", code == 200, f"HTTP {code}")
+    if not cam_ok:
+        skip("POST /v1/detect", "相机没连上, 检测跑不了")
+    else:
+        check("POST /v1/detect", code == 200, f"HTTP {code}")
     if code == 200:
         objects = body.get("objects") or []
         check("返回目标列表", isinstance(objects, list), f"{len(objects)} 个")
@@ -350,8 +371,15 @@ def check_arm_service(arm_url: str = "http://127.0.0.1:8802") -> None:
     has_cartesian = any(
         isinstance((d or {}).get("cartesian"), dict) for d in arms.values()
     )
-    check("至少一条臂有 cartesian (标定的量尺)", has_cartesian,
-          "没有的话没法做手眼标定")
+    if has_cartesian:
+        check("至少一条臂有 cartesian (标定的量尺)", True)
+    elif not body.get("controller_connected", False):
+        # 控制器没连 —— 仿真模式或者没开机, 属于环境问题
+        skip("至少一条臂有 cartesian (标定的量尺)",
+             "控制器没连 —— 标定时才需要")
+    else:
+        check("至少一条臂有 cartesian (标定的量尺)", False,
+              "控制器连着但没拿到位姿 —— 查一下机械臂是否使能")
 
     lifting = body.get("lifting_column")
     print(f"         升降柱: {lifting if lifting else '无'}")
@@ -529,10 +557,15 @@ def main() -> int:
         check_agent()
 
     print(f"\n{'=' * 50}")
-    print(f"通过 {len(PASSED)}, 失败 {len(FAILED)}")
+    print(f"通过 {len(PASSED)}, 失败 {len(FAILED)}"
+          + (f", 跳过 {len(SKIPPED)}" if SKIPPED else ""))
     if FAILED:
         print("\n失败项:")
         for name in FAILED:
+            print(f"  - {name}")
+    if SKIPPED:
+        print("\n跳过项 (环境没就绪, 不算失败):")
+        for name in SKIPPED:
             print(f"  - {name}")
     print("=" * 50)
     return 0 if not FAILED else 1

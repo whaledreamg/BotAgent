@@ -1,0 +1,16 @@
+# Skill 注册配置
+#
+# 内置 skill 由代码自动发现，不需要这里配。
+# 这个文件用于配置来自外部的 HTTP / MCP skill。
+
+# HTTP 远程 skill（来自已有 HTTP 服务）
+http: []
+  # - id: vision.detect
+  #   url: http://127.0.0.1:8803
+  #   endpoint: /v1/detect
+
+# MCP 远程 skill（来自第三方 MCP 服务）
+mcp: []
+  # - id: third_party.vqa
+  #   transport: stdio
+  #   command: ["python", "-m", "mcp_vqa_server"]

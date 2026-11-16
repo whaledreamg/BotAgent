@@ -1,0 +1,272 @@
+# LLM 参数提取 - Skill 参数规格定义
+#
+# 这个文件定义了各个 Skill 需要的参数，用于 LLM 参数提取器。
+# 新增 Skill 只需在这里加一条，无需改 Python 代码。
+
+skills:
+  # -------- 天气查询 --------
+  weather:
+    label: "查询天气"
+    description: "查询指定城市的天气情况，包括温度、湿度、风速等"
+    category: "query"  # query=信息查询，action=执行动作
+    parameters:
+      - name: city
+        description: "城市名称"
+        type: string
+        required: true
+        examples: 
+          - "北京"
+          - "上海"
+          - "南京"
+          - "杭州"
+          - "广州"
+        notes: "中文城市名，如果用户说 '这里' 或 '那里' 需要根据上下文推断"
+      
+      - name: date
+        description: "查询日期"
+        type: string
+        required: false
+        examples:
+          - "今天"
+          - "明天"
+          - "后天"
+        default: "今天"
+        notes: "默认查今天的天气"
+
+  # -------- 物体查找 --------
+  find_object:
+    label: "查找物体"
+    description: "在周围环境中查找指定的物体，返回物体的位置和信息"
+    category: "action"
+    parameters:
+      - name: name
+        description: "物体名称"
+        type: string
+        required: true
+        examples:
+          - "手机"
+          - "钥匙"
+          - "眼镜"
+          - "遥控器"
+          - "苹果"
+        notes: "可以是单数或复数形式"
+      
+      - name: location_hint
+        description: "地点提示"
+        type: string
+        required: false
+        examples:
+          - "客厅"
+          - "卧室"
+          - "厨房"
+          - "办公室"
+        notes: "用户可能会提到物体可能在的地方"
+
+  # -------- 讲笑话 --------
+  joke:
+    label: "讲笑话"
+    description: "给用户讲一个笑话"
+    category: "query"
+    parameters: []  # 无需参数
+
+  # -------- 播放音乐 --------
+  play_music:
+    label: "播放音乐"
+    description: "播放指定的音乐"
+    category: "action"
+    parameters:
+      - name: song_name
+        description: "歌曲名或歌手名"
+        type: string
+        required: false
+        examples:
+          - "静夜思"
+          - "梁静茹"
+          - "有你就够了"
+        notes: "如果用户没指定具体歌曲，可能需要播放推荐的音乐"
+      
+      - name: artist
+        description: "歌手名"
+        type: string
+        required: false
+        examples:
+          - "周杰伦"
+          - "林俊杰"
+          - "Taylor Swift"
+
+  # -------- 设置闹钟 --------
+  set_alarm:
+    label: "设置闹钟"
+    description: "设置一个定时闹钟"
+    category: "action"
+    parameters:
+      - name: time
+        description: "闹钟时间"
+        type: string
+        required: true
+        examples:
+          - "早上 7 点"
+          - "明天 9:00"
+          - "10 分钟后"
+        notes: "需要提取具体的时间"
+      
+      - name: label
+        description: "闹钟标签"
+        type: string
+        required: false
+        examples:
+          - "起床"
+          - "会议"
+          - "提醒吃药"
+        notes: "用户可能会标注闹钟的用途"
+
+  # -------- 查询日期时间 --------
+  query_time:
+    label: "查询时间"
+    description: "告诉用户当前的日期和时间"
+    category: "query"
+    parameters: []  # 无需参数
+
+  # -------- 查询股票 --------
+  check_stock:
+    label: "查询股票"
+    description: "查询指定股票的价格和涨跌信息"
+    category: "query"
+    parameters:
+      - name: stock_code
+        description: "股票代码或股票名称"
+        type: string
+        required: true
+        examples:
+          - "AAPL"
+          - "阿里巴巴"
+          - "0700.HK"
+        notes: "支持股票代码或公司名称"
+
+  # -------- 拍照 --------
+  take_photo:
+    label: "拍照"
+    description: "使用相机拍一张照片"
+    category: "action"
+    parameters:
+      - name: filter
+        description: "滤镜类型"
+        type: string
+        required: false
+        examples:
+          - "黑白"
+          - "怀旧"
+          - "鲜艳"
+        notes: "可选，如果用户没有指定则使用默认"
+      
+      - name: target
+        description: "拍摄对象"
+        type: string
+        required: false
+        examples:
+          - "自拍"
+          - "风景"
+          - "合照"
+        notes: "帮助系统理解用户想拍什么"
+
+  # -------- 控制灯光 --------
+  control_light:
+    label: "控制灯光"
+    description: "打开或关闭灯光"
+    category: "action"
+    parameters:
+      - name: state
+        description: "灯的状态"
+        type: string
+        required: true
+        enum: ["on", "off"]
+        examples:
+          - "打开"
+          - "关闭"
+        notes: "必须是打开(on) 或关闭(off)"
+      
+      - name: location
+        description: "灯的位置"
+        type: string
+        required: false
+        examples:
+          - "客厅"
+          - "卧室"
+          - "厨房"
+        notes: "如果有多个灯，需要指定位置"
+
+  # -------- 查询交通 --------
+  check_traffic:
+    label: "查询交通"
+    description: "查询从起点到终点的路线和交通状况"
+    category: "query"
+    parameters:
+      - name: from_location
+        description: "出发地"
+        type: string
+        required: true
+        examples:
+          - "公司"
+          - "家"
+          - "天安门广场"
+        notes: "起点位置"
+      
+      - name: to_location
+        description: "目的地"
+        type: string
+        required: true
+        examples:
+          - "机场"
+          - "火车站"
+          - "市中心"
+        notes: "终点位置"
+      
+      - name: transport_mode
+        description: "交通方式"
+        type: string
+        required: false
+        enum: ["driving", "transit", "walking", "cycling"]
+        examples:
+          - "驾车"
+          - "公交"
+          - "步行"
+        notes: "如果没指定则返回所有方式"
+
+# -------- 缓存配置 --------
+cache:
+  # 技能级别的缓存 TTL 配置 (单位: 秒)
+  ttl:
+    weather: 3600          # 天气: 1 小时
+    find_object: 1800      # 物体查找: 30 分钟
+    joke: 300              # 笑话: 5 分钟 (常变)
+    play_music: 600        # 播放音乐: 10 分钟
+    set_alarm: 3600        # 闹钟: 1 小时
+    query_time: 60         # 时间: 1 分钟
+    check_stock: 300       # 股票: 5 分钟 (实时性强)
+    take_photo: 3600       # 拍照: 1 小时
+    control_light: 1800    # 灯光: 30 分钟
+    check_traffic: 600     # 交通: 10 分钟
+    default: 1800          # 默认: 30 分钟
+
+# -------- LLM 提取配置 --------
+llm_extraction:
+  # 模型配置
+  model: "gpt-4o-mini"
+  temperature: 0.0
+  max_tokens: 200
+  
+  # 提示词配置
+  prompt_style: "structured"  # structured=结构化, conversational=对话式
+  
+  # 是否启用置信度评分
+  enable_confidence: true
+  
+  # 是否启用推理过程展示
+  enable_reasoning: true
+  
+  # 超时设置
+  timeout_seconds: 10
+  
+  # 重试策略
+  max_retries: 2
+  retry_delay_ms: 100

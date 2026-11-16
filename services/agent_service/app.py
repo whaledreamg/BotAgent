@@ -33,6 +33,9 @@ from llm import LLMClient, LLMError
 from registry import Registry
 from router import Router
 from session import SessionStore
+from skill.catalog import SkillCatalog
+from skill.loader import load_all_skills
+from query_api import router as thinking_api_router
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -74,16 +77,30 @@ class Service:
         self.llm = LLMClient(self.cfg.llm)
         self.registry = Registry()
         self.registry.load(self.cfg, self.llm)
-        self.router = Router(self.cfg, self.registry, self.llm)
+        
+        # Phase 1-7：加载 Skill 目录
+        self.skill_catalog = SkillCatalog()
+        load_all_skills(self.skill_catalog, self.llm)
+        
+        self.router = Router(self.cfg, self.registry, self.llm, self.skill_catalog)
         self.sessions = SessionStore(
             max_turns=self.cfg.session.max_turns,
             ttl_seconds=self.cfg.session.ttl_seconds,
         )
         logger.info(
-            "Agent 服务就绪: model=%s branches=%s router=%s",
+            "Agent 服务就绪: provider=%s model=%s branches=%s router=%s skills=%s",
+            self.cfg.llm.default_provider,
             self.cfg.llm.model,
             self.registry.names(),
             self.cfg.router.mode,
+            len(self.skill_catalog.get_all_specs()),
+        )
+        logger.info(
+            "LLM 角色绑定 (实际生效): %s",
+            {
+                name: f"{rc.provider}/{rc.model or '-'}"
+                for name, rc in self.cfg.llm.roles.items()
+            },
         )
 
     def _history(self, session_id: str, use_history: bool) -> List[Dict[str, Any]]:
@@ -168,6 +185,23 @@ class Service:
             intent,
             result.speak,
         )
+
+        # 调试模式: 把「收到什么 -> 怎么分流 -> 回了什么」整条链打出来
+        if os.environ.get("AGENT_DEBUG", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            logger.info(
+                "[AGENT-DEBUG] 输入=%r | intent=%s | by=%s | speak=%s\n"
+                "[AGENT-DEBUG] trace=%s\n"
+                "[AGENT-DEBUG] 回复=%r | action=%s",
+                req.text,
+                intent,
+                getattr(decision, "by", ""),
+                result.speak,
+                all_trace,
+                result.reply or "",
+                result.action,
+            )
 
         return DispatchResponse(
             session_id=req.session_id,
@@ -327,6 +361,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Bot Agent Service", version="1.0.0", lifespan=lifespan)
 
+# 注册思考过程查询 API
+app.include_router(thinking_api_router)
+
 
 def _svc() -> Service:
     if service is None:
@@ -337,14 +374,39 @@ def _svc() -> Service:
 @app.get("/health")
 async def health():
     svc = _svc()
+    llm_cfg = svc.cfg.llm
+
+    # 角色 -> 最终绑定的 provider/model (不含密钥)
+    roles: Dict[str, Any] = {}
+    for role in llm_cfg.role_names():
+        targets = svc.llm.resolve(role)
+        roles[role] = {
+            "provider": targets[0].provider if targets else "",
+            "model": targets[0].model if targets else "",
+            "fallback": [t.provider for t in targets[1:]],
+        }
+
+    # 顶层 model/base_url 反映**实际生效**的那家 (取 chat 角色),
+    # 不能用 default_provider —— 那只是「角色没显式配置时的兜底」。
+    # 否则 roles 全切走了, 顶层还显示旧 provider, 看着像没切换生效。
+    chat_targets = svc.llm.resolve("chat")
+    active_provider = chat_targets[0].provider if chat_targets else ""
+    active_model = chat_targets[0].model if chat_targets else ""
+    active_cfg = llm_cfg.providers.get(active_provider)
+
     return JSONResponse(
         {
             "status": "ok",
-            "model": svc.cfg.llm.model,
-            "base_url": svc.cfg.llm.base_url,
+            "model": active_model,
+            "base_url": active_cfg.base_url if active_cfg else "",
             "branches": svc.registry.names(),
             "router_mode": svc.cfg.router.mode,
-            "api_key_configured": bool(svc.cfg.llm.api_key),
+            "api_key_configured": bool(active_cfg.api_key) if active_cfg else False,
+            # ---- provider / role ----
+            "active_provider": active_provider,
+            "default_provider": llm_cfg.default_provider,
+            "providers": llm_cfg.provider_names,
+            "roles": roles,
         }
     )
 
@@ -362,6 +424,33 @@ async def branches():
             ],
         }
     )
+
+
+@app.get("/v1/skills")
+async def skills():
+    """列出所有已加载的 Skill。"""
+    svc = _svc()
+    specs = svc.skill_catalog.get_all_specs()
+    
+    # 按分支分组
+    by_branch = {}
+    for spec in specs:
+        if spec.branch not in by_branch:
+            by_branch[spec.branch] = []
+        by_branch[spec.branch].append({
+            "id": spec.id,
+            "name": spec.name,
+            "category": spec.category,
+            "kind": spec.kind,
+            "speak": spec.speak,
+            "examples": spec.natural_language_examples[:3],  # 取前 3 个例子
+        })
+    
+    return JSONResponse({
+        "total": len(specs),
+        "by_branch": by_branch,
+        "all_specs": svc.skill_catalog.list_all(),
+    })
 
 
 @app.post("/v1/dispatch", response_model=DispatchResponse)
@@ -396,7 +485,7 @@ async def chat_stream(req: ChatRequest):
             messages.append({"role": "user", "content": req.text})
 
             parts = []
-            async for piece in svc.llm.stream(messages):
+            async for piece in svc.llm.stream(messages, role="chat"):
                 parts.append(piece)
                 yield "data: " + json.dumps(
                     {"type": "delta", "text": piece}, ensure_ascii=False

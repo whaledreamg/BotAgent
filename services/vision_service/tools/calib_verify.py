@@ -258,25 +258,16 @@ def live_check(matrix: np.ndarray) -> None:
 
 
 def load_samples(path: str) -> List[PoseSample]:
-    p = Path(path)
-    with open(p, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    out: List[PoseSample] = []
-    for item in data:
-        obj = item.get("obj_points")
-        img = item.get("img_points")
-        out.append(
-            PoseSample(
-                t_cam_board=np.array(item["t_cam_board"], dtype=np.float64),
-                t_world_tool=np.array(item["t_world_tool"], dtype=np.float64),
-                t_tool_board=np.array(item["t_tool_board"], dtype=np.float64),
-                obj_points=None if obj is None else np.array(obj, dtype=np.float64),
-                img_points=None if img is None else np.array(img, dtype=np.float64),
-                corner_count=int(item.get("corner_count", 0)),
-                label=str(item.get("label", "")),
-            )
-        )
-    return out
+    """读采样。
+
+    兼容两种格式:
+    - **新格式** (session): 有 meta (板参数/内参/图片路径)
+    - **旧格式** (裸数组): 只有采样本身
+    """
+    from calibration.session import load_session
+
+    session = load_session(Path(path))
+    return session.samples
 
 
 def main() -> int:

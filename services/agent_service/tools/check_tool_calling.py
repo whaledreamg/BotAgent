@@ -313,6 +313,9 @@ def test_routing(cfg: Any) -> None:
     check("tool calling 只调了 1 次 LLM", llm.calls == 1, f"LLM 调用了 {llm.calls} 次")
 
     # ---- 3c. 纯 chat -> content 直接作为回复 ----
+    #
+    # 用**真正的闲聊**句子: 「今天天气怎么样」现在会命中天气的规则
+    # (它就是查天气的标准说法), 不会再走 LLM 闲聊路径了。
     llm = FakeLLM(
         ToolCallResult(
             content="今天天气不错",
@@ -321,11 +324,18 @@ def test_routing(cfg: Any) -> None:
         )
     )
     router = _make_router(cfg, llm)
-    decision = asyncio.run(router.decide(AgentRequest(text="今天天气怎么样")))
+    decision = asyncio.run(router.decide(AgentRequest(text="讲个笑话吧")))
     check("纯 chat 意图是 chat", decision.intent == "chat", decision.intent)
     check("纯 chat 拿到 content", decision.content == "今天天气不错", decision.content)
     check("纯 chat 没选工具", decision.tool is None)
     check("纯 chat 只调了 1 次 LLM", llm.calls == 1, f"LLM 调用了 {llm.calls} 次")
+
+    # ---- 3c-2. 「今天天气怎么样」命中天气规则, 零 LLM ----
+    llm = FakeLLM()
+    router = _make_router(cfg, llm)
+    decision = asyncio.run(router.decide(AgentRequest(text="今天天气怎么样")))
+    check("天气走规则通道", decision.intent == "tool", decision.intent)
+    check("天气不调 LLM", llm.calls == 0, f"LLM 调用了 {llm.calls} 次")
 
     # ---- 3d. 模型选了不存在的工具 -> 回落 ----
     llm = FakeLLM(

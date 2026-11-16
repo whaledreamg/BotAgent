@@ -7,7 +7,7 @@
 
 几个必须注意的点:
 1. 深度帧的 `get_data()` 是 **uint16 原始值**, 必须乘 `get_depth_scale()`
-   才是米。漏乘的话距离会差 1000 倍。
+    才是米。漏乘的话距离会差 1000 倍。
 2. `enable_video_stream` 有两个重载: 传 `OBSensorType` 或 `OBStreamType`。
    这里用前者, 因为它能同时带上 format。
 3. 彩色流是 RGB 排列 (不是 OpenCV 习惯的 BGR), 转 numpy 后要换通道。
@@ -22,11 +22,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from camera_adapter import CameraAdapter, CameraError, Frame, Intrinsics
+
 logger = logging.getLogger("vision.camera")
-
-
-class CameraError(RuntimeError):
-    """相机不可用或采帧失败。"""
 
 
 # ------------------------------------------------------------ DeviceInfo
@@ -87,67 +85,7 @@ def _info_vid(info: Any) -> str:
     return _info_call(info, "get_vid", "vid")
 
 
-@dataclass
-class Intrinsics:
-    """相机内参 (针孔模型)。
-
-    3D 反算用: X = (u - cx) * Z / fx, Y = (v - cy) * Z / fy
-    """
-
-    fx: float = 0.0
-    fy: float = 0.0
-    cx: float = 0.0
-    cy: float = 0.0
-    width: int = 0
-    height: int = 0
-
-    @property
-    def valid(self) -> bool:
-        return self.fx > 0 and self.fy > 0 and self.width > 0 and self.height > 0
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "fx": round(self.fx, 4),
-            "fy": round(self.fy, 4),
-            "cx": round(self.cx, 4),
-            "cy": round(self.cy, 4),
-            "width": self.width,
-            "height": self.height,
-        }
-
-
-@dataclass
-class Frame:
-    """一次采集的结果。"""
-
-    #: 彩色图, BGR (OpenCV 习惯)
-    color: Optional[np.ndarray] = None
-    #: 深度图, 原始 uint16 值 (未乘 scale)
-    depth_raw: Optional[np.ndarray] = None
-    #: 深度值 -> 米的换算系数
-    depth_scale: float = 0.001
-    #: 彩色相机内参
-    intrinsics: Intrinsics = field(default_factory=Intrinsics)
-    #: 深度相机内参 (深度图自己的分辨率)
-    depth_intrinsics: Intrinsics = field(default_factory=Intrinsics)
-    #: 深度相机 -> 彩色相机 的外参 (3x3 旋转 + 3 维平移, 平移单位米)
-    #: 没有时是 None —— 深度与彩色就是同一个坐标系。
-    depth_to_color: Optional[Tuple[np.ndarray, np.ndarray]] = None
-    #: 标定好的彩色内参 (覆盖 SDK 标称内参)。
-    #: 标定结果见 tools/calib_intrinsics.py。
-    calibrated_intrinsics: Optional[Intrinsics] = None
-    #: 标定好的畸变系数 (5 个或更多)
-    calibrated_dist: Optional[np.ndarray] = None
-
-    @property
-    def depth_meters(self) -> Optional[np.ndarray]:
-        """深度图 (米)。"""
-        if self.depth_raw is None:
-            return None
-        return self.depth_raw.astype(np.float32) * self.depth_scale
-
-
-class OrbbecCamera:
+class OrbbecCamera(CameraAdapter):
     """Orbbec RGBD 相机。
 
     用法::
@@ -236,6 +174,56 @@ class OrbbecCamera:
             raise CameraError(f"枚举相机失败: {last_error}")
         return ctx, []
 
+    @staticmethod
+    def _usb_seen() -> bool:
+        """内核层面能不能看到 Orbbec 设备 (VID 2bc5)。
+
+        用来区分两种"枚举不到":
+        - **内核都看不到** -> 相机没插 / USB 口坏了 / 线松了
+        - **内核能看到, SDK 看不到** -> SDK 构建有问题 (比如 pip 装的
+          没有 USB PAL), 或者相机被别的进程占着
+
+        没有这一步的话, 两种情况的报错长得一模一样, 排查起来很费时间。
+        """
+        import glob
+        import os
+
+        for path in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    if fh.read().strip().lower() == "2bc5":
+                        return True
+            except OSError:
+                continue
+        return False
+
+    def _no_device_message(self) -> str:
+        """构造"枚举不到相机"的诊断信息。"""
+        if self._usb_seen():
+            # 内核认到了, 但 SDK 枚举不到
+            return (
+                "没有找到 Orbbec 相机 (但 USB 层能看到设备)。\n"
+                "  可能是:\n"
+                "    1. 相机被别的进程占着 —— Orbbec 是 USB **独占**设备,\n"
+                "       视觉服务/标定脚本还开着它。停掉再试:\n"
+                "         ./scripts/stop_all.sh\n"
+                "    2. SDK 构建没有 USB 后端 —— 日志里会报\n"
+                "       'Usb pal is not exist', 需要用源码编译\n"
+                "       (OB_BUILD_USB_PAL=ON) 或换用支持 USB 的构建。\n"
+                "    3. 相机刚插上还没就绪 —— 拔插一次再试。"
+            )
+
+        # 内核层都看不到 —— 物理连接问题
+        return (
+            "没有找到 Orbbec 相机 (USB 层也看不到设备)。\n"
+            "  **相机没插好** —— 检查:\n"
+            "    - USB 线插紧了没 (换个口试试, 相机吃 USB3)\n"
+            "    - 相机供电够不够 (Orbbec 336L 需要独立供电, 有些口带不动)\n"
+            "    - 插上后等 2 秒, 然后重新跑一次\n"
+            "  确认系统认到了 (应该看到 2bc5 开头的行):\n"
+            "    lsusb | grep 2bc5"
+        )
+
     def open(self) -> None:
         """枚举设备并启动数据流。失败抛 CameraError。
 
@@ -274,12 +262,7 @@ class OrbbecCamera:
         ctx, devices = self._enumerate_devices(ob)
 
         if not devices:
-            raise CameraError(
-                "没有找到 Orbbec 相机。\n"
-                "  常见原因: pip 装的 pyorbbecsdk 是无 USB 后端的构建 "
-                "(日志里会报 'Usb pal is not exist'), 需要用源码编译 "
-                "(OB_BUILD_USB_PAL=ON) 或换用支持 USB 的构建。"
-            )
+            raise CameraError(self._no_device_message())
 
         # ---- 选设备 ----
         device = None
