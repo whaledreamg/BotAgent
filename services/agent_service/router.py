@@ -35,6 +35,7 @@ from action_tools import (
     build_tool_specs,
 )
 from config import Config
+from event_bus import bus
 from handlers.base import AgentRequest
 from llm import LLMError, ToolCall
 from registry import Registry
@@ -677,13 +678,67 @@ class Router:
         except asyncio.TimeoutError:
             logger.warning("tool calling 超时 (%.1fs), 回落默认分支", timeout)
             trace.append({"step": "tools", "ms": timeout * 1000, "detail": "timeout"})
+            bus.publish(
+                "error",
+                {
+                    "phase": "tool_calling",
+                    "text": req.text,
+                    "reason": "timeout",
+                    "message": f"tool calling 超时 ({timeout:.1f}s), 回落默认分支",
+                    "elapsed_ms": round(timeout * 1000, 1),
+                },
+                session_id=req.session_id,
+                turn_id=req.turn_id,
+            )
             return None, True
         except LLMError as exc:
             logger.warning("tool calling 失败: %s", exc)
             trace.append({"step": "tools", "ms": 0.0, "detail": "error"})
+            bus.publish(
+                "error",
+                {
+                    "phase": "tool_calling",
+                    "text": req.text,
+                    "reason": "llm_error",
+                    "message": str(exc),
+                    "elapsed_ms": round((time.time() - started) * 1000, 1),
+                },
+                session_id=req.session_id,
+                turn_id=req.turn_id,
+            )
             return None, True
 
         elapsed = round((time.time() - started) * 1000, 1)
+
+        # ---- 监控埋点: tool calling 的思考过程 ----
+        #
+        # 这里是 LLM 唯一一次「思考」的地方: 模型的 content 是它在决定
+        # 要不要调工具时说的话 (很多模型会先说一句「用户想查天气」),
+        # 工具名与参数则是它给出的选择。把这些连同 token 用量推出去,
+        # 监控端就能显示「模型当时在想什么、为什么选了这个工具」。
+        bus.publish(
+            "thinking",
+            {
+                "phase": "tool_calling",
+                "text": req.text,
+                "content": (result.content or "").strip(),
+                "finish_reason": result.finish_reason,
+                "provider": result.provider,
+                "model": result.model,
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "elapsed_ms": elapsed,
+                "tools": [
+                    {
+                        "name": c.name,
+                        "arguments": c.arguments,
+                    }
+                    for c in result.calls
+                ],
+            },
+            session_id=req.session_id,
+            turn_id=req.turn_id,
+        )
 
         # ---- 模型没调工具 ----
         if not result.has_calls:
@@ -833,6 +888,29 @@ class Router:
             return None
 
         elapsed = round((time.time() - started) * 1000, 1)
+
+        # ---- 监控埋点: required 重试的思考过程 ----
+        bus.publish(
+            "thinking",
+            {
+                "phase": "tool_calling_retry",
+                "text": req.text,
+                "content": (result.content or "").strip(),
+                "finish_reason": result.finish_reason,
+                "provider": result.provider,
+                "model": result.model,
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "elapsed_ms": elapsed,
+                "tools": [
+                    {"name": c.name, "arguments": c.arguments}
+                    for c in result.calls
+                ],
+            },
+            session_id=req.session_id,
+            turn_id=req.turn_id,
+        )
+
         if not result.has_calls:
             trace.append({"step": "tools-retry", "ms": elapsed, "detail": "no-call"})
             return None

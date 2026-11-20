@@ -1,0 +1,57 @@
+{
+  "pollIntervalMs": 2000,
+  "requestTimeoutMs": 3000,
+  "autoStart": false,
+  "defaultHost": "127.0.0.1",
+  "services": [
+    {
+      "name": "Agent",
+      "host": "127.0.0.1",
+      "port": 8800,
+      "healthPath": "/health",
+      "statusPath": "/v1/branches"
+    },
+    {
+      "name": "ASR",
+      "host": "127.0.0.1",
+      "port": 8801,
+      "healthPath": "/health",
+      "statusPath": null
+    },
+    {
+      "name": "TTS",
+      "host": "127.0.0.1",
+      "port": 8000,
+      "healthPath": "/health",
+      "statusPath": null
+    },
+    {
+      "name": "Arm",
+      "host": "127.0.0.1",
+      "port": 8802,
+      "healthPath": "/health",
+      "statusPath": "/v1/status"
+    },
+    {
+      "name": "Vision",
+      "host": "127.0.0.1",
+      "port": 8803,
+      "healthPath": "/health",
+      "statusPath": "/v1/status"
+    }
+  ],
+  "websockets": [
+    {
+      "name": "Agent",
+      "url": "ws://127.0.0.1:8800/v1/events/"
+    },
+    {
+      "name": "Arm",
+      "url": "ws://127.0.0.1:8802/ws"
+    },
+    {
+      "name": "Vision",
+      "url": "ws://127.0.0.1:8803/ws"
+    }
+  ]
+}

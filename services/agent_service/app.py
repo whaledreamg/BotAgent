@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -36,6 +37,8 @@ from session import SessionStore
 from skill.catalog import SkillCatalog
 from skill.loader import load_all_skills
 from query_api import router as thinking_api_router
+from event_bus import bus, new_turn_id
+from events_api import router as events_api_router
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -108,11 +111,31 @@ class Service:
 
     async def dispatch(self, req: DispatchRequest) -> DispatchResponse:
         started = time.time()
+
+        # ---- 本轮的唯一 id ----
+        #
+        # session_id 是常驻的 (robot-01), 不能用来分轮; turn_id 每轮换一个。
+        # 显式传给下面所有 publish, 监控端据此把事件归到同一轮。
+        turn_id = new_turn_id()
+
         areq = AgentRequest(
             text=req.text,
             session_id=req.session_id,
             history=self._history(req.session_id, req.use_history),
             image_path=req.image_path,
+            turn_id=turn_id,
+        )
+
+        # ---- 监控埋点: 本轮开始 ----
+        bus.publish(
+            "turn_start",
+            {
+                "text": req.text,
+                "history_len": len(areq.history),
+                "image_path": req.image_path,
+            },
+            session_id=req.session_id,
+            turn_id=turn_id,
         )
 
         t_route = time.time()
@@ -202,6 +225,29 @@ class Service:
                 result.reply or "",
                 result.action,
             )
+
+        # ---- 监控埋点: 本轮结束 ----
+        #
+        # 把这一轮的完整结论推给监控端: 分流怎么判的、走了哪个分支、
+        # 回了什么、动作结果、各阶段耗时。trace 是逐条的 step/ms/detail。
+        bus.publish(
+            "turn_end",
+            {
+                "text": req.text,
+                "intent": intent,
+                "route": [intent],
+                "by": getattr(decision, "by", ""),
+                "speak": bool(result.speak),
+                "reply": result.reply or "",
+                "action": result.action,
+                "latency_ms": total_ms,
+                "route_ms": route_ms,
+                "handler_ms": handler_ms,
+                "trace": all_trace,
+            },
+            session_id=req.session_id,
+            turn_id=turn_id,
+        )
 
         return DispatchResponse(
             session_id=req.session_id,
@@ -344,9 +390,15 @@ service: Optional[Service] = None
 async def lifespan(app: FastAPI):
     global service
     service = Service()
+    # 把事件循环绑到事件总线上 —— 跨线程 publish 时靠它投递
+    try:
+        bus.bind_loop(asyncio.get_running_loop())
+    except RuntimeError:  # pragma: no cover
+        pass
     try:
         yield
     finally:
+        bus.unbind_loop()
         if service is not None:
             await service.llm.aclose()
             # 各个分支可能持有 HTTP 客户端 (视觉/机械臂), 一起关掉
@@ -363,6 +415,8 @@ app = FastAPI(title="Bot Agent Service", version="1.0.0", lifespan=lifespan)
 
 # 注册思考过程查询 API
 app.include_router(thinking_api_router)
+# 注册实时事件推送 API (只读, 监控端用)
+app.include_router(events_api_router)
 
 
 def _svc() -> Service:

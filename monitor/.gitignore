@@ -1,0 +1,20 @@
+# 构建产物
+monitor/build/
+*.o
+*.so
+
+# Qt
+*.pro.user
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# 截图/临时
+*.png
+!docs/**/*.png
+
+# Qt Creator / qmake 中间产物
+.qtcreator/
+.qmake.stash
+Makefile
+*.o

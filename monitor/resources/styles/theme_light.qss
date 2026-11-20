@@ -1,0 +1,417 @@
+/* =====================================================
+ * theme_light.qss - 浅色主题 (默认, 果冻风)
+ *
+ * 本文件是**唯一**定义浅色模式配色的地方。
+ * common_*.qss 只定义结构, 不定义颜色。
+ * ===================================================== */
+
+QWidget {
+    background-color: #FFFFFF;
+    color: #1E1E1E;
+}
+
+QMainWindow {
+    background-color: #F2F4F8;
+}
+
+QDialog {
+    background-color: #FFFFFF;
+}
+
+/* ---------- 状态栏 ---------- */
+QStatusBar {
+    background-color: #FFFFFF;
+    color: #5A6478;
+    border-top: 1px solid rgba(200, 210, 230, 180);
+}
+
+QStatusBar QLabel {
+    background: transparent;
+    color: #5A6478;
+    padding: 0 4px;
+    font-size: 9pt;
+}
+
+/* ---------- 标签 ---------- */
+QLabel {
+    background: transparent;
+    color: #1E1E1E;
+}
+
+QLabel[role="title"] {
+    color: #1E1E1E;
+    font-weight: bold;
+    font-size: 10pt;
+}
+
+QLabel[role="subtitle"] {
+    color: #8A93A6;
+    font-size: 9pt;
+}
+
+QLabel[role="hint"] {
+    color: #8A93A6;
+    font-size: 9pt;
+}
+
+QLabel[role="ok"] {
+    color: #1e8449;
+    font-weight: bold;
+}
+
+QLabel[role="warn"] {
+    color: #9a7d0a;
+    font-weight: bold;
+}
+
+QLabel[role="error"] {
+    color: #c0392b;
+    font-weight: bold;
+}
+
+/* ---------- 按钮 ---------- */
+QPushButton {
+    background-color: #FFFFFF;
+    color: #1E1E1E;
+    border: 1px solid #C0C0C0;
+    border-radius: 4px;
+    padding: 6px 16px;
+    min-height: 24px;
+    outline: 0;
+}
+
+QPushButton:hover {
+    background-color: #F5F5F5;
+    border-color: #0078D4;
+    color: #0078D4;
+}
+
+QPushButton:pressed {
+    background-color: #E5E5E5;
+    border-color: #005A9E;
+    padding-top: 7px;
+    padding-bottom: 5px;
+}
+
+QPushButton:disabled {
+    background-color: #F0F0F0;
+    color: #A0A0A0;
+    border-color: #D0D0D0;
+}
+
+QPushButton:checked {
+    background-color: #0078D4;
+    color: #FFFFFF;
+    border-color: #0078D4;
+}
+
+QPushButton:checked:hover {
+    background-color: #1A88E4;
+}
+
+/* 主操作按钮 */
+QPushButton[type="primary"] {
+    background-color: #0078D4;
+    border-color: #0078D4;
+    color: #FFFFFF;
+    font-weight: bold;
+}
+
+QPushButton[type="primary"]:hover {
+    background-color: #1A88E4;
+    border-color: #1A88E4;
+    color: #FFFFFF;
+}
+
+QPushButton[type="primary"]:pressed {
+    background-color: #0068C4;
+    border-color: #0068C4;
+    color: #FFFFFF;
+}
+
+QPushButton[type="primary"]:disabled {
+    background-color: #B0C4D4;
+    color: #FFFFFF;
+    border-color: #B0C4D4;
+}
+
+/* 危险按钮 */
+QPushButton[type="danger"] {
+    background-color: #D32F2F;
+    border-color: #D32F2F;
+    color: #FFFFFF;
+    font-weight: bold;
+}
+
+QPushButton[type="danger"]:hover {
+    background-color: #E33F3F;
+    border-color: #E33F3F;
+    color: #FFFFFF;
+}
+
+QPushButton[type="danger"]:disabled {
+    background-color: #E0B0B0;
+    color: #FFFFFF;
+    border-color: #E0B0B0;
+}
+
+/* ---------- 输入框 ---------- */
+QLineEdit, QSpinBox, QDoubleSpinBox {
+    background-color: #FFFFFF;
+    color: #1E1E1E;
+    border: 1px solid #C0C0C0;
+    border-radius: 3px;
+    padding: 4px 8px;
+    min-height: 22px;
+    selection-background-color: #0078D4;
+    selection-color: #FFFFFF;
+}
+
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+    border-color: #888888;
+}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color: #0078D4;
+    background-color: #FFFFFF;
+}
+
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
+    background-color: #F0F0F0;
+    color: #A0A0A0;
+    border-color: #D0D0D0;
+}
+
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    width: 16px;
+    background-color: #E8E8E8;
+    border: 1px solid #C0C0C0;
+}
+
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #D0D0D0;
+}
+
+/* ---------- 下拉框 ---------- */
+QComboBox {
+    background-color: #FFFFFF;
+    color: #1E1E1E;
+    border: 1px solid #C0C0C0;
+    border-radius: 3px;
+    padding: 4px 8px;
+    min-height: 22px;
+}
+
+QComboBox:hover {
+    border-color: #888888;
+}
+
+QComboBox:focus {
+    border-color: #0078D4;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 18px;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #FFFFFF;
+    color: #1E1E1E;
+    border: 1px solid #C0C0C0;
+    selection-background-color: #0078D4;
+    selection-color: #FFFFFF;
+    outline: 0;
+}
+
+/* ---------- 分组框 ---------- */
+QGroupBox {
+    background-color: #FFFFFF;
+    color: #333333;
+    border: 1px solid #D0D0D0;
+    border-radius: 6px;
+    margin-top: 14px;
+    padding: 10px;
+    font-weight: normal;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 6px;
+    color: #0078D4;
+    font-weight: bold;
+    background-color: #F5F5F5;
+}
+
+QGroupBox:disabled {
+    color: #A0A0A0;
+    border-color: #E0E0E0;
+}
+
+/* ---------- 表格 ---------- */
+QTableView {
+    background-color: #FFFFFF;
+    alternate-background-color: #F7F9FC;
+    color: #1E1E1E;
+    border: 1px solid #E0E6EF;
+    border-radius: 6px;
+    gridline-color: #EDF1F7;
+    selection-background-color: rgba(74, 144, 226, 60);
+    selection-color: #1E1E1E;
+    outline: 0;
+}
+
+QTableView::item {
+    padding: 3px 6px;
+    border: none;
+}
+
+QTableView::item:selected {
+    background-color: rgba(74, 144, 226, 60);
+    color: #1E1E1E;
+}
+
+QTableView::item:hover {
+    background-color: #F0F6FD;
+}
+
+QHeaderView {
+    background-color: #F2F4F8;
+}
+
+QHeaderView::section {
+    background-color: #F2F4F8;
+    color: #5A6478;
+    border: none;
+    border-bottom: 1px solid #D0D6E0;
+    border-right: 1px solid #E8ECF3;
+    padding: 5px 8px;
+    font-weight: bold;
+}
+
+QHeaderView::section:hover {
+    background-color: #E8EEF7;
+    color: #0078D4;
+}
+
+QHeaderView::section:last {
+    border-right: none;
+}
+
+QTableCornerButton::section {
+    background-color: #F2F4F8;
+    border: none;
+    border-bottom: 1px solid #D0D6E0;
+}
+
+/* ---------- 树 ---------- */
+QTreeView {
+    background-color: #FFFFFF;
+    alternate-background-color: #F7F9FC;
+    color: #1E1E1E;
+    border: 1px solid #E0E6EF;
+    border-radius: 6px;
+    gridline-color: #EDF1F7;
+    selection-background-color: rgba(74, 144, 226, 60);
+    selection-color: #1E1E1E;
+    outline: 0;
+    show-decoration-selected: 1;
+}
+
+QTreeView::item {
+    padding: 2px 4px;
+    border: none;
+}
+
+QTreeView::item:selected {
+    background-color: rgba(74, 144, 226, 60);
+    color: #1E1E1E;
+}
+
+QTreeView::item:hover {
+    background-color: #F0F6FD;
+}
+
+QTreeView::branch {
+    background: transparent;
+}
+
+QTreeView::indicator {
+    width: 14px;
+    height: 14px;
+}
+
+/* ---------- 滚动条 ---------- */
+QScrollBar:vertical {
+    background-color: #F5F5F5;
+    width: 12px;
+    border: none;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #C0C0C0;
+    min-height: 30px;
+    border-radius: 6px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #888888;
+}
+
+QScrollBar:horizontal {
+    background-color: #F5F5F5;
+    height: 12px;
+    border: none;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #C0C0C0;
+    min-width: 30px;
+    border-radius: 6px;
+    margin: 2px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #888888;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line {
+    background: none;
+    height: 0;
+    width: 0;
+}
+
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
+}
+
+/* ---------- 选项卡 ---------- */
+QTabWidget::pane {
+    border: 1px solid #D0D0D0;
+    background-color: #FFFFFF;
+}
+
+QTabBar::tab {
+    background-color: #E8E8E8;
+    color: #4A4A4A;
+    padding: 8px 20px;
+    border: 1px solid #D0D0D0;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+
+QTabBar::tab:selected {
+    background-color: #FFFFFF;
+    color: #0078D4;
+    border-bottom: 2px solid #0078D4;
+}
+
+QTabBar::tab:hover {
+    background-color: #F0F0F0;
+}

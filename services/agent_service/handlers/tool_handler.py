@@ -29,6 +29,7 @@ from weather_client import (
 from parameter_extraction_manager import ParameterExtractionManager
 from llm_parameter_extractor import SkillSpec, ParameterSpec
 from thinking_logger import ThinkingLogger
+from event_bus import bus
 import yaml
 
 logger = logging.getLogger("agent.tools")
@@ -314,7 +315,9 @@ class ToolHandler(Handler):
             )
 
         # 使用 LLM-First 参数提取（异步）
-        args = await self._extract_args_async(name, req.text, args)
+        args = await self._extract_args_async(
+            name, req.text, args, req.session_id, req.turn_id
+        )
         
         status, detail = await self.execute(name, args)
         label = spec.get("label", name)
@@ -400,10 +403,12 @@ class ToolHandler(Handler):
         return args
 
     async def _extract_args_async(
-        self, 
-        name: str, 
-        text: str, 
-        base_args: Dict[str, Any]
+        self,
+        name: str,
+        text: str,
+        base_args: Dict[str, Any],
+        session_id: str = "",
+        turn_id: str = "",
     ) -> Dict[str, Any]:
         """异步 LLM-First 参数提取。
         
@@ -444,6 +449,21 @@ class ToolHandler(Handler):
                         total_ms=elapsed_ms,
                         timing_breakdown={"extraction": elapsed_ms},
                     )
+                    bus.publish(
+                        "thinking",
+                        {
+                            "phase": "param_extraction",
+                            "text": text,
+                            "skill": name,
+                            "extracted_params": params,
+                            "confidence": confidence,
+                            "reasoning": reasoning or "",
+                            "elapsed_ms": round(elapsed_ms, 1),
+                            "prompt": skill_spec.description,
+                        },
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
                 else:
                     # 降级到同步正则提取
                     city = self.extraction_manager.extract_without_llm("city", text)
@@ -481,6 +501,21 @@ class ToolHandler(Handler):
                         reasoning=reasoning,
                         total_ms=elapsed_ms,
                         timing_breakdown={"extraction": elapsed_ms},
+                    )
+                    bus.publish(
+                        "thinking",
+                        {
+                            "phase": "param_extraction",
+                            "text": text,
+                            "skill": name,
+                            "extracted_params": params,
+                            "confidence": confidence,
+                            "reasoning": reasoning or "",
+                            "elapsed_ms": round(elapsed_ms, 1),
+                            "prompt": skill_spec.description,
+                        },
+                        session_id=session_id,
+                        turn_id=turn_id,
                     )
                 else:
                     # 降级到同步正则提取

@@ -1,0 +1,12 @@
+<RCC>
+    <qresource prefix="/resources">
+        <!-- 全局基础样式 (字体) -->
+        <file alias="styles/global.qss">styles/global.qss</file>
+
+        <!-- 主题 (浅色, 唯一定义配色的地方) -->
+        <file alias="styles/theme_light.qss">styles/theme_light.qss</file>
+
+        <!-- 主窗口 -->
+        <file alias="styles/mainwindow.qss">styles/mainwindow.qss</file>
+    </qresource>
+</RCC>

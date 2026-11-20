@@ -1,0 +1,305 @@
+/* =====================================================
+ * mainwindow.qss - BotAgent 监控台 (果冻风, 紧凑布局)
+ *
+ * 全部用 #objectName 选择器, 只影响主窗口里的具名控件,
+ * 不会污染 theme_light.qss 定义的通用控件样式。
+ *
+ * 配色沿用 RobotControl 的果冻风:
+ *   常态: 半透明底色 + 深色文字, 无描边, 圆角 10px
+ *   hover: 底色变实色, 文字变白
+ * ===================================================== */
+
+QMainWindow#MainWindow {
+    background-color: #F2F4F8;
+}
+
+QWidget#centralWidget {
+    background-color: #F2F4F8;
+}
+
+/* ---------- 顶部工具条 ---------- */
+QFrame#topBar {
+    background-color: rgba(255, 255, 255, 230);
+    border: 1px solid rgba(200, 210, 230, 180);
+    border-radius: 12px;
+}
+
+QLabel#lblTitle {
+    color: #1E1E1E;
+    font-weight: bold;
+    font-size: 12pt;
+    background: transparent;
+}
+
+QLabel#lblSubtitle {
+    color: #8A93A6;
+    background: transparent;
+    font-size: 9pt;
+}
+
+QLabel#lblOverview {
+    color: #5A6478;
+    background: transparent;
+    font-size: 10pt;
+    font-weight: bold;
+}
+
+QLabel#lblIntervalTitle {
+    color: #5A6478;
+    background: transparent;
+    font-size: 9pt;
+}
+
+QLabel#lblHostTitle {
+    color: #5A6478;
+    background: transparent;
+    font-size: 9pt;
+}
+
+/* 监控 IP 输入框 —— 果冻风半透明圆角 */
+QLineEdit#editHost {
+    background-color: rgba(255, 255, 255, 200);
+    border: 1px solid rgba(200, 210, 230, 180);
+    border-radius: 8px;
+    padding: 4px 10px;
+    color: #1E1E1E;
+    font-size: 10pt;
+    selection-background-color: #4a90e2;
+    selection-color: #FFFFFF;
+}
+QLineEdit#editHost:focus {
+    border: 1px solid #4a90e2;
+    background-color: rgba(255, 255, 255, 240);
+}
+QLineEdit#editHost:disabled {
+    background-color: rgba(230, 235, 245, 160);
+    color: #A8B0C0;
+}
+
+QLabel#lblVersion {
+    color: #8A93A6;
+    background: transparent;
+    font-size: 9pt;
+}
+
+/* 间隔线 */
+QFrame#sep1, QFrame#sep2, QFrame#sep3 {
+    color: #C8D0E0;
+    background: #C8D0E0;
+    max-width: 1px;
+}
+
+/* =====================================================
+ * 底部服务状态条
+ * ===================================================== */
+
+QFrame#bottomBar {
+    background-color: rgba(255, 255, 255, 230);
+    border: 1px solid rgba(200, 210, 230, 180);
+    border-radius: 12px;
+}
+
+QLabel#lblSvcTitle {
+    color: #5A6478;
+    background: transparent;
+    font-size: 9pt;
+    font-weight: bold;
+}
+
+/* 单个服务胶囊 */
+QFrame#svcChip {
+    background-color: rgba(244, 247, 252, 220);
+    border: 1px solid rgba(200, 210, 230, 160);
+    border-radius: 10px;
+}
+
+QFrame#svcChip:hover {
+    background-color: rgba(230, 240, 255, 235);
+    border: 1px solid rgba(74, 144, 226, 150);
+}
+
+QLabel#svcDot {
+    background: transparent;
+    font-size: 10pt;
+}
+
+QLabel#svcName {
+    color: #1E1E1E;
+    background: transparent;
+    font-size: 9pt;
+    font-weight: bold;
+}
+
+QLabel#svcState {
+    background: transparent;
+    font-size: 9pt;
+}
+
+QLabel#lblWsStatus,
+QLabel#lblPollCount {
+    color: #5A6478;
+    background: transparent;
+    font-size: 9pt;
+}
+
+/* =====================================================
+ * 按钮 (果冻风)
+ * ===================================================== */
+
+/* 海蓝 primary: 开始/暂停监控 */
+QPushButton#btnToggle {
+    background-color: rgba(74, 144, 226, 90);
+    color: #357abd;
+    border: none;
+    border-radius: 10px;
+    padding: 6px 18px;
+    font-weight: bold;
+    font-size: 11pt;
+}
+QPushButton#btnToggle:hover {
+    background-color: #4a90e2;
+    color: #FFFFFF;
+}
+QPushButton#btnToggle:pressed {
+    background-color: #357abd;
+    color: #FFFFFF;
+    padding-top: 7px;
+    padding-bottom: 5px;
+}
+
+/* 中性按钮: 清空 */
+QPushButton#btnClearEvents,
+QPushButton#btnClearThinking {
+    background-color: rgba(140, 150, 170, 70);
+    color: #5A6478;
+    border: none;
+    border-radius: 10px;
+    padding: 6px 16px;
+    font-size: 10pt;
+}
+QPushButton#btnClearEvents:hover,
+QPushButton#btnClearThinking:hover {
+    background-color: #8a93a6;
+    color: #FFFFFF;
+}
+QPushButton#btnClearEvents:pressed,
+QPushButton#btnClearThinking:pressed {
+    background-color: #6f7889;
+    color: #FFFFFF;
+    padding-top: 7px;
+    padding-bottom: 5px;
+}
+
+/* =====================================================
+ * 对话流程面板 (中)
+ * ===================================================== */
+
+QScrollArea#flowPanel {
+    background-color: transparent;
+    border: 1px solid rgba(200, 210, 230, 180);
+    border-radius: 10px;
+}
+
+QWidget#flowContainer {
+    background-color: transparent;
+}
+
+/* 顶部流水线状态条 */
+QFrame#flowStateBar {
+    background-color: rgba(74, 144, 226, 30);
+    border: 1px solid rgba(74, 144, 226, 90);
+    border-radius: 8px;
+}
+
+QLabel#flowStateValue {
+    color: #357abd;
+    background: transparent;
+    font-weight: bold;
+    font-size: 11pt;
+}
+
+QLabel#flowStateHint {
+    color: #7A8496;
+    background: transparent;
+    font-size: 9pt;
+}
+
+/* ---------- 流程卡片 ---------- */
+QFrame#flowCard {
+    background-color: rgba(255, 255, 255, 245);
+    border: 1px solid rgba(200, 210, 230, 200);
+    border-radius: 10px;
+}
+
+QLabel#flowTime {
+    color: #357abd;
+    background: transparent;
+    font-weight: bold;
+    font-size: 10pt;
+}
+
+QLabel#flowBadge {
+    color: #FFFFFF;
+    background-color: #4a90e2;
+    border-radius: 7px;
+    padding: 1px 9px;
+    font-size: 9pt;
+    font-weight: bold;
+}
+
+QLabel#flowPhase {
+    color: #8A93A6;
+    background: transparent;
+    font-size: 9pt;
+}
+
+/* 小标题 (ASR 识别 / Agent 分流 ...) */
+QLabel#flowCaption {
+    color: #8A93A6;
+    background: transparent;
+    font-size: 9pt;
+    font-weight: bold;
+    min-width: 62px;
+    max-width: 62px;
+}
+
+/* 内容区 —— 自动换行, 完整显示 */
+QLabel#flowValue {
+    color: #1E1E1E;
+    background: transparent;
+    font-size: 10pt;
+}
+
+/* 系统事件 (Arm / Vision) */
+QLabel#flowSystemEvent {
+    color: #6B7488;
+    background: transparent;
+    font-size: 9pt;
+}
+
+/* =====================================================
+ * 三面板分组框
+ * ===================================================== */
+
+QGroupBox#eventGroup,
+QGroupBox#thinkingGroup {
+    background-color: rgba(255, 255, 255, 235);
+    border: 1px solid rgba(200, 210, 230, 180);
+    border-radius: 12px;
+    margin-top: 14px;
+    padding: 8px;
+}
+
+QGroupBox#eventGroup::title,
+QGroupBox#thinkingGroup::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 2px 8px;
+    color: #357abd;
+    font-size: 10pt;
+    font-weight: bold;
+    background-color: #FFFFFF;
+    border: 1px solid rgba(200, 210, 230, 180);
+    border-radius: 6px;
+}

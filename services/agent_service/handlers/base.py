@@ -21,6 +21,11 @@ class AgentRequest:
     history: List[Dict[str, Any]] = field(default_factory=list)
     image_path: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
+    #: 本轮对话的唯一 id —— **分轮靠它, 不靠 session_id**。
+    #:
+    #: session_id 是常驻的会话标识 (比如 robot-01), 用户说一百句话它也不变;
+    #: turn_id 每轮对话换一个, 监控端据此把事件归到对应的轮次。
+    turn_id: str = ""
 
 
 @dataclass
