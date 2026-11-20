@@ -101,6 +101,38 @@ class StatusResponse(BaseModel):
     queue_total: int = 0
 
 
+class MoveToRequest(BaseModel):
+    """把某条臂的 TCP 移到世界系下的目标位姿。
+
+    a/b/c 不给就用 configs/arm.yaml 里示教的抓取姿态;
+    duration 不给就用 grasp.duration (默认 3 秒)。
+    """
+
+    arm: str = Field("right", description="left / right, 或控制器里的真实臂名")
+    x: float = Field(..., description="世界系 x (m)")
+    y: float = Field(..., description="世界系 y (m)")
+    z: float = Field(..., description="世界系 z (m)")
+    a: Optional[float] = Field(None, description="姿态 a/rx (rad)")
+    b: Optional[float] = Field(None, description="姿态 b/ry (rad)")
+    c: Optional[float] = Field(None, description="姿态 c/rz (rad)")
+    duration: Optional[float] = Field(None, description="运动时长 (秒), 默认取配置")
+    speak: bool = Field(True, description="失败时是否由服务端语音播报 (调用方自己会念就关掉)")
+
+
+class MoveToResponse(BaseModel):
+    """移动结果。除下面的固定字段外还带规划与核对明细 (extra)。"""
+
+    model_config = {"extra": "allow"}
+
+    ok: bool
+    #: ok / safety / out_of_reach / unreachable / not_arrived / enter_failed ...
+    code: str = ""
+    #: 停在哪一步: safety / plan / enter / move / done
+    stage: str = ""
+    #: 可以直接念给用户听的一句话
+    message: str = ""
+
+
 class SafetyResponse(BaseModel):
     """安全门阀检查结果。"""
 

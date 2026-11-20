@@ -29,6 +29,13 @@ VISION_CONFIG_PATH = ROOT / "configs" / "vision.yaml"
 DEFAULTS: Dict[str, Any] = {
     "vision": {
         "server": {"host": "0.0.0.0", "port": 8803},
+        # ---- 相机自动恢复 ----
+        #
+        # 相机是 USB 独占设备, 掉线后不会自己回来。开着 auto_reconnect 后,
+        # 每次请求发现相机不可用就自动 close + reopen 一次。
+        "auto_reconnect": True,
+        # 两次重连之间的最小间隔 (秒) —— 免得失败时狂试, 把 USB 搞得更糟
+        "reconnect_interval": 2.0,
         "camera": {
             "camera_brand": "",  # 空表示笔记本摄像头
             "camera_type": "head",
@@ -305,6 +312,10 @@ class Config:
     extrinsic: ExtrinsicConfig = field(default_factory=ExtrinsicConfig)
     recognition: RecognitionConfig = field(default_factory=RecognitionConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    #: 相机不可用时自动 close + reopen (USB 掉线后自愈)
+    auto_reconnect: bool = True
+    #: 两次重连之间的最小间隔 (秒)
+    reconnect_interval: float = 2.0
 
 
 def load_config(path: Optional[Path] = None) -> Config:
@@ -454,6 +465,8 @@ def load_config(path: Optional[Path] = None) -> Config:
         extrinsic=extrinsic,
         recognition=recognition,
         training=training,
+        auto_reconnect=bool(v.get("auto_reconnect", True)),
+        reconnect_interval=float(v.get("reconnect_interval", 2.0) or 2.0),
     )
 
 

@@ -1,11 +1,14 @@
 # BotAgent 监控台 (Qt6)
 
-只读的桌面监控程序，看五个服务的连接状态，并把 **Agent 每轮的思考过程**实时展示出来。
+只读的监控程序，看五个服务的连接状态，并把 **Agent 每轮的思考过程**实时展示出来。
 
 - Qt **6.8.3** / QWidget / C++17
 - **qmake** 构建（`.pro` + `.pri` 分模块）
+- **桌面端 + Android 平板端**（横屏）—— 同一套代码同一套布局
 - 界面风格对齐 `RobotControl`：**果冻风**（圆角、半透明底、蓝色强调色 `#4a90e2`）
-- 只读：不下发任何控制指令，不会驱动机械臂
+- 默认只读：不下发任何控制指令，不会驱动机械臂
+- 底部的「手动指令」输入框是**唯一的例外** —— 它会真的向 Agent 提问，
+    **同样会触发设备动作**，详见 [手动指令](#手动指令) 一节
 
 ## 目录结构
 
@@ -13,15 +16,17 @@
 monitor/
 ├── monitor.pro              主工程 (qmake)
 ├── selftest.pro             自测程序 (独立 qmake 工程)
-├── build.sh                 一键构建
+├── build.sh                 一键构建 (桌面端)
+├── build_android.sh         一键打包 Android APK
 ├── config.json              服务地址与 WS 配置
-├── main.cpp                 入口 (加载 QSS / 调试截图)
+├── main.cpp                 入口 (加载 QSS / 应用图标 / 调试截图)
 ├── mainwindow.h/.cpp        主窗口逻辑
 ├── mainwindow.ui            界面布局 (Qt Designer)
 ├── core/
 │   ├── qssmanager.h/.cpp    QSS 样式管理器 (单例)
 │   ├── appconfig.h/.cpp     配置加载
 │   ├── servicepoller.h/.cpp HTTP 轮询
+│   ├── agentclient.h/.cpp   手动指令客户端 (POST /v1/dispatch)
 │   └── wsclient.h/.cpp      WebSocket 订阅 (指数退避重连)
 ├── models/
 │   ├── monitormodel.*       服务状态表模型 (状态数据的唯一来源)
@@ -34,10 +39,19 @@ monitor/
 │   └── ui.pri
 ├── resources/
 │   ├── resources.qrc        资源清单
+│   ├── icons/appicon.png    应用图标 (桌面窗口图标 + Android 启动图标)
 │   └── styles/
 │       ├── theme_light.qss  浅色主题 (唯一定义配色的地方)
 │       ├── global.qss       全局字体
 │       └── mainwindow.qss   主窗口控件 (果冻风)
+├── android/                 Android 工程 (Qt 的 androiddeployqt 约定布局)
+│   ├── AndroidManifest.xml  包名 / 权限 / 横屏 / 主题
+│   ├── build.gradle
+│   ├── res/
+│   │   ├── mipmap/appicon.png   启动器图标
+│   │   ├── values/styles.xml    NoActionBar 主题 (去掉系统标题栏)
+│   │   └── values/libs.xml
+│   └── gradle/
 └── build/                   构建产物
 ```
 
@@ -50,6 +64,8 @@ monitor/
 
 ## 构建
 
+### 桌面端
+
 ```bash
 cd monitor
 ./build.sh              # 产物: monitor/build/botagent_monitor
@@ -60,6 +76,85 @@ Qt 路径默认写死 `/home/gxh/Qt/6.8.3/gcc_64`，换版本用环境变量覆�
 
 ```bash
 QT_PREFIX=/path/to/Qt/6.8.3/gcc_64 ./build.sh
+```
+
+### Android 平板端
+
+```bash
+cd monitor
+./build_android.sh              # 产物: monitor/build-android/build/outputs/apk/debug/
+./build_android.sh --clean      # 先清理再构建
+./build_android.sh --install    # 打完后直接装到已连接的设备
+./build_android.sh --release    # release 版 (需自己配签名)
+```
+
+脚本内部做四件事：
+
+| 步骤 | 干什么 |
+| --- | --- |
+| 1. qmake | 用 `android_arm64_v8a` 那套 mkspec 生成 Android 的 Makefile |
+| 2. make | 交叉编译出 `libbotagent_monitor_arm64-v8a.so` |
+| 3. androiddeployqt | 把 Qt 库 + OpenSSL + 图标塞进 APK 工程，生成 Gradle 工程 |
+| 4. gradlew | `assembleDebug` / `assembleRelease` 出 APK |
+
+依赖的工具链（都能用环境变量覆盖）：
+
+```bash
+QT_PREFIX=/home/gxh/Qt/6.8.3
+ANDROID_SDK_ROOT=/home/gxh/Android/Sdk
+ANDROID_NDK_ROOT=/home/gxh/Android/Sdk/ndk/26.1.10909125
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+```
+
+> **OpenSSL 是必需的** —— `monitor.pro` 里的 `openssl.pri` 会把预编译的
+> `libssl` / `libcrypto` 加进 `ANDROID_EXTRA_LIBS`。少了它 WebSocket 的
+> TLS 后端就编不出来。
+
+#### 平板适配要点
+
+| 项 | 说明 |
+| --- | --- |
+| **横屏锁定** | `AndroidManifest.xml` 里 `android:screenOrientation="sensorLandscape"` —— 平板横屏显示，随重力在两个横屏方向间转 |
+| **去掉系统标题栏** | `res/values/styles.xml` 里的 `AppTheme` 继承 `Theme.DeviceDefault.NoActionBar`。不设的话系统会在顶部画一条白底标题栏，Qt 界面从它下面开始，浪费一屏高度 |
+| **启动闪白** | `AppTheme` 的 `android:windowBackground` 设成 `#F2F4F8`（跟应用背景一致），避免启动瞬间到 Qt 首帧之间的白闪 |
+| **触摸目标** | 窗口宽度 ≥ 640 时（平板横屏一定满足），按钮/输入框自动放大到 44dp，手指才点得准。桌面端保持鼠标友好尺寸 |
+| **明文 HTTP** | `android:usesCleartextTraffic="true"` —— 监控的是局域网里的 `http://` 服务，Android 9+ 默认禁明文，不开就连不上 |
+| **权限** | `INTERNET` + `ACCESS_NETWORK_STATE` |
+
+> 窗口最小尺寸是 **640x380**（逻辑像素）—— 10 寸平板横屏在 density=2 下
+> 是 640x400，刚好放得下；竖屏（宽度 < 640）系统会自动处理，我们只保证横屏可用。
+
+#### 应用图标
+
+图标只有**一份源文件**，两端共用：
+
+```
+resources/icons/appicon.png   ← 源文件 (192x192, 透明底)
+        │
+        ├── 桌面端: 打进 QRC, main.cpp 里 setWindowIcon() 读
+        │           :/resources/icons/appicon.png
+        │
+        └── Android: android/res/mipmap/appicon.png
+                    manifest 里 android:icon="@mipmap/appicon"
+```
+
+改图标只需换掉 `resources/icons/appicon.png` 和
+`android/res/mipmap/appicon.png` 两个文件即可，**不需要**生成各密度尺寸
+（Android 会自己缩放）。
+
+> Android 端还有个 `android:roundIcon` —— 现在也指向同一张图，
+> 想要真正的圆形图标再单独放一张 `mipmap/ic_launcher_round.png`。
+
+### 验证布局
+
+`main.cpp` 支持 `--size`，用来检查不同屏幕下的布局：
+
+```bash
+# 平板横屏 (1280x800)
+monitor/build/botagent_monitor --size 1280 800 --screenshot /tmp/tablet.png
+
+# 桌面宽屏
+monitor/build/botagent_monitor --size 1500 880 --screenshot /tmp/wide.png
 ```
 
 ## 运行
@@ -105,11 +200,13 @@ monitor/build/selftest/botagent_monitor_selftest
 │ │流程耗时  录音1150ms…       │ │   ├ 工具调用  query_weather           │
 │ └───────────────────────────┘ │   ├ 分流  tool (rule)                 │
 │ ┌───────────────────────────┐ │   └ 结果  南京今天晴，气温 25 度        │
-│ │16:20:05 [tool] 完成        │ │ ▸ 第 1 轮 「查南京天气」               │
+│ │16:20:05 [tool] 完成        │ │ ▸ 第 1 轮 「查南京天气」  (已折叠)     │
 │ │ASR 识别  查南京天气        │ │   └ ...                              │
 ├───────────────────────────────┴───────────────────────────────────────┤
 │ 服务  ●Agent 正常8ms ●ASR 正常16ms ●TTS 正常8ms ●Arm 降级6ms ●Vision… │
 │                                          WS: Agent✓ Arm✗ Vision✗ 轮询 12 次 │
+├───────────────────────────────────────────────────────────────────────┤
+│   +  ╭ 问点什么...  (Enter 发送, Shift+Enter 换行) ╮              [↑] │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -119,6 +216,8 @@ monitor/build/selftest/botagent_monitor_selftest
   底部收纳 Arm / Vision 的系统事件。
 - **右**：Agent 思考过程。按「轮次」分组，**倒叙排列 —— 最新的一轮在最上面**，
   往下翻是更早的对话（轮次编号仍按时间递增，所以「第 3 轮」排在「第 1 轮」上面）。
+  **新的一轮进来时，旧的轮次会自动折叠** —— 只留最新一轮铺开，
+  想看旧细节手动点开即可（顶栏「展开/折叠」按钮可以全部展开）。
   展开可看到分流依据、工具选择、参数提取的推理全文与置信度、各阶段耗时。
   **内容在树里是单行省略的，鼠标悬停任意单元格会弹出完整原文**
   （推理全文、LLM 原始输出、参数 JSON、分流 trace 详情）。
@@ -143,7 +242,75 @@ monitor/build/selftest/botagent_monitor_selftest
 
 开启后才会发起 HTTP 轮询与 WebSocket 订阅；关闭时两者都停掉。
 
-### 对话流程的数据来源
+### 手动指令
+
+底部状态栏上方有一条**指令输入框**（Cursor / Codex 那种），可以直接打字向 Agent 提问，
+像语音链路一样看到完整的「分流 → 工具调用 → 参数提取 → 回复」。
+
+| 项 | 说明 |
+| --- | --- |
+| 位置 | 底部状态栏**上方**，跨整个宽度 |
+| 快捷键 | **Enter 发送** / **Shift+Enter 换行**（也可以点「发送」按钮） |
+| 走的接口 | Agent 的 `POST /v1/dispatch` |
+| session_id | 固定 `monitor-ui`（可在 `config.json` 里改 `agentSessionId`） |
+
+样式是对齐 Cursor 的输入框：
+
+```
+  +   ╭──────────────────────────────────────────╮   [↑]
+      │ 问点什么...  (Enter 发送, Shift+Enter 换行) │
+      ╰──────────────────────────────────────────╯
+```
+
+- 中间的输入区是一个**胶囊体**（20px 大圆角 + 白底 + 细边框 + 淡投影），
+  **左右边缘都是圆弧**，不是方角
+- 左边是 `+` 按钮，右侧是**圆形发送箭头** `↑`
+- 发送按钮在**有内容时**才点亮成深色
+
+**卡片上会多一个「手动」徽标**，正文第一行的标题从「ASR 识别」变成「输入文本」，
+一眼能分出哪些是打字问的、哪些是语音说的。
+
+#### ⚠️ 会触发设备动作
+
+`/v1/dispatch` 与 ASR 语音走的是**完全同一条路径** —— 分流、工具调用、
+设备动作全都一样。机械臂、空调、灯这类动作会被**真的执行**。
+（内部有安全门阀预检，但动作本身会动。）
+
+想在生产环境试，请确认当前房间里没有人在机械臂工作范围内。
+
+#### 必须先点「开始监控」
+
+**没点「开始监控」就没有 WebSocket 订阅**，思考树不会更新 —— 你只能看到
+HTTP 返回的最终回复，看不到中间的推理过程。所以用输入框前先开监控。
+
+#### 数据流
+
+```
+输入框 ──Enter──▶ AgentClient (POST /v1/dispatch)
+                        │
+                        ├─▶ HTTP 响应 ──▶ 回填卡片 (回复 / 耗时)
+                        │
+Agent ──WS──▶ WsClient ──▶ ThinkingModel (思考树, 倒叙)
+                          └──▶ FlowPanel  (流程卡片)
+```
+
+WS 的 `turn_end` 是**主**（它带完整 trace），HTTP 响应只做**兜底** ——
+只有当卡片阶段还停在「发送中」时才会用 HTTP 结果回填。
+
+#### 手动轮次与语音轮次不打架
+
+- `session_id` 用独立的 `monitor-ui`，**不会混进 `robot-01` 的语音历史**。
+- 手动指令在飞行期间（`m_manualPending`）**跳过 ASR 快照建卡** ——
+  否则 ASR 的「最近一轮」会跟手动指令抢同一张卡片。
+- 手动轮次结束后两边靠文本比对自然分开。
+
+#### 并发注意
+
+`dispatch()` 会 abort 掉上一个还没回来的请求 —— 防止快速连点堆积。
+代价是：**上一条还没回来就发下一条，上一条的 HTTP 响应会丢**。
+WS 事件不受影响，思考过程照样收全。
+
+
 
 | 卡片字段 | 来源 | 时机 |
 | --- | --- | --- |
@@ -174,6 +341,7 @@ monitor/build/selftest/botagent_monitor_selftest
   "pollIntervalMs": 2000,
   "requestTimeoutMs": 3000,
   "autoStart": false,
+  "agentSessionId": "monitor-ui",
   "services": [
     { "name": "Agent",  "host": "127.0.0.1", "port": 8800, "healthPath": "/health", "statusPath": "/v1/branches" },
     { "name": "ASR",    "host": "127.0.0.1", "port": 8801, "healthPath": "/health", "statusPath": null },
@@ -192,6 +360,9 @@ monitor/build/selftest/botagent_monitor_selftest
 找不到 `config.json` 时用内置默认值（与上面一致）。
 
 `autoStart` 默认为 `false`（开窗不监控）；改成 `true` 可恢复「开窗即监控」。
+
+`agentSessionId` 默认为 `monitor-ui` —— 手动指令用的**独立会话**，
+跟语音链路的 `robot-01` 分开，互不污染历史。
 
 ## 数据来源
 
@@ -271,3 +442,5 @@ monitor/build/selftest/botagent_monitor_selftest
 - ASR 侧只保留「最近一轮」的快照，所以卡片历史是从监控端自己累积的
   （最多 50 张卡片）；监控端中途启动的话，之前几轮看不到。
 - 退出时若 WS 正好在重连，可能看到一条系统事件 —— 属正常收尾噪音。
+- **底部的指令输入框会真的触发设备动作**（`/v1/dispatch` 与语音同权）。
+  不用的时候可以不管它，但别在生产环境随手敲 —— 见 [手动指令](#手动指令)。

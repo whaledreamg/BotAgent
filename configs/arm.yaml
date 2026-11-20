@@ -30,6 +30,26 @@ arm:
   connect_timeout: 5.0
   play_timeout_ms: 15000
 
+  # ---- 抓取移动 (POST /v1/move_to) ----
+  #
+  # 视觉识别到物体后, 用固定示教的抓取姿态 (a/b/c 欧拉角, rad) 只替换
+  # x/y/z 下发。示教值直接抄 /v1/kinematics 读到的 cartesian.a/b/c。
+  grasp:
+    # 默认运动时长 (秒)
+    duration: 3.0
+    # 工作空间粗检: 目标到臂基座的距离不超过此值才下发 (米)
+    max_reach: 1.2
+    # 右臂抓取姿态 (rad)。先填 0, 示教后替换。
+    right:
+      a: 0
+      b: 0
+      c: 0
+    # 左臂抓取姿态 (rad)
+    left:
+      a: 0
+      b: 0
+      c: 0
+
   # 安全门阀: 动作执行前先检查控制器状态, 有异常就拒绝动作并语音播报原因。
   #
   # 检查项 (对应 robot/status 字段):

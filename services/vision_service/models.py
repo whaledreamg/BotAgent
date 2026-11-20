@@ -52,6 +52,8 @@ class Object(BaseModel):
     """一个被识别出来的物体。"""
 
     label: str
+    #: 中文类名 (播报用)。没有对应中文时与 label 相同。
+    label_zh: str = ""
     confidence: float
     bbox: BBox
     pose: Optional[Pose3D] = None

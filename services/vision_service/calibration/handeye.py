@@ -423,16 +423,23 @@ def solve_joint(
     )
 
     # ---- 初值 ----
-    tb0 = (
-        np.eye(4, dtype=np.float64)
-        if initial_tool_board is None
-        else np.asarray(initial_tool_board, dtype=np.float64)
-    )
-    # 用第一帧的 t_cam_board 反推 T_world_cam 的初值
-    s0 = usable[0]
-    tw0 = s0.t_world_tool
-    cb0 = s0.t_cam_board
-    c0 = tw0 @ tb0 @ _invert(cb0)
+    if initial_tool_board is None:
+        # 板位置完全未知: 用闭式 AX=ZB 给初值, 不假设板在工具原点
+        closed = closed_form_axzb(usable)
+        if closed is not None:
+            c0, tb0 = closed
+            logger.info(
+                "闭式初值: 板偏置 %.1f mm, 相机位置 %s",
+                float(np.linalg.norm(tb0[:3, 3])) * 1000,
+                np.round(c0[:3, 3], 3),
+            )
+        else:
+            tb0 = np.eye(4, dtype=np.float64)
+            c0 = usable[0].t_world_tool @ tb0 @ _invert(usable[0].t_cam_board)
+    else:
+        tb0 = np.asarray(initial_tool_board, dtype=np.float64)
+        # 用第一帧的 t_cam_board 反推 T_world_cam 的初值
+        c0 = usable[0].t_world_tool @ tb0 @ _invert(usable[0].t_cam_board)
 
     def unpack(p: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         c = np.eye(4, dtype=np.float64)
@@ -514,6 +521,58 @@ def solve_joint(
         "联合解算: 重投影残差 %.3f -> %.3f px", rms_before, rms_after
     )
     return c, x, rms_after
+
+
+def closed_form_axzb(
+    samples: Sequence[PoseSample],
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """闭式求解 ``T_world_tool(i) · X = C · T_cam_board(i)``。
+
+    返回 ``(C=T_world_cam, X=T_tool_board)``, 不需要任何先验。
+    旋转用线性最小二乘 (18 维零空间) 再投影回 SO(3), 平移再解一次线性方程。
+    只用作联合优化的初值, 精度由后面的重投影优化保证。
+    """
+    if len(samples) < 3:
+        return None
+    eye3 = np.eye(3)
+    rows = []
+    for s in samples:
+        a = s.t_world_tool[:3, :3]
+        b = s.t_cam_board[:3, :3]
+        rows.append(np.hstack([np.kron(a, eye3), -np.kron(eye3, b.T)]))
+    _, _, vt = np.linalg.svd(np.vstack(rows))
+    v = vt[-1]
+
+    def to_rot(vec: np.ndarray) -> np.ndarray:
+        m = vec.reshape(3, 3)
+        d = np.linalg.det(m)
+        if abs(d) < 1e-12:
+            raise ValueError("退化")
+        m = m / np.cbrt(d)
+        u, _, wt = np.linalg.svd(m)
+        r = u @ wt
+        if np.linalg.det(r) < 0:
+            u[:, -1] *= -1
+            r = u @ wt
+        return r
+
+    try:
+        rx = to_rot(v[:9])
+        rc = to_rot(v[9:])
+    except ValueError:
+        return None
+
+    # R_Ti · tx + t_Ti = Rc · t_cb_i + tc   ->  [R_Ti, -I] [tx; tc] = Rc t_cb_i - t_Ti
+    amat = np.vstack([np.hstack([s.t_world_tool[:3, :3], -eye3]) for s in samples])
+    bvec = np.concatenate(
+        [rc @ s.t_cam_board[:3, 3] - s.t_world_tool[:3, 3] for s in samples]
+    )
+    sol, *_ = np.linalg.lstsq(amat, bvec, rcond=None)
+    x = np.eye(4)
+    x[:3, :3], x[:3, 3] = rx, sol[:3]
+    c = np.eye(4)
+    c[:3, :3], c[:3, 3] = rc, sol[3:]
+    return c, x
 
 
 def _invert(m: np.ndarray) -> np.ndarray:
@@ -626,6 +685,7 @@ def solve_pose(
 __all__ = [
     "HandEyeResult",
     "PoseSample",
+    "closed_form_axzb",
     "solve_handeye",
     "solve_joint",
     "solve_pose",

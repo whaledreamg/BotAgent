@@ -1,0 +1,72 @@
+vision:
+  server:
+    host: 0.0.0.0
+    port: 8803
+  camera:
+    camera_brand: orbbec
+    camera_type: head
+    serial_number: CPCBC53000H5
+    width: 0
+    height: 0
+    fps: 0
+    frame_timeout_ms: 2000
+    align_depth_to_color: true
+    calibrated_intrinsics:
+      fx: 605.779933
+      fy: 609.009161
+      cx: 635.684459
+      cy: 407.178887
+      width: 1280
+      height: 800
+  detector:
+    weights: /home/gxh/workspace/data/model/yolo/yolo26n.pt
+    pose_weights: ''
+    conf: 0.15
+    find_conf: 0.15
+    iou: 0.5
+    device: auto
+    imgsz: 640
+    max_objects: 20
+  solver:
+    sample_grid: 5
+    min_valid_ratio: 0.05
+    depth_min: 0.1
+    depth_max: 5.0
+    erode_iterations: 1
+  recognition:
+    mode: live
+    conf: 0.05
+    frames: 5
+    output_dir: logs
+  training:
+    data: /home/gxh/workspace/project/datasets/myobjects/data.yaml
+    base_weights: /home/gxh/workspace/project/ultralytics/yolo26n.pt
+    epochs: 100
+    imgsz: 640
+    batch: 16
+    patience: 30
+    device: '0'
+    project: /home/gxh/workspace/project/runs
+    name: myobjects
+    hsv_h: 0.01
+    hsv_s: 0.4
+    hsv_v: 0.4
+    mosaic: 1.0
+    close_mosaic: 10
+    seed: 0
+    auto_apply: true
+    min_map50: 0.5
+  extrinsic:
+    enabled: false
+    matrix: []
+    rotation: []
+    translation:
+    - 0.0
+    - 0.0
+    - 0.0
+    matrix_frame: world
+    target_frame: arm_base
+    arm: auto
+    dynamic: false
+    arm_service_url: http://127.0.0.1:8802
+    flip_axes: false

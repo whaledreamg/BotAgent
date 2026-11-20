@@ -31,12 +31,6 @@ QLabel#lblTitle {
     background: transparent;
 }
 
-QLabel#lblSubtitle {
-    color: #8A93A6;
-    background: transparent;
-    font-size: 9pt;
-}
-
 QLabel#lblOverview {
     color: #5A6478;
     background: transparent;
@@ -247,6 +241,16 @@ QLabel#flowBadge {
     font-weight: bold;
 }
 
+/* 「手动」徽标 —— 手动输入的轮次 */
+QLabel#flowManualBadge {
+    color: #8A5A00;
+    background-color: rgba(255, 193, 7, 90);
+    border-radius: 7px;
+    padding: 1px 9px;
+    font-size: 9pt;
+    font-weight: bold;
+}
+
 QLabel#flowPhase {
     color: #8A93A6;
     background: transparent;
@@ -275,6 +279,112 @@ QLabel#flowSystemEvent {
     color: #6B7488;
     background: transparent;
     font-size: 9pt;
+}
+
+/* =====================================================
+ * 手动指令输入区 (底部状态栏上方)
+ *
+ * 参考 Cursor 的输入框:
+ *   - 中间是**胶囊体**输入区 —— 左右边缘都是大圆角, 像个药丸
+ *   - 左侧 `+` 按钮, 右侧圆形发送箭头 `↑`
+ *   - 输入区有极淡的投影, 浮在面板之上
+ * ===================================================== */
+
+/* 外层只负责排版, 自己不画任何东西 */
+QFrame#commandBar {
+    background-color: transparent;
+    border: none;
+}
+
+/* 左侧 + 按钮 —— 无边框, 悬停才显形 */
+QPushButton#btnAttach {
+    background-color: transparent;
+    border: none;
+    border-radius: 13px;
+    color: #6B7280;
+    font-size: 16pt;
+    font-weight: bold;
+    padding: 0;
+    outline: 0;
+}
+QPushButton#btnAttach:hover {
+    background-color: #F0F2F6;
+    color: #1E1E1E;
+}
+QPushButton#btnAttach:pressed {
+    background-color: #E4E7EE;
+}
+
+/* 输入区 —— 胶囊体: 左右边缘都是大圆角 */
+QPlainTextEdit#editCommand {
+    background-color: #FFFFFF;
+    border: 1px solid #E3E6ED;
+    border-radius: 20px;
+    color: #1E1E1E;
+    font-size: 10pt;
+    padding: 8px 18px;
+    min-height: 20px;
+    selection-background-color: #4a90e2;
+    selection-color: #FFFFFF;
+}
+QPlainTextEdit#editCommand:hover {
+    border-color: #D4D8E2;
+}
+QPlainTextEdit#editCommand:focus {
+    border: 1px solid #C7CDD9;
+    background-color: #FFFFFF;
+}
+QPlainTextEdit#editCommand:disabled {
+    background-color: #F7F8FA;
+    color: #A8B0C0;
+    border-color: #E8EAEF;
+}
+
+/* 输入框里的滚动条 —— 细一点, 别抢镜 */
+QPlainTextEdit#editCommand QScrollBar:vertical {
+    background-color: transparent;
+    width: 8px;
+    margin: 2px;
+}
+QPlainTextEdit#editCommand QScrollBar::handle:vertical {
+    background-color: #D0D4DC;
+    border-radius: 4px;
+    min-height: 20px;
+}
+QPlainTextEdit#editCommand QScrollBar::handle:vertical:hover {
+    background-color: #B4BAC6;
+}
+QPlainTextEdit#editCommand QScrollBar::add-line,
+QPlainTextEdit#editCommand QScrollBar::sub-line,
+QPlainTextEdit#editCommand QScrollBar::add-page,
+QPlainTextEdit#editCommand QScrollBar::sub-page {
+    background: none;
+    height: 0;
+    width: 0;
+}
+
+/* 发送按钮 —— 圆形深色箭头, 有内容才点亮 */
+QPushButton#btnSend {
+    background-color: #E8EAEF;
+    border: none;
+    border-radius: 14px;
+    color: #9AA1AE;
+    font-size: 13pt;
+    font-weight: bold;
+    padding: 0;
+    outline: 0;
+}
+QPushButton#btnSend:hover {
+    background-color: #1E1E1E;
+    color: #FFFFFF;
+}
+QPushButton#btnSend:pressed {
+    background-color: #333333;
+    color: #FFFFFF;
+}
+QPushButton#btnSend:disabled {
+    background-color: #F0F2F5;
+    color: #C4C9D2;
 }
 
 /* =====================================================

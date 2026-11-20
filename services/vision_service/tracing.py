@@ -63,12 +63,21 @@ class DetectionRecord:
 class DetectionTracer:
     """识别追溯记录器。
 
-    线程安全。支持异步写入 (可选)。
+    目录结构 (每次拍照一个文件夹):
+        traces/
+            ├── 20261117_110830_123456/       # 一次拍照 = 一个文件夹
+            │   ├── mouse_01.jpg              # 每个物体一张图, 各画各的框
+            │   ├── cup_02.jpg
+            │   └── frame.jpg                 # 整帧原图 (可选)
+            ├── records.jsonl                 # 结构化记录
+            └── index.json                    # 索引和元数据
+
+    线程安全。
     """
 
     def __init__(self, trace_root: str | Path = "traces") -> None:
         self.trace_root = Path(trace_root)
-        self.image_dir = self.trace_root / "images"
+        self.sessions_dir = self.trace_root / "sessions"
         self.records_file = self.trace_root / "records.jsonl"
         self.index_file = self.trace_root / "index.json"
 
@@ -82,10 +91,23 @@ class DetectionTracer:
     def _setup(self) -> None:
         """初始化目录结构。"""
         try:
-            self.image_dir.mkdir(parents=True, exist_ok=True)
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
             logger.info("追溯系统已初始化: %s", self.trace_root)
         except Exception as exc:
             logger.error("初始化追溯系统失败: %s", exc)
+
+    def new_session(self) -> str:
+        """开一个新的拍照会话 (一个文件夹), 返回文件夹名。
+
+        每次拍照调一次 —— 这一拍的图片都放进这个文件夹。
+        """
+        now = datetime.now()
+        name = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        try:
+            (self.sessions_dir / name).mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("创建追溯文件夹失败 (%s): %s", name, exc)
+        return name
 
     def record(
         self,
@@ -96,6 +118,8 @@ class DetectionTracer:
         pose: Optional[Dict[str, Any]] = None,
         frame: str = "camera",
         extra: Optional[Dict[str, Any]] = None,
+        session: Optional[str] = None,
+        index: int = 0,
     ) -> Optional[DetectionRecord]:
         """记录一次识别结果。
 
@@ -107,6 +131,8 @@ class DetectionTracer:
             pose: 3D 位置信息
             frame: 坐标系名
             extra: 额外信息
+            session: 所属的拍照会话 (文件夹名); 不给就自己开一个
+            index: 该物体在这次拍照里的序号 (决定文件名, 避免同名覆盖)
 
         Returns:
             记录对象; 保存失败时返回 None
@@ -119,10 +145,15 @@ class DetectionTracer:
                 seq = self._record_count
             record_id = f"{ts_ms}_{seq:04d}"
 
-            # 保存图像
+            if not session:
+                session = self.new_session()
+
+            # 保存图像 —— 每个物体一张, 各画各的框
             image_filename = None
             if image is not None and image.size > 0:
-                image_filename = self._save_image(image, record_id, bbox)
+                image_filename = self._save_image(
+                    image, session, label, index, bbox, confidence, pose,
+                )
 
             # 创建记录
             record = DetectionRecord(
@@ -149,36 +180,121 @@ class DetectionTracer:
             return None
 
     def _save_image(
-        self, image: np.ndarray, record_id: str, bbox: Tuple[float, float, float, float]
+        self,
+        image: np.ndarray,
+        session: str,
+        label: str,
+        index: int,
+        bbox: Tuple[float, float, float, float],
+        confidence: float,
+        pose: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        """保存图像并在其上绘制检测框。
+        """保存图像并在其上绘制该物体的检测框。
+
+        文件名: ``<类别>_<序号>.jpg`` (放在本次拍照的文件夹里)
 
         Returns:
-            文件名; 失败时返回 None
+            相对 trace_root 的路径; 失败时返回 None
         """
         try:
-            # 绘制检测框
+            session_dir = self.sessions_dir / session
+            session_dir.mkdir(parents=True, exist_ok=True)
+
+            # 文件名: 类别 + 序号, 同一类别出现多次也不会互相覆盖
+            safe_label = "".join(
+                ch for ch in str(label or "obj") if ch.isalnum() or ch in "-_"
+            ) or "obj"
+            filename = f"{safe_label}_{index:02d}.jpg"
+
             img_copy = image.copy()
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(img_copy.shape[1], x2)
-            y2 = min(img_copy.shape[0], y2)
+            self._draw_box(img_copy, bbox, label, confidence, pose)
 
-            cv2.rectangle(img_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            # 生成文件名 (包含时间戳)
-            now = datetime.now()
-            filename = now.strftime(f"%Y%m%d_%H%M%S_{record_id}.jpg")
-            filepath = self.image_dir / filename
-
-            # 保存
+            filepath = session_dir / filename
             cv2.imwrite(str(filepath), img_copy)
-            logger.debug("已保存识别图像: %s", filename)
-            return filename
+            with self._lock:
+                self._image_count += 1
+            logger.debug("已保存识别图像: %s/%s", session, filename)
+            return str(Path(session) / filename)
         except Exception as exc:
-            logger.warning("保存图像失败 (%s): %s", record_id, exc)
+            logger.warning("保存图像失败 (%s): %s", label, exc)
             return None
+
+    #: 不同类别配不同颜色, 免得满屏都是绿框看不出区别
+    _BOX_COLORS = (
+        (0, 255, 0),    # 绿
+        (0, 165, 255),  # 橙
+        (255, 128, 0),  # 蓝
+        (0, 255, 255),  # 黄
+        (255, 0, 255),  # 紫
+        (0, 255, 128),  # 青
+        (255, 255, 0),  # 蓝绿
+    )
+
+    def _draw_box(
+        self,
+        img: np.ndarray,
+        bbox: Tuple[float, float, float, float],
+        label: str,
+        confidence: float,
+        pose: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """在图上画一个检测框 + 标签。"""
+        try:
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            h, w = img.shape[:2]
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                return
+
+            # 按类别取色: 同一个类别同一个颜色
+            color = self._BOX_COLORS[hash(str(label)) % len(self._BOX_COLORS)]
+
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+            # ---- 标签文字 ----
+            #
+            # 画在框上方; 顶到画面边缘就画到框里面, 别把字画到画面外。
+            text = str(label)
+            try:
+                text = f"{text} {float(confidence):.0%}"
+            except (TypeError, ValueError):
+                pass
+            if pose:
+                try:
+                    z = pose.get("z")
+                    if z is not None:
+                        text += f" {float(z):.2f}m"
+                except (TypeError, ValueError, AttributeError):
+                    pass
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.55
+            thickness = 1
+            (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+
+            pad = 3
+            box_h = th + baseline + pad * 2
+            ty1 = y1 - box_h if y1 - box_h >= 0 else y1
+            ty2 = ty1 + box_h
+
+            # 标签底色 (半透明, 文字才看得清)
+            overlay = img.copy()
+            cv2.rectangle(overlay, (x1, ty1), (x1 + tw + pad * 2, ty2), color, -1)
+            cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
+
+            cv2.putText(
+                img, text, (x1 + pad, ty2 - baseline - pad),
+                font, scale, (0, 0, 0), thickness + 1, cv2.LINE_AA,
+            )
+            cv2.putText(
+                img, text, (x1 + pad, ty2 - baseline - pad),
+                font, scale, (255, 255, 255), thickness, cv2.LINE_AA,
+            )
+        except Exception as exc:
+            logger.debug("画框失败: %s", exc)
 
     def _append_record(self, record: DetectionRecord) -> None:
         """追加记录到 JSONL 文件。"""
@@ -279,10 +395,24 @@ class DetectionTracer:
         }
 
     def get_image_path(self, filename: str) -> Optional[Path]:
-        """获取图像文件的完整路径。"""
+        """获取图像文件的完整路径。
+
+        ``filename`` 的格式取决于数据新旧:
+        - 新: ``20261117_110830_123/mouse_01.jpg`` (在 sessions/ 下)
+        - 旧: ``20260717_110830_123.jpg`` (在 images/ 下)
+        """
         if not filename:
             return None
-        filepath = self.image_dir / filename
+        # 新格式: sessions/<会话>/<类别>_<序号>.jpg
+        filepath = self.sessions_dir / filename
+        if filepath.exists():
+            return filepath
+        # 旧格式: images/<文件名>.jpg
+        filepath = self.trace_root / "images" / filename
+        if filepath.exists():
+            return filepath
+        # 兜底: 直接在 trace_root 下
+        filepath = self.trace_root / filename
         if filepath.exists():
             return filepath
         return None

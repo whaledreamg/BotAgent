@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import Config
 from library import ActionLibrary, ActionNotFound, ActionUnit
+from mover import CartesianMover
 from notifier import ArmNotifier
 from robot.connection import RobotConnection
 from robot.controller import ArmController, ControllerError, Phase
@@ -125,6 +126,8 @@ class ArmService:
         self._sub_lock = threading.Lock()
 
         self._started = False
+        #: 笛卡尔移动执行器 (POST /v1/move_to)
+        self._mover = CartesianMover(self)
         #: 最近一次查询 robot/status 的臂名 (应答里没有 name 字段, 只能记住)
         self._status_query_arm = ""
         #: 后台重连线程 (控制器启动时连不上时用)
@@ -535,6 +538,18 @@ class ArmService:
 
     def _handle_start_control(self, db: Any, response: Dict[str, Any]) -> None:
         """入控响应。"""
+        # 笛卡尔移动在等这个应答 (它自己判成败并播报), 无论成败都先转给它
+        if self._mover.busy:
+            self._mover.on_start_control(db, response)
+            if "err" in response:
+                err = response.get("err") or {}
+                logger.warning(
+                    "[服务] 末端入控失败 (%s): %s", err.get("code", "?"), err.get("message", "")
+                )
+            else:
+                logger.info("[服务] 末端入控成功")
+            return
+
         if "err" in response:
             err = response.get("err") or {}
             code = err.get("code", "?")
@@ -800,12 +815,18 @@ class ArmService:
         text = self._gate.speak_text(report)
         if not text:
             return
+        self._speak_text(text)
+
+    def _speak_text(self, text: str) -> None:
+        """后台线程播报一段话 (移动失败、不可达等)。"""
+        if not text or not self.cfg.safety.speak_on_reject:
+            return
 
         def _worker() -> None:
             try:
                 self._notifier.speak(text)
             except Exception as exc:  # pragma: no cover - 播报失败不该影响主流程
-                logger.warning("[门阀] 播报失败: %s", exc)
+                logger.warning("[播报] 失败: %s", exc)
 
         threading.Thread(target=_worker, name="arm-notify", daemon=True).start()
 
@@ -1063,6 +1084,8 @@ class ArmService:
         was_playing = thread is not None and thread.is_alive()
 
         self._stop_requested = True
+        # 正在做笛卡尔移动时, 先打断它 (它自己会停流并 stopControl)
+        self._mover.abort()
         self._stop_playback(silent=True)
 
         # 等播放线程真的退出 (不持锁, 免得和线程里的加锁操作互等)

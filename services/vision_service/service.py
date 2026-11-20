@@ -82,6 +82,21 @@ class VisionService:
         self._errors: List[str] = []
         self._started = False
 
+        #: 相机重连相关
+        #:
+        #: 相机是 USB 独占设备, 掉线 (USB 重置/线材松动/供电不足) 后
+        #: 不会自己回来, 必须 close + reopen。开着这个开关, 每次请求发现
+        #: 相机不可用就自动重连, 重连成功当没事发生。
+        self._reconnect_enabled = bool(getattr(cfg, "auto_reconnect", True))
+        #: 两次重连之间的最小间隔 (秒) —— 别一失败就连着狂试, 把 USB 搞得更糟
+        self._reconnect_interval = float(getattr(cfg, "reconnect_interval", 2.0))
+        #: 上次重连的时间戳 (单调时钟)
+        self._last_reconnect: float = 0.0
+        #: 连续重连失败的次数 (用于日志和 /health)
+        self._reconnect_failures: int = 0
+        #: 重连用的锁 —— 相机操作不能并发
+        self._camera_lock = threading.Lock()
+
         # 追溯系统
         trace_dir = Path(getattr(cfg, "trace_dir", "traces"))
         self._tracer = DetectionTracer(trace_dir)
@@ -225,6 +240,49 @@ class VisionService:
                 self._errors = self._errors[-20:]
         logger.error("[视觉] %s", message)
 
+    # ------------------------------------------------------------ 相机重连
+
+    def _reconnect_camera(self) -> bool:
+        """尝试重新打开相机。成功返回 True。
+
+        什么时候需要:
+        - 启动时相机就没打开 (USB 层看不到设备 —— 别的进程占着 / 线没插好)
+        - 跑到一半 USB 掉了 (read() 抛错, 或相机自己关了)
+
+        **必须 close + reopen**: Orbbec 是 USB 独占设备, 掉线后老的流句柄
+        还挂在设备上, 直接 open() 会报 `uvc_open failed -6`。
+
+        限流: 两次重连之间至少隔 ``reconnect_interval`` 秒, 免得失败时
+        一股脑狂试, 把 USB 栈搞得更糟。
+        """
+        now = time.monotonic()
+        with self._camera_lock:
+            if now - self._last_reconnect < self._reconnect_interval:
+                return False
+            self._last_reconnect = now
+
+            logger.warning("相机不可用, 尝试重新打开")
+            try:
+                self.camera.reopen()
+            except Exception as exc:
+                self._reconnect_failures += 1
+                msg = f"重新打开相机失败 (第 {self._reconnect_failures} 次): {exc}"
+                logger.error("[视觉] %s", msg)
+                self._record_error(msg)
+                return False
+
+            self._reconnect_failures = 0
+            logger.info("相机已恢复")
+            return True
+
+    def _ensure_camera(self) -> None:
+        """确保相机可用。不可用时先试着重连, 仍不行才抛错。"""
+        if self.camera.opened:
+            return
+        if self._reconnect_enabled and self._reconnect_camera():
+            return
+        raise CameraError("相机没连上")
+
     # ------------------------------------------------------------ 检测
 
     def detect(
@@ -241,10 +299,19 @@ class VisionService:
         # 动态外参: 每次检测前刷新一次世界系上下文 (基座/头位姿)
         self._refresh_world_context()
 
-        if not self.camera.opened:
-            raise CameraError("相机没连上")
+        # 相机可能没打开 (启动失败 / USB 掉线) —— 先试着连回来
+        self._ensure_camera()
 
-        capture = self.camera.read()
+        try:
+            capture = self.camera.read()
+        except CameraError:
+            # 采帧失败往往意味着 USB 断了: 关掉重开, 下次请求就能用
+            logger.warning("采帧失败, 尝试重连相机")
+            self._record_error("采帧失败")
+            if self._reconnect_enabled and self._reconnect_camera():
+                capture = self.camera.read()
+            else:
+                raise
         if capture is None:
             raise CameraError("采帧超时")
         if capture.color is None:
@@ -264,6 +331,10 @@ class VisionService:
         depth_m = capture.depth_meters
         objects: List[Dict[str, Any]] = []
 
+        # 这次拍照的追溯会话 (一个文件夹) —— 这次拍到的所有物体的图
+        # 都放在这个文件夹里
+        session = self._tracer.new_session()
+
         for det in detections:
             # 深度没跟彩色对齐时, 彩色框的像素坐标要映射到深度图上
             bbox = self.camera.map_bbox_to_depth(det.bbox, capture.intrinsics)
@@ -277,6 +348,7 @@ class VisionService:
             pose3d = self._pose_dict(target, frame)
             obj: Dict[str, Any] = {
                 "label": det.label,
+                "label_zh": class_names.to_zh(det.label),
                 "confidence": round(float(det.confidence), 4),
                 "bbox": {
                     "x1": round(det.bbox[0], 1),
@@ -297,7 +369,7 @@ class VisionService:
                 ]
             objects.append(obj)
 
-            # 追溯记录 (异步保存, 不阻塞响应)
+            # 追溯记录: 每个物体一张图, 各画各的框, 放在同一文件夹里
             try:
                 self._tracer.record(
                     label=det.label,
@@ -307,6 +379,8 @@ class VisionService:
                     pose=pose3d,
                     frame=frame,
                     extra={"keypoints_count": len(det.keypoints) if det.keypoints else 0},
+                    session=session,
+                    index=len(objects),
                 )
             except Exception as exc:
                 logger.debug("记录识别追溯失败: %s", exc)
@@ -631,6 +705,9 @@ class VisionService:
             "camera_connected": self.camera.opened,
             "camera_name": self.camera.device_info.get("name", ""),
             "camera_serial": self.camera.device_info.get("serial_number", ""),
+            # 自动重连状态 —— 排查「拍几次就不拍了」时先看这里
+            "auto_reconnect": self._reconnect_enabled,
+            "reconnect_failures": self._reconnect_failures,
             "detector_loaded": self.detector.loaded,
             "pose_loaded": self.detector.pose_loaded,
             "device": self.detector.device,

@@ -82,6 +82,14 @@ class JointStreamer:
     def frequency(self) -> int:
         return self._frequency
 
+    @property
+    def host(self) -> str:
+        return self._host
+
+    @property
+    def port(self) -> int:
+        return self._port
+
     def set_frequency(self, hz: int) -> None:
         self._frequency = max(10, min(1000, hz))
 

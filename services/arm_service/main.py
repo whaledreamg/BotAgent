@@ -10,6 +10,7 @@
     GET  /health        服务与控制器状态
     GET  /v1/actions    动作库清单
     POST /v1/play       下发播放 (异步)
+    POST /v1/move_to    TCP 移到世界系目标点 (同步, 经门阀与控制器逆解)
     POST /v1/stop       停止并交还通道
     GET  /v1/status     当前播放状态
     GET  /v1/safety     跑一次安全门阀检查 (不动作)
@@ -40,6 +41,8 @@ from models import (  # noqa: E402
     ActionListResponse,
     HealthResponse,
     KinematicsResponse,
+    MoveToRequest,
+    MoveToResponse,
     PlayRequest,
     PlayResponse,
     SafetyResponse,
@@ -120,6 +123,22 @@ async def play(req: PlayRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ControllerError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/move_to", response_model=MoveToResponse)
+async def move_to(req: MoveToRequest) -> Dict[str, Any]:
+    """把 TCP 移到世界系目标点 (同步, 走完才返回)。
+
+    流程: 安全门阀 -> 臂展粗检 -> 控制器逆解 (cartesianIkPath=analytic) ->
+    S 曲线 ``duration`` 秒 -> 读回 TCP 核对。被拒绝或没到位时 ``ok=false``,
+    ``message`` 是可以直接播报的原因。HTTP 状态码恒为 200, 成败看 ``ok``。
+    """
+    svc = _svc()
+    # 移动会阻塞到走完 (几秒), 必须放线程池, 否则事件循环被卡住
+    return await await_run(
+        svc._mover.move_to,
+        req.arm, req.x, req.y, req.z, req.a, req.b, req.c, req.duration, req.speak,
+    )
 
 
 @app.post("/v1/stop", response_model=StopResponse)

@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
+#include "core/agentclient.h"
 #include "core/servicepoller.h"
 #include "core/wsclient.h"
 #include "models/monitormodel.h"
@@ -11,14 +12,36 @@
 
 #include <QCloseEvent>
 #include <QDateTime>
+#include <QFrame>
+#include <QGraphicsDropShadowEffect>
+#include <QColor>
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QTreeView>
+
+namespace {
+
+/// 平板横屏的参考逻辑尺寸 (Qt 的 high-DPI 缩放后的像素)。
+///
+/// 10 寸平板横屏通常是 1280x800 或 1920x1200 (物理像素), 在
+/// density=2 的设备上对应 640x400 / 960x600 逻辑像素。
+///
+/// 监控台的布局是「左右两栏 + 上下几行」, 窄了就没法看, 所以
+/// 最小宽度按 640 来 —— 竖屏 (宽度 < 640) 会放不下, 让系统自己
+/// 处理旋转, 我们只保证横屏能用。
+constexpr int kMinTabletWidth = 640;
+constexpr int kMinTabletHeight = 380;
+
+/// 触摸目标最小高度 (Android 推荐 48dp, 取 44 已经很接近了)。
+constexpr int kTouchTarget = 44;
+
+}  // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -45,6 +68,7 @@ MainWindow::MainWindow(QWidget *parent)
     // ---- 数据源 ----
     m_poller = new ServicePoller(this);
     m_wsClient = new WsClient(this);
+    m_agentClient = new AgentClient(this);
 
     connect(m_poller, &ServicePoller::serviceUpdated,
             this, &MainWindow::onServiceUpdated);
@@ -57,6 +81,11 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onEventReceived);
     connect(m_wsClient, &WsClient::connectionChanged,
             this, &MainWindow::onConnectionChanged);
+
+    connect(m_agentClient, &AgentClient::dispatched,
+            this, &MainWindow::onDispatched);
+    connect(m_agentClient, &AgentClient::failed,
+            this, &MainWindow::onDispatchFailed);
 
     // ---- 工具条 ----
     connect(ui->btnToggle, &QPushButton::clicked,
@@ -76,9 +105,40 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->editHost, &QLineEdit::editingFinished,
             this, &MainWindow::onHostEditingFinished);
 
+    // ---- 手动指令输入框 ----
+    //
+    // Enter 发送, Shift+Enter 换行 —— QPlainTextEdit 默认的回车是换行,
+    // 这里用 event filter 拦截「不带 Shift 的回车」改成发送。
+    connect(ui->btnSend, &QPushButton::clicked,
+            this, &MainWindow::onCommandSend);
+    connect(ui->editCommand, &QPlainTextEdit::textChanged,
+            this, &MainWindow::onCommandTextChanged);
+    ui->editCommand->installEventFilter(this);
+    ui->btnSend->setEnabled(false);
+
+    // ---- 指令输入框的浮起投影 ----
+    //
+    // Cursor 那种输入框是「浮」在面板上的, 靠一层很淡的投影撑出层次感。
+    // QSS 画不出外阴影, 得用 QGraphicsDropShadowEffect。
+    //
+    // 投影挂在**输入框本身**上 —— 外层 commandBar 现在是透明的,
+    // 挂它身上会透出一圈方形的光晕。
+    {
+        auto *shadow = new QGraphicsDropShadowEffect(ui->editCommand);
+        shadow->setBlurRadius(16);
+        shadow->setOffset(0, 1);
+        shadow->setColor(QColor(30, 40, 70, 24));
+        ui->editCommand->setGraphicsEffect(shadow);
+    }
+
     applyConfig();
     updateOverview();
     updateWsStatus();
+
+    // ---- 触摸尺寸 ----
+    //
+    // 平板上要放大触摸目标; 桌面端保持鼠标友好尺寸。
+    applyTouchSizing();
 }
 
 MainWindow::~MainWindow()
@@ -98,6 +158,24 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    // ---- 指令输入框: Enter 发送, Shift+Enter 换行 ----
+    //
+    // QPlainTextEdit 默认回车是换行, 这里把「不带 Shift 的回车」改成发送。
+    if (watched == ui->editCommand && event->type() == QEvent::KeyPress) {
+        auto *ke = static_cast<QKeyEvent *>(event);
+        if (ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter) {
+            if (!ke->modifiers().testFlag(Qt::ShiftModifier)) {
+                onCommandSend();
+                return true;   // 吃掉这个回车 —— 别让它再插入一个换行
+            }
+            // Shift+回车 —— 放行, 正常换行
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     if (m_wsClient)
@@ -105,6 +183,46 @@ void MainWindow::closeEvent(QCloseEvent *event)
     if (m_poller)
         m_poller->stop();
     QMainWindow::closeEvent(event);
+}
+
+// =====================================================
+// 平板适配 (横屏)
+// =====================================================
+
+bool MainWindow::event(QEvent *event)
+{
+    if (event->type() == QEvent::Resize)
+        applyTouchSizing();
+
+    return QMainWindow::event(event);
+}
+
+void MainWindow::applyTouchSizing()
+{
+    // 平板上用手指操作, 触摸目标要够大 (Android 推荐 48dp)。
+    //
+    // 桌面端保持紧凑的鼠标友好尺寸 —— 一律放大反而会让桌面版显得笨重。
+    // 判据: 窗口够宽 => 是平板/桌面横屏。
+    const bool touch = width() >= kMinTabletWidth;
+
+    const int target = touch ? kTouchTarget : 0;
+    ui->btnToggle->setMinimumHeight(target);
+    ui->editHost->setMinimumHeight(target);
+    ui->spinInterval->setMinimumHeight(target);
+    ui->editCommand->setMinimumHeight(target);
+
+    // 发送 / 附件按钮是圆形的, 尺寸跟着目标走。
+    const int side = touch ? kTouchTarget : 28;
+    ui->btnSend->setMinimumSize(side, side);
+    ui->btnAttach->setMinimumSize(touch ? kTouchTarget : 26,
+                                  touch ? kTouchTarget : 26);
+
+    // 触摸设备的文字选择与悬停提示没有意义, 反而会挡住内容。
+    if (touch) {
+        ui->treeThinking->setMouseTracking(false);
+    } else {
+        ui->treeThinking->setMouseTracking(true);
+    }
 }
 
 void MainWindow::applyConfig()
@@ -127,6 +245,13 @@ void MainWindow::applyConfig()
     // 存一份原始配置 —— 每次「开始监控」都基于它重新套用目标 IP。
     m_baseServices = cfg.services;
     m_baseWsSources = cfg.websockets;
+
+    // ---- 手动指令 ----
+    //
+    // session_id 固定成独立的一个, 手动输入的历史不会混进语音会话。
+    m_agentSessionId = cfg.agentSessionId.trimmed().isEmpty()
+                           ? QStringLiteral("monitor-ui")
+                           : cfg.agentSessionId.trimmed();
 
     m_poller->setServices(cfg.services);
     m_poller->setInterval(cfg.pollIntervalMs);
@@ -170,6 +295,18 @@ void MainWindow::applyHost()
     // 状态条上的地址也跟着变 (悬停提示里会显示 host:port)
     for (const ServiceConfig &svc : services)
         m_serviceBar->setServiceHost(svc.name, svc.host, svc.port);
+
+    // ---- 手动指令客户端也指向同一个 host ----
+    //
+    // Agent 的端口从服务列表里找叫 "Agent" 的那条拿 —— 找不到就退回 8800。
+    int agentPort = 8800;
+    for (const ServiceConfig &svc : services) {
+        if (svc.name.compare(QStringLiteral("Agent"), Qt::CaseInsensitive) == 0) {
+            agentPort = svc.port;
+            break;
+        }
+    }
+    m_agentClient->setBaseUrl(QStringLiteral("http://%1:%2").arg(host).arg(agentPort));
 
     m_currentHost = host;
     qInfo("[监控] 目标地址已切换到 %s", qPrintable(host));
@@ -352,11 +489,15 @@ void MainWindow::onEventReceived(const QString &source, const QJsonObject &event
                 card->setAsrText(text);
             card->setPhaseText(QStringLiteral("Agent 处理中"));
 
+            // 手动指令的那一轮 —— 把卡片标成「手动」
+            if (!m_manualText.isEmpty() && m_manualText == text.trimmed())
+                card->setManual(true);
+
             // 有新对话了 —— 从现在开始 ASR 快照才用来建卡
             m_turnStarted = true;
 
-            // 新一轮开始时自动展开思考树, 免得用户还得手动点
-            ui->treeThinking->expandAll();
+            // 新一轮开始 —— 最新的一轮展开, 旧的全部折叠起来
+            collapseOldThinkingTurns();
             // 倒叙 —— 最新的一轮在顶部, 所以滚到顶而不是底
             ui->treeThinking->scrollToTop();
         } else if (type == QStringLiteral("turn_end")) {
@@ -376,6 +517,15 @@ void MainWindow::onEventReceived(const QString &source, const QJsonObject &event
                                  payload.value(QStringLiteral("route_ms")).toInt(),
                                  payload.value(QStringLiteral("handler_ms")).toInt());
             card->setPhaseText(QStringLiteral("已完成"));
+
+            // 这一轮结束了 —— 手动标记用完就清掉
+            if (!m_manualText.isEmpty() && m_manualText == text.trimmed()) {
+                card->setManual(true);
+                m_manualText.clear();
+            }
+
+            // 阶段都插完了 —— 把最新一轮的阶段展开
+            expandLatestTurnSections();
         }
         return;
     }
@@ -399,6 +549,69 @@ FlowCard *MainWindow::findOrCreateCard(const QString &text)
 
     // 卡片还没结束但文本对不上 —— 说明是新一轮但 ASR 快照还没更新
     return ui->scrollFlow->beginTurn(QDateTime::currentDateTime());
+}
+
+void MainWindow::collapseOldThinkingTurns()
+{
+    // ---- 思考树是倒叙的: 最新一轮在第 0 行 ----
+    //
+    // 只留最新一轮展开, 其余的旧轮次全部收起 —— 用户关心的是
+    // 「刚才那轮在想什么」, 旧轮次想看时再手动点开。
+    QTreeView *tree = ui->treeThinking;
+    QAbstractItemModel *model = tree->model();
+    if (!model)
+        return;
+
+    const int rows = model->rowCount(QModelIndex());
+    if (rows <= 0)
+        return;
+
+    // ---- 收起第 1 行往下的所有旧轮次 ----
+    //
+    // 不能用 collapseAll() —— 那会把最新那轮也收起来。
+    for (int r = 1; r < rows; ++r) {
+        const QModelIndex idx = model->index(r, 0, QModelIndex());
+        if (idx.isValid())
+            tree->collapse(idx);
+    }
+
+    // ---- 最新一轮 (第 0 行) 展开 ----
+    //
+    // 它是刚来的那一轮, 里面的「分流 / 工具调用 / 参数提取」应该
+    // 铺开给用户看。
+    //
+    // 注意: turn_start 的时候这一轮还是空的 (阶段是后面 thinking /
+    // turn_end 事件才陆续插进来的), 所以这里只展开轮次本身 ——
+    // 新插进来的阶段会自动显示出来 (父节点是展开的)。
+    const QModelIndex latest = model->index(0, 0, QModelIndex());
+    if (latest.isValid())
+        tree->expand(latest);
+}
+
+void MainWindow::expandLatestTurnSections()
+{
+    // ---- 把最新一轮里的各个「阶段」也展开 ----
+    //
+    // 「参数提取 -> 推理」这种要两级都展开才看得到推理全文。
+    //
+    // 必须在**所有阶段都插完之后**才做 —— turn_start 时树还是空的,
+    // 阶段是随 thinking / turn_end 事件陆续插进来的, 所以这里
+    // 在 turn_end 时才调。
+    QTreeView *tree = ui->treeThinking;
+    QAbstractItemModel *model = tree->model();
+    if (!model)
+        return;
+
+    const QModelIndex latest = model->index(0, 0, QModelIndex());
+    if (!latest.isValid())
+        return;
+
+    tree->expand(latest);
+    for (int r = 0; r < model->rowCount(latest); ++r) {
+        const QModelIndex sec = model->index(r, 0, latest);
+        if (sec.isValid())
+            tree->expand(sec);
+    }
 }
 
 QString MainWindow::describeAction(const QJsonObject &action)
@@ -444,6 +657,13 @@ void MainWindow::updateFromAsrSnapshot(const QJsonObject &snapshot)
     // ---- 最近一轮的内容 ----
     const QString text = snapshot.value(QStringLiteral("last_text")).toString();
     if (text.trimmed().isEmpty())
+        return;
+
+    // **手动指令在飞行中 —— 跳过建卡**。
+    //
+    // ASR 快照只有一个「最近一轮」, 手动指令跟它会抢同一张卡片。
+    // 流水线状态条照常更新 (在上面已经做了), 只是不碰卡片。
+    if (m_manualPending)
         return;
 
     const QString reply = snapshot.value(QStringLiteral("last_reply")).toString();
@@ -582,4 +802,90 @@ void MainWindow::onServiceBarClicked(const QString &name)
                                                             ? QStringLiteral("无附加信息")
                                                             : status->detail));
     box.exec();
+}
+
+// =====================================================
+// 手动指令
+// =====================================================
+
+void MainWindow::onCommandSend()
+{
+    const QString text = ui->editCommand->toPlainText().trimmed();
+    if (text.isEmpty())
+        return;
+
+    // ---- 先清空输入框 ----
+    //
+    // 用户体验: 立刻能接着输入下一条, 不用等这一轮跑完。
+    ui->editCommand->clear();
+
+    // ---- 立刻建卡, 不等 HTTP 回来 ----
+    //
+    // 用户马上就能看到「我的指令发出去了」, 而不是对着空白等几秒。
+    FlowCard *card = findOrCreateCard(text);
+    card->setManual(true);
+    card->setAsrText(text);
+    card->setPhaseText(QStringLiteral("发送中"));
+
+    m_manualText = text;
+    m_manualPending = true;
+
+    // 新一轮开始 —— 从现在开始 ASR 快照才用来建卡
+    m_turnStarted = true;
+
+    if (!m_agentClient->dispatch(text, m_agentSessionId)) {
+        // 压根没发出去 (地址没配之类) —— dispatch() 内部会发 failed()
+        m_manualPending = false;
+        return;
+    }
+}
+
+void MainWindow::onDispatched(const QJsonObject &result)
+{
+    m_manualPending = false;
+
+    // ---- WS 为主, HTTP 只做兜底 ----
+    //
+    // WS 的 turn_end 带完整 trace, 会把阶段改成「已完成」。
+    // 所以只有阶段还停在「发送中」时才用 HTTP 的结果回填。
+    FlowCard *card = ui->scrollFlow->currentCard();
+    if (!card || card->phaseText() != QStringLiteral("发送中"))
+        return;   // WS 已经处理过了 —— 忽略
+
+    const QString reply = result.value(QStringLiteral("reply")).toString();
+    const QString intent = result.value(QStringLiteral("intent")).toString();
+    const QString by = result.value(QStringLiteral("by")).toString();
+    const int latency = result.value(QStringLiteral("latency_ms")).toInt();
+    const bool speak = result.value(QStringLiteral("speak")).toBool();
+    const QJsonObject action = result.value(QStringLiteral("action")).toObject();
+
+    if (!intent.isEmpty())
+        card->setRoute(intent, by);
+    if (!reply.isEmpty())
+        card->setReply(reply, speak, describeAction(action));
+    if (latency > 0)
+        card->setAgentTiming(latency,
+                             result.value(QStringLiteral("route_ms")).toInt(),
+                             result.value(QStringLiteral("handler_ms")).toInt());
+    card->setPhaseText(QStringLiteral("已完成"));
+}
+
+void MainWindow::onDispatchFailed(const QString &error)
+{
+    m_manualPending = false;
+
+    FlowCard *card = ui->scrollFlow->currentCard();
+    if (card && card->phaseText() == QStringLiteral("发送中")) {
+        card->setPhaseText(QStringLiteral("发送失败"));
+        card->setReply(QStringLiteral("指令发送失败: %1").arg(error), false, QString());
+    }
+
+    ui->scrollFlow->appendSystemEvent(QStringLiteral("Agent"),
+                                      QStringLiteral("指令发送失败: %1").arg(error));
+}
+
+void MainWindow::onCommandTextChanged()
+{
+    const bool hasText = !ui->editCommand->toPlainText().trimmed().isEmpty();
+    ui->btnSend->setEnabled(hasText);
 }

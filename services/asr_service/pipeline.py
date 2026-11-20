@@ -201,6 +201,11 @@ class Pipeline:
         self._set_state(State.THINK)
         with self._lock:
             self.turn_count += 1
+            # **先把识别文本记下来** —— 这一步在等 Agent 之前,
+            # 监控端才能实时看到「用户说了什么」。等 _run_turn 跑完再记的话,
+            # 中间那几秒的 THINK 阶段监控端是空的。
+            self.last.text = text
+            self.last.at = time.time()
         worker = threading.Thread(
             target=self._run_turn,
             args=(text, record_ms),

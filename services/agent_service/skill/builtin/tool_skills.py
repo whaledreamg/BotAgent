@@ -12,6 +12,7 @@ __all__ = [
     "time_spec",
     "date_spec",
     "find_object_spec",
+    "describe_scene_spec",
 ]
 
 # 查天气 Skill
@@ -283,5 +284,32 @@ find_object_spec = SkillSpec(
             "position": {"type": "string"},
             "confidence": {"type": "number"},
         },
+    },
+)
+
+# 描述场景 Skill: 「你看到了什么」「你前面有什么」
+describe_scene_spec = SkillSpec(
+    id="describe_scene",
+    name="场景描述",
+    description="列出摄像头当前看到的所有物体及数量",
+    branch="tool",
+    category="vision",
+    kind="query",
+    speak=True,
+    timeout_ms=15000,
+    source="builtin",
+    natural_language_examples=[
+        "你看到了什么",
+        "你前面有什么",
+        "桌上有什么东西",
+        "描述一下眼前",
+    ],
+    definition={
+        "boundary": "只列出类别和数量, 不报位置和距离; 问某个具体物体用 find_object",
+    },
+    parameters={"type": "object", "properties": {}},
+    returns={
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
     },
 )

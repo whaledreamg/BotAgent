@@ -5,15 +5,21 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import time
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from skill.base import Skill, SkillError
 from skill.result import SkillResult
 from skill.spec import SkillSpec
 
 logger = logging.getLogger("skill.vision_grasp")
+
+#: 抓取追溯记录 (JSONL, 每次抓取一行)。logs/ 已被 .gitignore 忽略
+GRASP_TRACE_PATH = Path(__file__).resolve().parents[2] / "logs" / "grasp_trace.jsonl"
 
 
 class VisionGraspSkill(Skill):
@@ -24,9 +30,13 @@ class VisionGraspSkill(Skill):
         spec: SkillSpec,
         ctx: Optional[Any] = None,
         vision_client: Optional[Any] = None,
+        arm_client: Optional[Any] = None,
+        trace_path: Optional[Path] = None,
     ):
         super().__init__(spec, ctx)
         self.vision_client = vision_client
+        self.arm_client = arm_client
+        self.trace_path = Path(trace_path) if trace_path else GRASP_TRACE_PATH
 
     @staticmethod
     def spec() -> SkillSpec:
@@ -34,12 +44,12 @@ class VisionGraspSkill(Skill):
         return SkillSpec(
             id="vision.grasp",
             name="物体抓取",
-            description="识别指定物体并计算机械臂抓取的目标位姿和预抓取路点。",
+            description="识别指定物体, 选离机器人最近的一个, 经安全门阀后控制机械臂移动到它上方的预抓取点。",
             category="vision",
             tags=["manipulation", "planning"],
-            kind="query",
+            kind="action",
             speak=True,
-            timeout_ms=15000,
+            timeout_ms=45000,
             source="builtin",
             # Phase 1 新增：动态路由信息
             branch="tool",
@@ -52,24 +62,25 @@ class VisionGraspSkill(Skill):
             ],
             # Phase 1 新增：完整 Skill 定义
             definition={
-                "boundary": "仅计算抓取位姿，不执行实际的机械臂动作；依赖 vision.recognize 的准确性",
+                "boundary": "识别并移动到预抓取点，不闭合夹爪；移动必经 arm_service 的安全门阀；依赖手眼标定精度",
                 "detector_class": "VisionGraspDetector",
                 "post_processors": ["pose_formatter", "approach_calculator"],
                 "documentation": """
 # vision.grasp - 物体抓取规划
 
 ## 职责边界
-- ✓ 识别指定物体
-- ✓ 计算抓取位姿
-- ✓ 计算预抓取路点
-- ✓ 支持多种坐标系输出
-- ✗ 不执行实际机械臂动作
+- ✓ 识别指定物体 (世界系)
+- ✓ 多个同类物体时取离机器人最近的一个
+- ✓ 套上示教的固定抓取姿态, 经安全门阀与臂展检查后移动到预抓取点
+- ✗ 不闭合夹爪
 - ✗ 不处理碰撞检测
 
 ## 输入参数
 - target (必需): 要抓取的物体名，如「杯子」
-- frame (可选): 输出坐标系，默认 arm_base
-- approach_distance (可选): 预抓取距离，默认 0.1m
+- arm (可选): left / right，默认 right
+- approach_distance (可选): 预抓取点在物体上方的距离，默认 0.1m
+- duration (可选): 运动时长，默认取 configs/arm.yaml 的 grasp.duration (3 秒)
+- execute (可选): false 时只规划不动，默认 true
 
 ## 输出格式
 ```json
@@ -94,16 +105,25 @@ class VisionGraspSkill(Skill):
                         "type": "string",
                         "description": "要抓取的物体名，如「杯子」「瓶子」",
                     },
-                    "frame": {
+                    "arm": {
                         "type": "string",
-                        "description": "输出坐标系: camera / world / arm_base",
-                        "enum": ["camera", "world", "arm_base"],
-                        "default": "arm_base",
+                        "description": "用哪条臂: left / right",
+                        "enum": ["left", "right"],
+                        "default": "right",
                     },
                     "approach_distance": {
                         "type": "number",
-                        "description": "预抓取距离（米），默认 0.1",
+                        "description": "预抓取点在物体上方的距离（米），默认 0.1",
                         "default": 0.1,
+                    },
+                    "duration": {
+                        "type": "number",
+                        "description": "运动时长（秒），不给则用配置默认值（3 秒）",
+                    },
+                    "execute": {
+                        "type": "boolean",
+                        "description": "false 时只规划不移动",
+                        "default": True,
                     },
                 },
                 "required": ["target"],
@@ -120,10 +140,9 @@ class VisionGraspSkill(Skill):
         )
 
     async def execute(self, args: Dict[str, Any]) -> SkillResult:
-        """执行物体抓取规划。"""
+        """识别 -> 取离机器人最近的 -> 经门阀移动到预抓取点 -> 落盘追溯。"""
         started = time.time()
 
-        # 参数校验
         valid, error_msg = await self.validate_args(args)
         if not valid:
             return SkillResult(
@@ -133,8 +152,13 @@ class VisionGraspSkill(Skill):
             )
 
         target = str(args.get("target", "")).strip()
-        frame = str(args.get("frame", "arm_base")).strip()
+        side = str(args.get("arm", "right") or "right").strip().lower()
+        if side not in ("left", "right"):
+            side = "right"
         approach_distance = float(args.get("approach_distance", 0.1))
+        duration = args.get("duration")
+        duration = float(duration) if duration not in (None, "") else None
+        do_execute = args.get("execute", True) not in (False, "false", "False", 0)
 
         if not target:
             return SkillResult(
@@ -143,101 +167,209 @@ class VisionGraspSkill(Skill):
                 elapsed_ms=(time.time() - started) * 1000,
             )
 
-        if frame not in ("camera", "world", "arm_base"):
-            frame = "arm_base"
+        # 追溯记录: 每一步都往里填, 无论成功失败最后都落盘
+        trace: Dict[str, Any] = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "target": target,
+            "arm": side,
+            "approach_distance": approach_distance,
+            "execute": do_execute,
+        }
 
         try:
-            # 调用视觉服务查找物体
             if not self.vision_client:
-                error_msg = "视觉服务客户端未配置"
-                return SkillResult(
-                    ok=False,
-                    error=error_msg,
-                    reply=error_msg,
-                    speak=True,
-                    elapsed_ms=(time.time() - started) * 1000,
+                return self._fail("视觉服务客户端未配置", trace, started)
+            if not self.arm_client:
+                return self._fail("机械臂服务客户端未配置", trace, started)
+
+            # ---- 1. 视觉: 一律请求世界系 ----
+            #
+            # 离机器人多远、机械臂要去哪, 都在同一个世界系里算。
+            result = await self.vision_client.find(target, frame="world")
+            logger.info("[抓取] 视觉查询 target=%r frame=world 返回: %s", target, result)
+            objects = result.get("objects") or []
+            if not result.get("found") or not objects:
+                trace["outcome"] = "not_found"
+                return self._fail(
+                    f"没有找到{target}，请调整物体或相机位置。", trace, started
                 )
 
-            result = await self.vision_client.find(target, frame=frame)
+            # ---- 2. 机器人位置: 臂基座在世界系下的位置 ----
+            kin = await self.arm_client.kinematics(refresh=True)
+            arm_name, arm_data = self._pick_arm(kin.get("arms") or {}, side)
+            base = (arm_data or {}).get("base_frame")
+            if not base:
+                return self._fail(
+                    "拿不到机械臂基座位置，无法判断哪个物体最近。", trace, started
+                )
+            base_pos = (float(base["x"]), float(base["y"]), float(base["z"]))
+            trace["robot_arm"] = arm_name
+            trace["robot_base_world"] = base_pos
 
-            if not result.get("found"):
-                reply = f"没有找到 {target}，请移动或调整相机位置。"
-                return SkillResult(
-                    ok=False,
-                    output=f"没有找到 {target}。",
-                    reply=reply,
-                    speak=True,
-                    elapsed_ms=(time.time() - started) * 1000,
+            # ---- 3. 候选: 深度可信 + 确实是世界系, 按到基座的距离排序 ----
+            candidates: List[Dict[str, Any]] = []
+            skipped = 0
+            for obj in objects:
+                pose = obj.get("pose") or {}
+                if not pose.get("depth_valid", True) or pose.get("frame") != "world":
+                    skipped += 1
+                    continue
+                pos = (float(pose["x"]), float(pose["y"]), float(pose["z"]))
+                candidates.append(
+                    {
+                        "position": pos,
+                        "distance_to_base": self._dist(pos, base_pos),
+                        "confidence": float(obj.get("confidence", 0)),
+                        "label": obj.get("label_zh") or obj.get("label") or target,
+                    }
+                )
+            candidates.sort(key=lambda c: c["distance_to_base"])
+            trace["candidates"] = candidates
+            trace["skipped_invalid"] = skipped
+            for i, c in enumerate(candidates):
+                logger.info(
+                    "抓取候选 #%d %s pos=(%.4f, %.4f, %.4f) 距基座 %.3fm conf=%.2f",
+                    i, c["label"], *c["position"], c["distance_to_base"], c["confidence"],
                 )
 
-            # 获取识别结果
-            objects = result.get("objects", [])
-            if not objects:
-                reply = "搜索返回结果为空，请重试。"
-                return SkillResult(
-                    ok=False,
-                    output=f"没有找到 {target}。",
-                    reply=reply,
-                    speak=True,
-                    elapsed_ms=(time.time() - started) * 1000,
+            if not candidates:
+                trace["outcome"] = "no_valid_candidate"
+                reason = (
+                    f"看到了{target}，但测不准距离，不能抓。"
+                    if skipped else
+                    f"{target}的位置没能换算到世界坐标系，请检查手眼标定。"
                 )
+                return self._fail(reason, trace, started)
 
-            # 取第一个（通常是置信度最高的）
-            obj = objects[0]
-            pose = obj.get("pose", {})
-
-            # 计算预抓取点
-            target_pos = (float(pose.get("x", 0)), float(pose.get("y", 0)), float(pose.get("z", 0)))
+            chosen = candidates[0]
+            target_pos = chosen["position"]
             approach_pos = self._compute_approach_point(
-                target_pos, approach_distance, frame
+                target_pos, approach_distance, "world"
             )
-
-            # 构造回复
-            reply = (
-                f"找到 {target}。\n"
-                f"目标位置: ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}) m\n"
-                f"预抓取位置: ({approach_pos[0]:.3f}, {approach_pos[1]:.3f}, {approach_pos[2]:.3f}) m\n"
-                f"坐标系: {frame}"
+            trace["chosen_index"] = 0
+            trace["target_pose"] = target_pos
+            trace["approach_pose"] = approach_pos
+            logger.info(
+                "抓取规划 target=%s arm=%s 共%d个候选, 选最近 距基座 %.3fm "
+                "target_pose=(%.4f, %.4f, %.4f) approach_pose=(%.4f, %.4f, %.4f)",
+                target, arm_name, len(candidates), chosen["distance_to_base"],
+                *target_pos, *approach_pos,
             )
 
             state_updates = {
                 "grasp_target": {
                     "name": target,
-                    "frame": frame,
+                    "frame": "world",
                     "target_pose": target_pos,
                     "approach_pose": approach_pos,
-                    "confidence": float(obj.get("confidence", 0)),
+                    "confidence": chosen["confidence"],
                     "timestamp_ms": int(time.time() * 1000),
                 }
             }
+            payload = {
+                "target": target,
+                "target_pose": target_pos,
+                "approach_pose": approach_pos,
+                "frame": "world",
+                "confidence": chosen["confidence"],
+                "candidates": len(candidates),
+            }
 
+            # ---- 4. 只规划不动 ----
+            if not do_execute:
+                trace["outcome"] = "planned_only"
+                reply = (
+                    f"找到{target}，离机械臂 {chosen['distance_to_base']:.2f} 米。"
+                    f"预抓取点 {approach_pos[0]:.3f}, {approach_pos[1]:.3f}, "
+                    f"{approach_pos[2]:.3f}。"
+                )
+                self._write_trace(trace, started)
+                return SkillResult(
+                    ok=True, output=reply, reply=reply, speak=True,
+                    state_updates=state_updates, payload=payload,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            # ---- 5. 移动: 先到物体上方的预抓取点, 不直接去物体表面 ----
+            move = await self.arm_client.move_to(
+                side, approach_pos[0], approach_pos[1], approach_pos[2],
+                duration=duration,
+            )
+            trace["move"] = move
+            trace["outcome"] = "moved" if move.get("ok") else f"rejected:{move.get('code')}"
+
+            payload["move"] = {
+                k: move.get(k) for k in ("ok", "code", "stage", "message", "error_m")
+            }
+            if not move.get("ok"):
+                msg = str(move.get("message") or "机械臂没有移动")
+                self._write_trace(trace, started)
+                return SkillResult(
+                    ok=False, output=msg, error=msg, reply=msg, speak=True,
+                    state_updates=state_updates, payload=payload,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            reply = f"已移动到{target}上方，离目标{move.get('error_m', 0) * 100:.1f}厘米。"
+            self._write_trace(trace, started)
             return SkillResult(
-                ok=True,
-                output=reply,
-                reply=reply,
-                speak=True,
-                state_updates=state_updates,
+                ok=True, output=reply, reply=reply, speak=True,
+                state_updates=state_updates, payload=payload,
                 elapsed_ms=(time.time() - started) * 1000,
-                payload={
-                    "target": target,
-                    "target_pose": target_pos,
-                    "approach_pose": approach_pos,
-                    "frame": frame,
-                    "confidence": float(obj.get("confidence", 0)),
-                },
             )
 
         except Exception as e:
-            logger.exception("物体抓取规划失败")
-            # 生成用户友好的错误提示
-            error_reason = self._get_error_reason(str(e))
-            return SkillResult(
-                ok=False,
-                error=error_reason,
-                reply=error_reason,
-                speak=True,
-                elapsed_ms=(time.time() - started) * 1000,
-            )
+            logger.exception("物体抓取失败")
+            trace["outcome"] = "exception"
+            trace["exception"] = repr(e)
+            return self._fail(self._get_error_reason(str(e)), trace, started)
+
+    # ------------------------------------------------------------ 辅助
+
+    def _fail(self, message: str, trace: Dict[str, Any], started: float) -> SkillResult:
+        """失败收尾: 落盘追溯并返回要念出来的原因。"""
+        trace.setdefault("outcome", "failed")
+        trace["message"] = message
+        self._write_trace(trace, started)
+        return SkillResult(
+            ok=False,
+            output=message,
+            error=message,
+            reply=message,
+            speak=True,
+            elapsed_ms=(time.time() - started) * 1000,
+        )
+
+    def _write_trace(self, trace: Dict[str, Any], started: float) -> None:
+        """追加一行 JSONL。写失败只记日志, 不影响抓取流程。"""
+        trace["elapsed_ms"] = int((time.time() - started) * 1000)
+        try:
+            self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.trace_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(trace, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("写抓取追溯记录失败: %s", exc)
+
+    @staticmethod
+    def _dist(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    @staticmethod
+    def _pick_arm(
+        arms: Dict[str, Dict[str, Any]], side: str
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """在运动学快照里按左右找臂 (臂名是控制器里的真实名)。"""
+        for name, data in arms.items():
+            low = name.lower()
+            if side in low:
+                return name, data
+        for name, data in arms.items():
+            low = name.lower()
+            if (side == "left" and (low.endswith("l") or "_l" in low)) or (
+                side == "right" and (low.endswith("r") or "_r" in low)
+            ):
+                return name, data
+        return "", None
 
     @staticmethod
     def _compute_approach_point(
@@ -245,15 +377,13 @@ class VisionGraspSkill(Skill):
         approach_distance: float,
         frame: str,
     ) -> Tuple[float, float, float]:
-        """
-        计算预抓取点（沿 Z 轴方向后退）。
+        """预抓取点: 在目标正上方 ``approach_distance`` 米。
 
-        在所有坐标系下，沿 Z 轴（深度轴）增加距离值即为后退。
+        世界系 Z 向上, 所以加在 z 上。(相机系的 Z 是深度, 加距离是后退,
+        数学上也是 z + d。)
         """
         x, y, z = target_pos
-        # 沿 Z 轴增加距离（后退）
-        z_approach = z + approach_distance
-        return (x, y, z_approach)
+        return (x, y, z + approach_distance)
 
     @staticmethod
     def _get_error_reason(error_str: str) -> str:

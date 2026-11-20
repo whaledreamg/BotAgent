@@ -313,12 +313,13 @@ async def traces_query(
     }
 
 
-@app.get("/v1/traces/image/{filename}")
+@app.get("/v1/traces/image/{filename:path}")
 async def traces_image(filename: str):
     """获取追溯图像。
 
     Args:
-        filename: 图像文件名 (从 /v1/traces/query 返回的 image_filename)
+        filename: 图像路径 (从 /v1/traces/query 返回的 image_filename),
+            形如 ``20261117_110830_123/mouse_01.jpg``
 
     Returns:
         图像文件 (JPEG)

@@ -195,6 +195,49 @@ class ArmClient:
         except Exception as exc:
             raise ArmError(f"状态查询失败: {exc}") from exc
 
+    async def kinematics(self, refresh: bool = True) -> Dict[str, Any]:
+        """运动学快照: 各臂 TCP 与基座在世界系下的位姿。"""
+        try:
+            resp = await self._client.get(
+                "/v1/kinematics", params={"refresh": "true" if refresh else "false"},
+                timeout=6.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"运动学查询失败: {exc}") from exc
+
+    async def move_to(
+        self,
+        arm: str,
+        x: float,
+        y: float,
+        z: float,
+        duration: Optional[float] = None,
+        a: Optional[float] = None,
+        b: Optional[float] = None,
+        c: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """把 TCP 移到世界系目标点。**同步等到走完**。
+
+        被门阀或可达性检查拒绝时不抛异常, 返回 ``ok=false`` 和可播报的
+        ``message``; 只有服务不可达这类传输错误才抛 ArmError。
+        """
+        # speak=False: 失败原因由 agent 回复念出来, 服务端不再重复播报
+        payload: Dict[str, Any] = {"arm": arm, "x": x, "y": y, "z": z, "speak": False}
+        for key, value in (("duration", duration), ("a", a), ("b", b), ("c", c)):
+            if value is not None:
+                payload[key] = value
+        # 服务端会阻塞到走完, 超时要覆盖 运动时长 + 入控 + 核对
+        timeout = float(duration or 3.0) + 20.0
+        try:
+            resp = await self._client.post("/v1/move_to", json=payload, timeout=timeout)
+        except Exception as exc:
+            raise ArmError(f"机械臂服务不可达 ({self.base_url}): {exc}") from exc
+        if resp.status_code >= 400:
+            raise ArmError(f"移动请求失败 (HTTP {resp.status_code}): {resp.text[:200]}")
+        return resp.json()
+
     async def check_safety(self) -> Dict[str, Any]:
         """跑一次安全门阀检查 (不执行动作)。
 

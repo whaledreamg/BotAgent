@@ -1,6 +1,7 @@
 // 监控 APP 的逻辑自测 —— 不依赖 GUI 截图, 直接验证模型层。
 //
 // 用法: monitor/build/botagent_monitor_selftest
+#include "core/agentclient.h"
 #include "core/appconfig.h"
 #include "models/monitormodel.h"
 #include "models/thinkingmodel.h"
@@ -354,6 +355,103 @@ int main(int argc, char *argv[])
     out << "  卡片数=" << flow.cardCount() << "\n";
     out << "  [填完] 可见的正文行数=" << visibleValueCount(card) << " (应为 4)\n";
     out << "  ASR=" << card->findChild<QLabel *>(QStringLiteral("flowValue"))->text() << "\n";
+
+    out << "\n========== 5. 手动指令标识 (FlowCard::setManual) ==========\n";
+    {
+        // 找「ASR 识别 / 输入文本」那一行的标题
+        auto findAsrCaption = [](FlowCard *c) -> QLabel * {
+            for (QLabel *label : c->findChildren<QLabel *>()) {
+                if (label->objectName() == QLatin1String("flowCaption")
+                    && (label->text() == QStringLiteral("ASR 识别")
+                        || label->text() == QStringLiteral("输入文本"))) {
+                    return label;
+                }
+            }
+            return nullptr;
+        };
+
+        FlowPanel p;
+        FlowCard *mc = p.beginTurn(QDateTime::currentDateTime());
+        mc->setAsrText(QStringLiteral("手动输入的指令"));
+
+        // ---- 默认 (语音轮次) ----
+        QLabel *caption = findAsrCaption(mc);
+        QLabel *manualBadge = mc->findChild<QLabel *>(QStringLiteral("flowManualBadge"));
+        out << "  默认标题 = " << (caption ? caption->text() : QStringLiteral("<没找到>")) << "\n";
+        out << "  默认 isManual = " << (mc->isManual() ? "true" : "false") << "\n";
+        if (caption && caption->text() == QStringLiteral("ASR 识别")
+            && !mc->isManual()) {
+            out << "  [PASS] 默认是「ASR 识别」且非手动\n";
+        } else {
+            out << "  [FAIL] 默认状态不对\n";
+        }
+        if (manualBadge && !manualBadge->isVisibleTo(mc)) {
+            out << "  [PASS] 默认不显示「手动」徽标\n";
+        } else {
+            out << "  [FAIL] 「手动」徽标默认应该隐藏\n";
+        }
+
+        // ---- 切到手动 ----
+        mc->setManual(true);
+        caption = findAsrCaption(mc);
+        out << "  手动标题 = " << (caption ? caption->text() : QStringLiteral("<没找到>")) << "\n";
+        out << "  手动 isManual = " << (mc->isManual() ? "true" : "false") << "\n";
+        if (caption && caption->text() == QStringLiteral("输入文本")
+            && mc->isManual()) {
+            out << "  [PASS] 手动模式下标题为「输入文本」\n";
+        } else {
+            out << "  [FAIL] 手动模式下标题没切过去\n";
+        }
+        if (manualBadge && manualBadge->isVisibleTo(mc)) {
+            out << "  [PASS] 手动模式显示「手动」徽标\n";
+        } else {
+            out << "  [FAIL] 手动模式应该显示「手动」徽标\n";
+        }
+
+        // ---- 切回语音 ----
+        mc->setManual(false);
+        caption = findAsrCaption(mc);
+        out << "  切回标题 = " << (caption ? caption->text() : QStringLiteral("<没找到>")) << "\n";
+        if (caption && caption->text() == QStringLiteral("ASR 识别")
+            && !mc->isManual()) {
+            out << "  [PASS] 切回语音模式, 标题恢复「ASR 识别」\n";
+        } else {
+            out << "  [FAIL] 切回语音模式失败\n";
+        }
+    }
+
+    out << "\n========== 6. 手动指令客户端 (AgentClient) ==========\n";
+    {
+        AgentClient client;
+        client.setBaseUrl(QStringLiteral("http://127.0.0.1:8800/"));
+        out << "  baseUrl = " << client.baseUrl() << "\n";
+        // 尾部斜杠要被去掉 —— 否则会拼出 http://host:8800//v1/dispatch
+        if (client.baseUrl() == QStringLiteral("http://127.0.0.1:8800"))
+            out << "  [PASS] baseUrl 规范化正常 (尾部斜杠已去掉)\n";
+        else
+            out << "  [FAIL] baseUrl 规范化不对\n";
+
+        // 空地址时 dispatch 要直接失败, 不能发请求
+        AgentClient noAddr;
+        bool failedEmitted = false;
+        QObject::connect(&noAddr, &AgentClient::failed,
+                         [&](const QString &) { failedEmitted = true; });
+        const bool ok = noAddr.dispatch(QStringLiteral("测试"), QStringLiteral("monitor-ui"));
+        out << "  空地址 dispatch 返回 = " << (ok ? "true" : "false") << " (应为 false)\n";
+        if (!ok && failedEmitted)
+            out << "  [PASS] 空地址时立即报错\n";
+        else
+            out << "  [FAIL] 空地址时应该直接失败\n";
+    }
+
+    out << "\n========== 7. 手动指令 session id ==========\n";
+    {
+        out << "  agentSessionId = " << cfg.agentSessionId << "\n";
+        if (!cfg.agentSessionId.isEmpty() && cfg.agentSessionId != QStringLiteral("robot-01"))
+            out << "  [PASS] 手动指令用独立 session, 不污染语音历史\n";
+        else
+            out << "  [FAIL] agentSessionId 不对\n";
+    }
 
     out << "\n自测完成\n";
     return 0;

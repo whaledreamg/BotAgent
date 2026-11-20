@@ -194,6 +194,12 @@ class ArmController:
             self._on_error(message)
         self._set_phase(Phase.ERROR, message)
 
+    def clear_failure(self) -> None:
+        """清掉上一轮的失败标记 (笛卡尔入控前调用)。"""
+        with self._lock:
+            self._failed = False
+            self._last_error = ""
+
     @property
     def failed(self) -> bool:
         """入控/播放过程中是否已出错。"""
@@ -277,6 +283,28 @@ class ArmController:
             # 协议缺省是 false (即无任何关节级限速)。
             "jointLimit": dict(self._joint_limit),
         }
+
+    def cartesian_control_config(self, max_arm_angle_delta: float = 0.05) -> Dict[str, Any]:
+        """末端空间入控的 config 段 (``cartesianIkPath: analytic``)。
+
+        与关节流的区别:
+        - 本会话额外接受末端包 (``controlSpace: 1``), 由控制器逆解
+        - 不加后滤波: 末端轨迹本身是 S 曲线, 再叠 2Hz 低通只会让终点多滞后
+        - 关节限幅照样打开, 它仍是本会话唯一的关节级保护
+        """
+        cfg = self._control_config()
+        cfg["cartesianIkPath"] = "analytic"
+        cfg["analyticIk"] = {"maxArmAngleDelta": max_arm_angle_delta}
+        cfg.pop("postFilter", None)
+        return cfg
+
+    @property
+    def streamer_port(self) -> int:
+        return self._streamer.port
+
+    @property
+    def streamer_frequency(self) -> int:
+        return self._streamer.frequency
 
     def enter_control(self) -> None:
         """入控: 起流 + 并行发 startControl。

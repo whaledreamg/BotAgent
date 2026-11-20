@@ -392,6 +392,9 @@ class ToolSpecConfig:
     action_map: Dict[str, str] = field(default_factory=dict)
     #: JSON Schema (parameters 段)
     parameters: Dict[str, Any] = field(default_factory=dict)
+    #: 依赖的 skill id (可选)。禁用这个 skill 时该 tool 也一起被剔掉 ——
+    #: 免得 skill 关了但 tool 还留着, 模型照样能调它。
+    skill: str = ""
 
 @dataclass
 class ToolConfig:
@@ -471,6 +474,7 @@ def load_tool_specs(path: Path = TOOLS_CONFIG_PATH) -> ToolConfig:
                 value_arg=str(item.get("value_arg", "") or ""),
                 action_map=action_map,
                 parameters=dict(item.get("parameters") or {}),
+                skill=str(item.get("skill", "") or ""),
             )
         )
 
@@ -490,6 +494,10 @@ class Config:
     arm_actions: ArmActionConfig = field(default_factory=ArmActionConfig)
     #: tool 定义清单 (configs/tools.yaml)
     tool_specs: ToolConfig = field(default_factory=ToolConfig)
+    #: 被禁用的 skill id (configs/agent.yaml 的 skills.disabled)
+    disabled_skills: List[str] = field(default_factory=list)
+    #: 被禁用的 tool 名 (configs/agent.yaml 的 skills.disabled_tools)
+    disabled_tools: List[str] = field(default_factory=list)
 
     @property
     def enabled_handlers(self) -> List[HandlerConfig]:
@@ -801,6 +809,18 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
         ttl_seconds=int(s.get("ttl_seconds", 1800)),
     )
 
+    # ---- skill / tool 的选择性关闭 ----
+    #
+    # 写在这里的 id 不会注册进 SkillCatalog, 也不会出现在给模型的工具清单里。
+    # 关掉 = 模型看不见它, 用户说了也不会被路由过去。
+    sk = merged.get("skills") or {}
+    disabled_skills = [
+        str(x).strip() for x in (sk.get("disabled") or []) if str(x).strip()
+    ]
+    disabled_tools = [
+        str(x).strip() for x in (sk.get("disabled_tools") or []) if str(x).strip()
+    ]
+
     return Config(
         llm=llm,
         router=router,
@@ -810,4 +830,6 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
         router_prompt=merged.get("router_prompt", "").strip(),
         arm_actions=load_arm_actions(),
         tool_specs=load_tool_specs(),
+        disabled_skills=disabled_skills,
+        disabled_tools=disabled_tools,
     )

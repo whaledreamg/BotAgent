@@ -80,6 +80,7 @@ tools:
 
   # ---- 查天气 ----
   - name: query_weather
+    skill: weather
     kind: query
     label: 查天气
     description: >-
@@ -99,6 +100,7 @@ tools:
 
   # ---- 查时间 ----
   - name: query_time
+    skill: time
     kind: query
     label: 查时间
     description: 查询当前时间。
@@ -110,6 +112,7 @@ tools:
 
   # ---- 查日期 ----
   - name: query_date
+    skill: date
     kind: query
     label: 查日期
     description: 查询今天的日期和星期。
@@ -119,8 +122,24 @@ tools:
       type: object
       properties: {}
 
+  # ---- 描述场景 (视觉服务) ----
+  - name: describe_scene
+    skill: describe_scene
+    kind: query
+    label: 描述场景
+    description: >-
+      列出相机当前看到的所有物体和数量。用户问「你看到了什么」
+      「你前面有什么」「桌上有什么」这类没有指定物体的问题时使用。
+      问某个具体物体在哪或有几个, 用 find_object。
+    action_map:
+      "": describe_scene
+    parameters:
+      type: object
+      properties: {}
+
   # ---- 找物体 (视觉服务) ----
   - name: find_object
+    skill: find_object
     kind: query
     label: 找物体
     description: >-
@@ -143,6 +162,32 @@ tools:
             arm_base=机械臂基座坐标系(需要标定 + 运行时基座位姿);
             left_base=左臂基座坐标系;
             right_base=右臂基座坐标系
+      required: ["name"]
+
+  # ---- 抓取物体 (视觉 + 机械臂, 会真的动) ----
+  - name: grasp_object
+    kind: query
+    label: 抓取物体
+    speak: true
+    # 依赖的 skill —— configs/agent.yaml 的 skills.disabled 里禁用了
+    # vision.grasp, 这个 tool 会跟着一起被剔掉
+    skill: vision.grasp
+    description: >-
+      让机械臂去抓某个物体: 用相机找到它 (多个时取离机器人最近的),
+      然后经安全检查把机械臂移动到它上方。只有用户明确要求「抓」「拿」
+      「取」某个物体时使用; 只问位置或有没有时用 find_object。
+    action_map:
+      "": grasp_object
+    parameters:
+      type: object
+      properties:
+        name:
+          type: string
+          description: 要抓的物体名称, 如 鼠标、杯子、瓶子
+        arm:
+          type: string
+          enum: ["left", "right"]
+          description: 用哪条臂, 用户没说就用 right
       required: ["name"]
 
 # ---------------------------------------------------------------------

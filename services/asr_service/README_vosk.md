@@ -76,6 +76,30 @@ cd /home/gxh/workspace/project/ASRT
 | `--no-save` | 关 | 不保存 WAV |
 | `--quiet` | 关 | 不显示电平条 |
 
+## HTTP 接口
+
+服务在 `--health-port`（默认 8801）上提供三个接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health`、`/state` | 状态快照。含 `state`（IDLE/REC/THINK/SAY）、`last_text`（识别到的原文）、`last_intent`、`last_reply`、`timings`（各阶段耗时） |
+| POST | `/v1/submit` | **测试入口**：直接灌一段文本进流水线，走完整的 ASR → Agent → TTS 链路 |
+
+`POST /v1/submit` 是给「麦克风不可用」的场景准备的（CI、远程开发机、
+或者只是想复现某个 bug）：
+
+```bash
+curl -X POST http://127.0.0.1:8801/v1/submit \
+     -H 'Content-Type: application/json' \
+     -d '{"text":"查南京天气","record_ms":1200}'
+# -> {"ok": true, "text": "查南京天气"}
+```
+
+`record_ms` 可选，用来模拟「录音+识别」阶段的耗时，会体现在 `timings` 里。
+
+> 注意：`last_text` 在**识别完成时**就写入（不等 Agent 返回），
+> 这样监控端能在 THINK 阶段就看到「用户说了什么」。
+
 ## 实现要点
 
 ### 唤醒词为什么要分词

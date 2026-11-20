@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from handlers.base import AgentRequest, BranchResult, Handler
+from arm_client import ArmClient
 from vision_client import VisionClient, VisionError
 from weather_client import (
     CityNotFound,
@@ -97,6 +98,30 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "label": "查日期",
         "patterns": [r"(几号|今天.*日期|什么日期|今天星期)"],
     },
+    # ---- 视觉: 描述场景 ----
+    #
+    # 「你看到了什么」「前面有什么」没有具体物体名, 要列出全部检测结果。
+    # **必须排在 find_object 之前**, 否则「看看有什么」会被「看看」抢走。
+    "describe_scene": {
+        "kind": KIND_QUERY,
+        "label": "描述场景",
+        "patterns": [
+            r"(你)?(看到|看见)了?(什么|啥|哪些)",
+            r"(前面|面前|眼前|桌上|桌子上)(有|是)?(什么|啥|哪些)",
+            r"(有什么|有哪些)(东西|物体)",
+            r"看看(有什么|周围)",
+            r"描述一下(眼前|周围|场景)",
+        ],
+    },
+    # ---- 视觉 + 机械臂: 抓取 ----
+    #
+    # 没有正则: 会动的指令只走 LLM tool calling (tools.yaml 的 grasp_object),
+    # 不用关键词快速通道, 避免「拿」「抓」这类词误触发机械臂移动。
+    "grasp_object": {
+        "kind": KIND_QUERY,
+        "label": "抓取物体",
+        "patterns": [],
+    },
     # ---- 视觉: 找物体 ----
     #
     # 匹配要**排除机械臂相关的说法** (「左手在哪」是问机械臂, 不是问
@@ -148,6 +173,7 @@ class ToolHandler(Handler):
         super().__init__(config=config, llm=llm)
         self._speak_tools: Optional[set] = None
         self._vision_client: Optional[VisionClient] = None
+        self._arm_client: Optional[ArmClient] = None
         self._weather_client: Optional[WeatherClient] = None
         # 混合参数提取管理器
         self._extraction_manager: Optional[ParameterExtractionManager] = None
@@ -238,6 +264,9 @@ class ToolHandler(Handler):
         if self._vision_client is not None:
             await self._vision_client.aclose()
             self._vision_client = None
+        if self._arm_client is not None:
+            await self._arm_client.aclose()
+            self._arm_client = None
         if self._weather_client is not None:
             await self._weather_client.aclose()
             self._weather_client = None
@@ -254,6 +283,19 @@ class ToolHandler(Handler):
                 timeout=float(self._options().get("vision_timeout", 10.0)),
             )
         return self._vision_client
+
+    @property
+    def arm_client(self) -> ArmClient:
+        """机械臂服务客户端 (懒加载), 抓取移动用。"""
+        if self._arm_client is None:
+            opts = self._options()
+            base = opts.get("arm_base_url") or getattr(
+                getattr(self.config, "arm_actions", None), "base_url", ""
+            ) or "http://127.0.0.1:8802"
+            self._arm_client = ArmClient(
+                base_url=str(base), timeout=float(opts.get("arm_timeout", 5.0))
+            )
+        return self._arm_client
 
     # ------------------------------------------------------------ 分类判定
 
@@ -363,7 +405,7 @@ class ToolHandler(Handler):
         # **天气是例外**: 「今天天气怎么样」就是标准的查天气说法,
         # 而且用户没提城市时问的正是**当前城市**的天气。
         # 把它当闲聊挡掉, 用户永远等不到天气结果。
-        if name != "weather" and any(
+        if name not in ("weather", "describe_scene") and any(
             re.search(p, text) for p in self.QUESTION_PATTERNS
         ):
             return None, {}, {}
@@ -449,6 +491,10 @@ class ToolHandler(Handler):
                         total_ms=elapsed_ms,
                         timing_breakdown={"extraction": elapsed_ms},
                     )
+                    # ---- 监控埋点: 参数提取的思考过程 ----
+                    #
+                    # `reasoning` 是模型解释「我怎么从这句话里认出城市的」,
+                    # 是整条链路上最有信息量的一段 —— 推给监控端展示。
                     bus.publish(
                         "thinking",
                         {
@@ -502,6 +548,7 @@ class ToolHandler(Handler):
                         total_ms=elapsed_ms,
                         timing_breakdown={"extraction": elapsed_ms},
                     )
+                    # ---- 监控埋点: 参数提取的思考过程 ----
                     bus.publish(
                         "thinking",
                         {
@@ -651,8 +698,12 @@ class ToolHandler(Handler):
             now = datetime.now()
             week = "一二三四五六日"[now.weekday()]
             return "ok", f"今天是{now.month}月{now.day}日，星期{week}"
+        if name == "describe_scene":
+            return await self._execute_describe_scene(args)
         if name == "find_object":
             return await self._execute_find_object(args)
+        if name == "grasp_object":
+            return await self._execute_grasp_object(args)
         return "failed", "未知动作"
 
     # ------------------------------------------------------------ 天气
@@ -698,6 +749,62 @@ class ToolHandler(Handler):
         return "ok", "，".join(parts) + "。"
 
     # ------------------------------------------------------------ 视觉
+
+    #: 描述场景时最多报几类物体
+    _SCENE_MAX_KINDS = 5
+
+    async def _execute_describe_scene(self, args: Dict[str, Any]) -> Tuple[str, str]:
+        """描述场景 -> 「我看到 2 个杯子、1 个人。」
+
+        中文名用视觉服务返回的 label_zh, 没有就用原类名 (自定义中文模型)。
+        不报位置和距离, 避免句子过长。
+        """
+        try:
+            result = await self.vision_client.detect()
+        except VisionError as exc:
+            logger.error("[视觉] 描述场景失败: %s", exc)
+            return "failed", "视觉服务暂时用不了，请稍后再试"
+
+        counts: Dict[str, int] = {}
+        for obj in result.get("objects") or []:
+            name = str(obj.get("label_zh") or obj.get("label") or "").strip()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        if not counts:
+            return "ok", "我现在没有看到明显的物体。"
+
+        # 数量降序; 同数量保持首次出现的顺序
+        ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+        shown = ranked[: self._SCENE_MAX_KINDS]
+        text = "、".join(f"{n} 个{name}" for name, n in shown)
+        reply = f"我看到 {text}"
+        if len(ranked) > len(shown):
+            reply += "，还有其他几样东西"
+        return "ok", reply + "。"
+
+    async def _execute_grasp_object(self, args: Dict[str, Any]) -> Tuple[str, str]:
+        """抓取: 识别最近的目标 -> 经安全门阀移动到预抓取点。
+
+        结果文案 (含失败原因) 直接念给用户。
+        """
+        from skill.builtin.vision_grasp import VisionGraspSkill
+
+        target = str(args.get("name") or args.get("target") or "").strip()
+        if not target:
+            return "failed", "没说要抓什么物体"
+        skill = VisionGraspSkill(
+            VisionGraspSkill.spec(),
+            None,
+            vision_client=self.vision_client,
+            arm_client=self.arm_client,
+        )
+        skill_args: Dict[str, Any] = {"target": target}
+        for key in ("arm", "approach_distance", "duration", "execute"):
+            if args.get(key) not in (None, ""):
+                skill_args[key] = args[key]
+        result = await skill.execute(skill_args)
+        text = result.reply or result.error or result.output or "抓取没有完成"
+        return ("ok" if result.ok else "failed"), text
 
     async def _execute_find_object(self, args: Dict[str, Any]) -> Tuple[str, str]:
         """找物体 -> 播报它的位置。

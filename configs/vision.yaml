@@ -2,49 +2,37 @@ vision:
   server:
     host: 0.0.0.0
     port: 8803
+
+  # ---- 相机自动恢复 ----
+  #
+  # 相机是 USB 独占设备, 掉线 (USB 重置/线材松动/供电不足) 后不会自己
+  # 回来。开着 auto_reconnect 后, 每次请求发现相机不可用就自动
+  # close + reopen 一次 —— 不用重启服务。
+  #
+  # 之前的行为: 相机一掉线, /v1/detect 就一直返回 503 「相机没连上」,
+  # 直到手工重启视觉服务。
+  auto_reconnect: true
+  # 两次重连之间的最小间隔 (秒)。太小会在失败时连着狂试, 把 USB 栈
+  # 搞得更糟 (日志里见过 UVC transfer queue exhausted)。
+  reconnect_interval: 2.0
+
   camera:
-    # 相机品牌: "" (空/笔记本) / "orbbec" / "usb3vision" / "realsense" / ...
-    # 空字符串表示使用笔记本内置摄像头
-    camera_brand: "orbbec"
-    # 相机类型: head (头部) / left_wrist (左腕) / right_wrist (右腕)
+    camera_brand: orbbec
     camera_type: head
-    # 设备序列号或ID
-    # 笔记本摄像头: "", "0", "1" 等设备 ID
-    # Orbbec: 设备序列号，空表示第一个可用设备
-    serial_number: 'CPCBC53000H5'
+    #serial_number: CPCBC53000H5
+    serial_number: CPB9463000RS
     width: 0
     height: 0
     fps: 0
     frame_timeout_ms: 2000
     align_depth_to_color: true
     calibrated_intrinsics:
-      fx: 613.955834
-      fy: 632.477331
-      cx: 677.750872
-      cy: 409.485186
+      fx: 605.779933
+      fy: 609.009161
+      cx: 635.684459
+      cy: 407.178887
       width: 1280
       height: 800
-  # 多相机配置示例 (可选)
-  # 如果要使用多个相机, 在这里定义各相机的参数
-  # cameras:
-  #   head:
-  #     camera_brand: "orbbec"  # Orbbec 3D 相机
-  #     serial_number: 'ORBBEC_HEAD_001'
-  #     width: 1280
-  #     height: 800
-  #     fps: 30
-  #   left_wrist:
-  #     camera_brand: ""        # 笔记本摄像头
-  #     serial_number: "0"      # 第一个设备
-  #     width: 640
-  #     height: 480
-  #     fps: 30
-  #   right_wrist:
-  #     camera_brand: "orbbec"  # Orbbec 3D 相机
-  #     serial_number: 'ORBBEC_RIGHT_001'
-  #     width: 640
-  #     height: 480
-  #     fps: 30
   detector:
     weights: /home/gxh/workspace/data/model/yolo/yolo26n.pt
     pose_weights: ''
@@ -84,15 +72,31 @@ vision:
     auto_apply: true
     min_map50: 0.5
   extrinsic:
-    enabled: false
-    matrix: []
+    enabled: true
+    matrix:
+    - - 0.01895335
+      - -0.64996966
+      - 0.75972378
+      - 0.04554415
+    - - -0.99977783
+      - -0.01933029
+      - 0.00840442
+      - -0.06425278
+    - - 0.00922307
+      - -0.75971428
+      - -0.65019163
+      - 0.12808003
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
     rotation: []
     translation:
     - 0.0
     - 0.0
     - 0.0
     matrix_frame: world
-    target_frame: arm_base
+    target_frame: world
     arm: auto
     dynamic: false
     arm_service_url: http://127.0.0.1:8802

@@ -348,12 +348,41 @@ def build_tool_specs(cfg: Any) -> List[ActionSpec]:
 
     顺序: 机械臂 (自动生成) -> yaml 里定义的工具。
     机械臂放前面是因为它是「最需要被模型注意到」的那个。
+
+    configs/agent.yaml 的 ``skills.disabled_tools`` 里列出的 tool 会被剔除 ——
+    模型看不见它, 也不会被路由过去。
     """
     specs: List[ActionSpec] = []
     arm = build_arm_spec(cfg)
     if arm is not None:
         specs.append(arm)
     specs.extend(build_config_specs(cfg))
+
+    off = {
+        str(x).strip()
+        for x in (getattr(cfg, "disabled_tools", None) or [])
+        if str(x).strip()
+    }
+    # 被禁用的 skill 会连带禁用依赖它的 tool —— 否则 skill 关了, 模型还是
+    # 能调到那个 tool (功能等于没关掉)。
+    off_skills = {
+        str(x).strip()
+        for x in (getattr(cfg, "disabled_skills", None) or [])
+        if str(x).strip()
+    }
+    if off_skills:
+        tool_cfg = getattr(cfg, "tool_specs", None)
+        for raw in list(getattr(tool_cfg, "tools", []) or []):
+            dep = str(getattr(raw, "skill", "") or "").strip()
+            if dep and dep in off_skills:
+                off.add(str(getattr(raw, "name", "") or "").strip())
+
+    if off:
+        kept = [s for s in specs if s.name not in off]
+        dropped = [s.name for s in specs if s.name in off]
+        if dropped:
+            logger.info("tool 已按配置禁用: %s", ", ".join(dropped))
+        specs = kept
     return specs
 
 

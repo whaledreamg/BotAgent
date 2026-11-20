@@ -141,6 +141,22 @@ router:
       keywords: []
       exclude: ["怎么样", "如何", "为什么", "什么是", "是什么", "怎么", "什么意思", "能干什么", "会什么"]
 
+# ---- 功能的选择性开关 ----
+#
+# 写在这里的名字**不会**被注册 —— 模型看不见它, 路由也找不到它,
+# 用户说了也不会被处理。等于把这个功能整个下线, 改回来只要删掉这行。
+#
+# disabled      : skill id (见 skill/loader.py 注册的那些)
+# disabled_tools: tool 名 (configs/tools.yaml 里定义的)
+#
+# 注: 禁用 skill 会**连带**禁用依赖它的 tool (tools.yaml 里的 `skill:` 字段),
+# 所以禁用 vision.grasp 就够了, 不用再单独写 grasp_object。
+skills:
+  # 视觉抓取: 识别物体 + 控制机械臂移动过去
+  disabled:
+    - vision.grasp
+  disabled_tools: []
+
 # 各分支处理器 (新增分支 = 加一个 handlers/xxx.py + 这里一段)
 handlers:
   chat:
@@ -158,11 +174,13 @@ handlers:
     # 显式列出可以覆盖内置判定, 例如把某个动作也改成要播报:
     #   speak_tools: ["weather", "time", "date"]
     options:
-      speak_tools: ["weather", "time", "date", "find_object"]
+      speak_tools: ["weather", "time", "date", "find_object", "describe_scene", "grasp_object"]
       # 视觉服务地址 (视觉服务跑在 8803)
       vision_base_url: "http://127.0.0.1:8803"
       # 调用视觉服务的超时 (秒) —— 相机采集 + 推理, 留够时间
       vision_timeout: 15.0
+      # 抓取移动调用的机械臂服务 (留空用 configs/actions.yaml 的 arm.base_url)
+      arm_base_url: ""
       # ---- 天气 (Open-Meteo, 免 key) ----
       # **必须由用户说出城市名** —— 语音里「今天天气怎么样」很常见,
       # 但没说城市就查不了。IP 定位在移动网络/代理下经常偏几百公里,

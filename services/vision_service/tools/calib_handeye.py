@@ -616,7 +616,7 @@ def _try_joint_solve(
 
     joint = solve_joint(
         samples, camera_matrix, dist_coeffs,
-        initial_tool_board=samples[0].t_tool_board,
+        initial_tool_board=None,
     )
     if joint is None:
         return None
@@ -656,7 +656,7 @@ def _try_joint_solve(
         if len(train) < 3:
             continue
         sub = solve_joint(train, camera_matrix, dist_coeffs,
-                          initial_tool_board=samples[0].t_tool_board)
+                          initial_tool_board=None)
         if sub is None:
             continue
         xs.append(sub[1][:3, 3])
@@ -889,12 +889,18 @@ def main() -> int:
             except Exception as exc:
                 print(f"读标定内参失败 ({exc}), 只做稳健平均", file=sys.stderr)
 
-    result = solve_handeye(
-        samples,
-        refine=camera_matrix is not None,
-        camera_matrix=camera_matrix,
-        dist_coeffs=dist_coeffs,
-    )
+    # 没给 --tool-offset = 板位置未知 -> 直接联合求解, 不走「板在工具原点」的常规解算
+    force_joint = not args.tool_offset and camera_matrix is not None
+    if force_joint:
+        print("未指定 --tool-offset: 板位置视为未知, 直接联合解算", file=sys.stderr)
+        result = None
+    else:
+        result = solve_handeye(
+            samples,
+            refine=camera_matrix is not None,
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
+        )
 
     if result is None:
         # ---- 常规解算失败 -> 尝试联合解算 ----
@@ -915,8 +921,7 @@ def main() -> int:
 
         print(
             "\n"
-            "常规解算失败 —— 尝试**联合解算**"
-            " (同时求 T_tool_board 和 T_world_cam)\n",
+            "联合解算 (同时求 T_tool_board 和 T_world_cam)\n",
             file=sys.stderr,
         )
         joint = _try_joint_solve(samples, camera_matrix, dist_coeffs)

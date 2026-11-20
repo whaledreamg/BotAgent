@@ -314,6 +314,23 @@ ASR 服务也支持透传参数：
 
 详见 [`arm-service.md`](arm-service.md)。
 
+### 监控台（Qt6 桌面 APP）
+
+`monitor/` 目录下一个 **只读** 的 Qt6 (QWidget) 桌面程序，看五个服务的连接状态，
+并实时展示 Agent 每轮的**思考过程**。
+
+```bash
+cd monitor && ./build.sh          # 构建 (Qt 6.8.3)
+monitor/build/botagent_monitor    # 运行
+```
+
+Agent 侧为此新增了一个只读的 WebSocket 推送接口：
+
+- `GET /v1/events` (WS) — 推送每轮对话的 `turn_start` / `thinking` / `turn_end` /
+  `error` 事件，含分流依据、工具选择、参数提取的推理全文与各阶段耗时。
+
+详见 [`monitor/README.md`](../monitor/README.md)。
+
 ## 分流机制
 
 **两级**结构，由 `configs/agent.yaml` 控制：

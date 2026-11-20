@@ -1,4 +1,4 @@
-QT       += core gui widgets
+QT       += core gui widgets network
 
 CONFIG   += c++17
 CONFIG   += console
@@ -10,6 +10,7 @@ TEMPLATE = app
 INCLUDEPATH += $$PWD
 
 HEADERS += \
+    $$PWD/core/agentclient.h \
     $$PWD/core/appconfig.h \
     $$PWD/models/monitormodel.h \
     $$PWD/models/thinkingmodel.h \
@@ -18,6 +19,7 @@ HEADERS += \
 
 SOURCES += \
     $$PWD/selftest.cpp \
+    $$PWD/core/agentclient.cpp \
     $$PWD/core/appconfig.cpp \
     $$PWD/models/monitormodel.cpp \
     $$PWD/models/thinkingmodel.cpp \

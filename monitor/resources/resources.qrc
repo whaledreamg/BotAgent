@@ -8,5 +8,8 @@
 
         <!-- 主窗口 -->
         <file alias="styles/mainwindow.qss">styles/mainwindow.qss</file>
+
+        <!-- 应用图标 (窗口图标 / 托盘 / 任务栏) -->
+        <file alias="icons/appicon.png">icons/appicon.png</file>
     </qresource>
 </RCC>

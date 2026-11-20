@@ -3,6 +3,7 @@
   "requestTimeoutMs": 3000,
   "autoStart": false,
   "defaultHost": "127.0.0.1",
+  "agentSessionId": "monitor-ui",
   "services": [
     {
       "name": "Agent",

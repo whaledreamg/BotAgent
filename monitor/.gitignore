@@ -1,5 +1,6 @@
 # 构建产物
 monitor/build/
+build-android/
 *.o
 *.so
 
@@ -12,6 +13,10 @@ ui_*.h
 # 截图/临时
 *.png
 !docs/**/*.png
+
+# 应用图标 —— 是源码的一部分, 不能被上面的 *.png 规则排除
+!resources/icons/*.png
+!android/res/mipmap/*.png
 
 # Qt Creator / qmake 中间产物
 .qtcreator/

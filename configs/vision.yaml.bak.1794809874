@@ -1,0 +1,99 @@
+vision:
+  server:
+    host: 0.0.0.0
+    port: 8803
+  camera:
+    # 相机品牌: "" (空/笔记本) / "orbbec" / "usb3vision" / "realsense" / ...
+    # 空字符串表示使用笔记本内置摄像头
+    camera_brand: "orbbec"
+    # 相机类型: head (头部) / left_wrist (左腕) / right_wrist (右腕)
+    camera_type: head
+    # 设备序列号或ID
+    # 笔记本摄像头: "", "0", "1" 等设备 ID
+    # Orbbec: 设备序列号，空表示第一个可用设备
+    serial_number: 'CPCBC53000H5'
+    width: 0
+    height: 0
+    fps: 0
+    frame_timeout_ms: 2000
+    align_depth_to_color: true
+    calibrated_intrinsics:
+      fx: 613.955834
+      fy: 632.477331
+      cx: 677.750872
+      cy: 409.485186
+      width: 1280
+      height: 800
+  # 多相机配置示例 (可选)
+  # 如果要使用多个相机, 在这里定义各相机的参数
+  # cameras:
+  #   head:
+  #     camera_brand: "orbbec"  # Orbbec 3D 相机
+  #     serial_number: 'ORBBEC_HEAD_001'
+  #     width: 1280
+  #     height: 800
+  #     fps: 30
+  #   left_wrist:
+  #     camera_brand: ""        # 笔记本摄像头
+  #     serial_number: "0"      # 第一个设备
+  #     width: 640
+  #     height: 480
+  #     fps: 30
+  #   right_wrist:
+  #     camera_brand: "orbbec"  # Orbbec 3D 相机
+  #     serial_number: 'ORBBEC_RIGHT_001'
+  #     width: 640
+  #     height: 480
+  #     fps: 30
+  detector:
+    weights: /home/gxh/workspace/data/model/yolo/yolo26n.pt
+    pose_weights: ''
+    conf: 0.15
+    find_conf: 0.15
+    iou: 0.5
+    device: auto
+    imgsz: 640
+    max_objects: 20
+  solver:
+    sample_grid: 5
+    min_valid_ratio: 0.05
+    depth_min: 0.1
+    depth_max: 5.0
+    erode_iterations: 1
+  recognition:
+    mode: live
+    conf: 0.05
+    frames: 5
+    output_dir: logs
+  training:
+    data: /home/gxh/workspace/project/datasets/myobjects/data.yaml
+    base_weights: /home/gxh/workspace/project/ultralytics/yolo26n.pt
+    epochs: 100
+    imgsz: 640
+    batch: 16
+    patience: 30
+    device: '0'
+    project: /home/gxh/workspace/project/runs
+    name: myobjects
+    hsv_h: 0.01
+    hsv_s: 0.4
+    hsv_v: 0.4
+    mosaic: 1.0
+    close_mosaic: 10
+    seed: 0
+    auto_apply: true
+    min_map50: 0.5
+  extrinsic:
+    enabled: false
+    matrix: []
+    rotation: []
+    translation:
+    - 0.0
+    - 0.0
+    - 0.0
+    matrix_frame: world
+    target_frame: arm_base
+    arm: auto
+    dynamic: false
+    arm_service_url: http://127.0.0.1:8802
+    flip_axes: false

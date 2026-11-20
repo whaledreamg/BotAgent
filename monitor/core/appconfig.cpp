@@ -65,6 +65,7 @@ AppConfig AppConfig::defaults()
     cfg.requestTimeoutMs = 3000;
     cfg.autoStart = false;
     cfg.defaultHost = QStringLiteral("127.0.0.1");
+    cfg.agentSessionId = QStringLiteral("monitor-ui");
 
     const auto svc = [](const char *name, const char *host, int port,
                         const char *health, const char *status) {
@@ -144,6 +145,8 @@ AppConfig AppConfig::load(const QString &path)
             cfg.autoStart = root.value(QStringLiteral("autoStart")).toBool(cfg.autoStart);
         if (root.contains(QStringLiteral("defaultHost")))
             cfg.defaultHost = root.value(QStringLiteral("defaultHost")).toString(cfg.defaultHost);
+        if (root.contains(QStringLiteral("agentSessionId")))
+            cfg.agentSessionId = root.value(QStringLiteral("agentSessionId")).toString(cfg.agentSessionId);
 
         if (root.contains(QStringLiteral("services"))) {
             const QJsonArray arr = root.value(QStringLiteral("services")).toArray();

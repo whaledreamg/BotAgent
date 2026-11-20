@@ -12,6 +12,10 @@ QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
 
+class QEvent;
+class QKeyEvent;
+
+class AgentClient;
 class FlowCard;
 class FlowPanel;
 class MonitorModel;
@@ -53,6 +57,10 @@ signals:
 
 protected:
     void closeEvent(QCloseEvent *event) override;
+    /// 事件过滤器 —— 指令输入框里 Enter 发送 / Shift+Enter 换行。
+    bool eventFilter(QObject *watched, QEvent *event) override;
+    /// 窗口尺寸变化 —— 在「窄屏」与「宽屏」两种布局之间切换。
+    bool event(QEvent *event) override;
 
 private slots:
     // ===== 顶部工具条 =====
@@ -64,6 +72,16 @@ private slots:
     void onHostReturnPressed();
     /// IP 输入框失焦 —— 提示需要重新开始监控才生效。
     void onHostEditingFinished();
+
+    // ===== 手动指令 =====
+    /// 发送输入框里的指令到 Agent。
+    void onCommandSend();
+    /// Agent 同步返回了结果 (WS 还没到时用它兜底回填)。
+    void onDispatched(const QJsonObject &result);
+    /// 指令发送失败。
+    void onDispatchFailed(const QString &error);
+    /// 输入框内容变化 —— 控制发送按钮的可用状态。
+    void onCommandTextChanged();
 
     // ===== 数据源回调 =====
     void onServiceUpdated(const QString &name, int state, int latencyMs,
@@ -99,6 +117,27 @@ private:
     /// 刷新底部状态栏的 WS 连接状态。
     void updateWsStatus();
 
+    // ===== 平板适配 =====
+    ///
+    /// 平板横屏是主要目标 (Android 端), 桌面端沿用同一套布局。
+    ///
+    /// 与桌面端的唯一差别是**触摸目标尺寸** —— 手指比鼠标粗,
+    /// 按钮/输入框在平板上要放大到 44dp 才点得准。
+    ///
+    /// 判据是窗口宽度 (`kMinTabletWidth`) —— 平板横屏一定够宽。
+    void applyTouchSizing();
+    /// 折叠旧的思考轮次 —— 只留最新一轮展开。
+    ///
+    /// 思考树是倒叙的 (最新一轮在顶部)。新的一轮进来时, 上一轮
+    /// 还铺着大片屏幕就太吵了 —— 这里把除最新一轮之外的顶层节点
+    /// 全部收起, 想看细节再手动点开。
+    void collapseOldThinkingTurns();
+    /// 展开最新一轮里的各个「阶段」 (第二层)。
+    ///
+    /// 要在 turn_end 时调 —— 阶段是随 thinking / turn_end 事件
+    /// 陆续插进来的, turn_start 时还没到。
+    void expandLatestTurnSections();
+
     Ui::MainWindow *ui;
 
     // ---- 模型 ----
@@ -108,6 +147,8 @@ private:
     // ---- 数据源 ----
     ServicePoller *m_poller = nullptr;
     WsClient *m_wsClient = nullptr;
+    /// 手动指令客户端 (POST /v1/dispatch)。
+    AgentClient *m_agentClient = nullptr;
 
     // ---- 视图 ----
     ServiceBar *m_serviceBar = nullptr;
@@ -121,6 +162,18 @@ private:
     /// 当前实际生效的目标 IP (最后一次 applyHost 时用的)。
     QString m_currentHost;
 
+    /// 手动指令用的 session id (默认 monitor-ui)。
+    QString m_agentSessionId;
+
+    /// 有手动指令正在飞行中。
+    ///
+    /// 这期间**跳过 ASR 快照建卡** —— 否则 ASR 的「最近一轮」会跟
+    /// 手动指令抢同一张卡片。
+    bool m_manualPending = false;
+
+    /// 当前手动指令的文本 —— 用来在 WS 事件里认出「这是手动那一轮」。
+    QString m_manualText;
+
     /// WebSocket 源的名字 (状态栏显示用)
     QStringList m_wsNames;
     /// 本次运行是否已经经历过一轮对话。
@@ -130,6 +183,8 @@ private:
     bool m_turnStarted = false;
     /// 启动时记下的 ASR 历史文本 (基线)
     QString m_asrBaselineText;
+
+    // ===== 平板适配 =====
 };
 
 #endif  // MAINWINDOW_H

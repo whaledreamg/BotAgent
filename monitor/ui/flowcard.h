@@ -34,6 +34,18 @@ public:
     QString asrText() const { return m_asrText; }
     /// 本轮是否已经结束 (收到回复)。
     bool isComplete() const { return m_complete; }
+    /// 标记这一轮是**手动输入**的 (不是 ASR 语音)。
+    ///
+    /// 效果:
+    ///   - 正文第一行的标题从「ASR 识别」改成「输入文本」
+    ///   - 卡片头部多一个「手动」徽标
+    void setManual(bool manual);
+    /// 本轮是否是手动输入的。
+    bool isManual() const { return m_manual; }
+    /// 卡片当前的阶段文案 (如「发送中」「已完成」)。
+    QString phaseText() const;
+    /// 设置卡片当前的阶段文案。
+    void setPhaseText(const QString &text);
     /// Agent 的分流结论 (intent + 判定方式)。
     void setRoute(const QString &intent, const QString &by);
     /// Agent 返回的回复内容。
@@ -42,8 +54,6 @@ public:
     void setAgentTiming(int totalMs, int routeMs, int handlerMs);
     /// ASR 侧的耗时 (来自 /health 快照的 timings 字段)。
     void setAsrTiming(const QJsonObject &timings);
-    /// 卡片右上角的状态文字 (如「思考中」「已完成」)。
-    void setPhaseText(const QString &text);
     /// 意图徽标 (空则隐藏)。
     void setBadge(const QString &intent);
 
@@ -69,6 +79,8 @@ private:
     QLabel *m_time = nullptr;
     QLabel *m_badge = nullptr;
     QLabel *m_phase = nullptr;
+    /// 「手动」徽标 —— 只在手动输入的轮次显示。
+    QLabel *m_manualBadge = nullptr;
 
     // 原始数值, 用于重新拼装耗时行
     int m_agentTotal = -1;
@@ -80,4 +92,6 @@ private:
     QString m_asrText;
     /// 本轮是否已经拿到回复
     bool m_complete = false;
+    /// 本轮是否是手动输入的 (不是 ASR 语音)
+    bool m_manual = false;
 };

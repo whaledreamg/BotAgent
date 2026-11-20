@@ -474,6 +474,22 @@ class OrbbecCamera(CameraAdapter):
         self._ctx = None
         self._opened = False
 
+    def reopen(self) -> None:
+        """关掉再重新打开 —— USB 掉线后的恢复手段。
+
+        Orbbec 是 **USB 独占**设备: 一次 USB 重置/掉线之后, 老的流句柄
+        还挂在设备上, 直接 `open()` 会报 `uvc_open failed -6`。必须先
+        `close()` 把句柄还回去, 再重新枚举、重新起流。
+
+        失败只抛 CameraError, 由调用方决定要不要重试。
+        """
+        logger.info("重新打开相机")
+        self.close()
+        # USB 设备掉线后需要一点时间重新枚举, 否则会拿到空列表
+        time.sleep(0.5)
+        self.open()
+        logger.info("相机已重新打开")
+
     def __enter__(self) -> "OrbbecCamera":
         self.open()
         return self

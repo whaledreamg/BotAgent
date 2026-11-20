@@ -1,0 +1,17 @@
+<?xml version='1.0'?>
+<resources>
+    <!--
+      去掉 Android 系统自带的标题栏（ActionBar）。
+
+      起因：AndroidManifest 里声明了 android:theme，应用就继承了设备的
+      默认主题 (Material + ActionBar)。系统会在窗口顶部画一条带应用名
+      （android:label）的白底标题栏，Qt 的主界面从它下面开始绘制，
+      于是最上方多出一条空白。
+
+      继承 NoActionBar 变体即可：系统不再绘制标题栏，Qt 自己的界面占满窗口。
+    -->
+    <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <!-- 启动瞬间到 Qt 渲染首帧之前的底色，跟应用浅色背景一致，避免闪白 -->
+        <item name="android:windowBackground">#F2F4F8</item>
+    </style>
+</resources>

@@ -7,6 +7,7 @@ from skill.builtin.tool_skills import (
     time_spec,
     date_spec,
     find_object_spec,
+    describe_scene_spec,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "time_spec",
     "date_spec",
     "find_object_spec",
+    "describe_scene_spec",
 ]

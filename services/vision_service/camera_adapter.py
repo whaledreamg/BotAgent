@@ -107,6 +107,14 @@ class CameraAdapter(ABC):
     def close(self) -> None:
         """停止数据流并释放资源。"""
 
+    def reopen(self) -> None:
+        """关掉再重新打开 —— USB 掉线后的恢复手段。
+
+        默认实现就是 close + open, 够用的相机不用覆盖。
+        """
+        self.close()
+        self.open()
+
     @abstractmethod
     def read(self, timeout_ms: Optional[int] = None) -> Optional[Frame]:
         """采一帧。超时返回 None。"""

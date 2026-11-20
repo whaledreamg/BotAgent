@@ -121,6 +121,23 @@ class JointLimit:
 
 
 @dataclass
+class GraspConfig:
+    """抓取移动 (/v1/move_to) 配置。"""
+
+    #: 默认运动时长 (秒)
+    duration: float = 3.0
+    #: 工作空间粗检: 目标到臂基座的最大距离 (米)
+    max_reach: float = 1.2
+    #: 各臂示教的抓取姿态 a/b/c (rad), key 为 left / right
+    orientation: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {
+            "left": {"a": 0.0, "b": 0.0, "c": 0.0},
+            "right": {"a": 0.0, "b": 0.0, "c": 0.0},
+        }
+    )
+
+
+@dataclass
 class ArmConfig:
     #: 机器人控制器的 WebSocket 控制面地址
     controller_ws: str = "ws://192.168.100.16:9000"
@@ -142,6 +159,7 @@ class ArmConfig:
     idle_stop_ms: int = 1000
     connect_timeout: float = 5.0
     play_timeout_ms: int = 15000
+    grasp: GraspConfig = field(default_factory=GraspConfig)
 
     @property
     def action_path(self) -> Path:
@@ -215,6 +233,17 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
 
     a = merged.get("arm", {})
     jl = a.get("joint_limit") or {}
+    gr = a.get("grasp") or {}
+
+    def _abc(side: str) -> Dict[str, float]:
+        raw = gr.get(side) or {}
+        return {k: float(raw.get(k, 0.0) or 0.0) for k in ("a", "b", "c")}
+
+    grasp = GraspConfig(
+        duration=float(gr.get("duration", 3.0)),
+        max_reach=float(gr.get("max_reach", 1.2)),
+        orientation={"left": _abc("left"), "right": _abc("right")},
+    )
     arm = ArmConfig(
         controller_ws=os.environ.get(
             "ARM_CONTROLLER_WS", a.get("controller_ws", "ws://192.168.100.16:9000")
@@ -236,6 +265,7 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         idle_stop_ms=int(os.environ.get("ARM_IDLE_STOP_MS", a.get("idle_stop_ms", 1000))),
         connect_timeout=float(a.get("connect_timeout", 5.0)),
         play_timeout_ms=int(a.get("play_timeout_ms", 15000)),
+        grasp=grasp,
     )
 
     s = merged.get("server", {})

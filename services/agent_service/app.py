@@ -82,8 +82,13 @@ class Service:
         self.registry.load(self.cfg, self.llm)
         
         # Phase 1-7：加载 Skill 目录
+        #
+        # configs/agent.yaml 的 skills.disabled 里列出的 skill 不注册 ——
+        # 模型看不见, 路由也找不到, 等于整个功能下线。
         self.skill_catalog = SkillCatalog()
-        load_all_skills(self.skill_catalog, self.llm)
+        load_all_skills(
+            self.skill_catalog, self.llm, disabled=self.cfg.disabled_skills,
+        )
         
         self.router = Router(self.cfg, self.registry, self.llm, self.skill_catalog)
         self.sessions = SessionStore(

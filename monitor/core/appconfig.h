@@ -44,6 +44,11 @@ struct AppConfig {
     /// 填了就作为所有服务与 WebSocket 的目标主机; 开始监控时以输入框
     /// 里的实际内容为准 (IP 或主机名都行)。
     QString defaultHost = QStringLiteral("127.0.0.1");
+    /// 手动指令用的 session id。
+    ///
+    /// 固定成独立的一个 (默认 monitor-ui), 这样手动输入的历史
+    /// **不会混进语音链路** 的 robot-01 会话里。
+    QString agentSessionId = QStringLiteral("monitor-ui");
     QVector<ServiceConfig> services;
     QVector<WsConfig> websockets;
 

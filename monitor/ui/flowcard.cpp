@@ -61,6 +61,14 @@ FlowCard::FlowCard(const QDateTime &startedAt, QWidget *parent)
     m_badge->setAlignment(Qt::AlignCenter);
     header->addWidget(m_badge);
 
+    // 「手动」徽标 —— 手动输入的轮次才显示 (ASR 语音轮次不显示)
+    m_manualBadge = new QLabel(QStringLiteral("手动"));
+    m_manualBadge->setObjectName(QStringLiteral("flowManualBadge"));
+    m_manualBadge->setVisible(false);
+    m_manualBadge->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    m_manualBadge->setAlignment(Qt::AlignCenter);
+    header->addWidget(m_manualBadge);
+
     header->addStretch(1);
 
     m_phase = new QLabel(QStringLiteral("进行中"));
@@ -122,6 +130,20 @@ void FlowCard::setAsrText(const QString &text)
     const QString t = text.trimmed();
     m_asrText = t;
     updateRow(m_asrRow, t);
+}
+
+void FlowCard::setManual(bool manual)
+{
+    m_manual = manual;
+    // 标题跟着切换 —— 手动输入的轮次不是「ASR 识别」出来的
+    m_asrRow.caption->setText(manual ? QStringLiteral("输入文本")
+                                      : QStringLiteral("ASR 识别"));
+    m_manualBadge->setVisible(manual);
+}
+
+QString FlowCard::phaseText() const
+{
+    return m_phase ? m_phase->text() : QString();
 }
 
 void FlowCard::setRoute(const QString &intent, const QString &by)

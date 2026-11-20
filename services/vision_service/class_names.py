@@ -114,23 +114,100 @@ ZH_TO_CLASS: Dict[str, str] = {
     "球拍": "tennis racket",
     "泰迪熊": "teddy bear",
     "泰迪": "teddy bear",
-    "熊": "teddy bear",
     "钟": "clock",
     "花瓶儿": "vase",
     "婴儿车": "stroller",
     "滑雪板儿": "skis",
-    "发卡": "hair drier",
     "吹风机": "hair drier",
     "计算器": "calculator",
     "蜡烛": "candle",
     "酒瓶": "bottle",
-    "咖啡机": "cup",
-    "灭火器": "fire hydrant",
-    "路牌": "stop sign",
     "停车计时器": "parking meter",
     "长椅": "bench",
     "长凳": "bench",
 }
+
+
+#: COCO 80 类 -> 规范中文名 (播报用, 一类一个)。
+#: 模型换成自定义类别时不受影响: 没在这里的类名原样播报。
+COCO_ZH: Dict[str, str] = {
+    "person": "人", "bicycle": "自行车", "car": "汽车", "motorcycle": "摩托车",
+    "airplane": "飞机", "bus": "公交车", "train": "火车", "truck": "卡车",
+    "boat": "船", "traffic light": "红绿灯", "fire hydrant": "消防栓",
+    "stop sign": "停车标志", "parking meter": "停车计时器", "bench": "长椅",
+    "bird": "鸟", "cat": "猫", "dog": "狗", "horse": "马", "sheep": "羊",
+    "cow": "牛", "elephant": "大象", "bear": "熊", "zebra": "斑马",
+    "giraffe": "长颈鹿", "backpack": "背包", "umbrella": "雨伞",
+    "handbag": "手提包", "tie": "领带", "suitcase": "行李箱",
+    "frisbee": "飞盘", "skis": "滑雪板", "snowboard": "单板滑雪板",
+    "sports ball": "球", "kite": "风筝", "baseball bat": "棒球棒",
+    "baseball glove": "棒球手套", "skateboard": "滑板", "surfboard": "冲浪板",
+    "tennis racket": "网球拍", "bottle": "瓶子", "wine glass": "酒杯",
+    "cup": "杯子", "fork": "叉子", "knife": "刀", "spoon": "勺子",
+    "bowl": "碗", "banana": "香蕉", "apple": "苹果", "sandwich": "三明治",
+    "orange": "橙子", "broccoli": "西兰花", "carrot": "胡萝卜",
+    "hot dog": "热狗", "pizza": "披萨", "donut": "甜甜圈", "cake": "蛋糕",
+    "chair": "椅子", "couch": "沙发", "potted plant": "盆栽", "bed": "床",
+    "dining table": "桌子", "toilet": "马桶", "tv": "电视",
+    "laptop": "笔记本电脑", "mouse": "鼠标", "remote": "遥控器",
+    "keyboard": "键盘", "cell phone": "手机", "microwave": "微波炉",
+    "oven": "烤箱", "toaster": "烤面包机", "sink": "水槽",
+    "refrigerator": "冰箱", "book": "书", "clock": "时钟", "vase": "花瓶",
+    "scissors": "剪刀", "teddy bear": "泰迪熊", "hair drier": "吹风机",
+    "toothbrush": "牙刷",
+}
+
+#: 补充说法 (口语别名) -> 类名, 与 ZH_TO_CLASS 合并。
+_EXTRA_ALIASES: Dict[str, str] = {
+    "红绿灯": "traffic light", "信号灯": "traffic light",
+    "消防栓": "fire hydrant", "灭火栓": "fire hydrant",
+    "停车标志": "stop sign", "停止标志": "stop sign", "路牌": "stop sign",
+    "大象": "elephant", "斑马": "zebra", "长颈鹿": "giraffe",
+    "领带": "tie", "飞盘": "frisbee", "单板滑雪板": "snowboard",
+    "风筝": "kite", "棒球手套": "baseball glove",
+    "酒杯": "wine glass", "高脚杯": "wine glass", "红酒杯": "wine glass",
+    "叉子": "fork", "刀": "knife", "刀子": "knife", "水果刀": "knife",
+    "勺子": "spoon", "汤匙": "spoon", "调羹": "spoon",
+    "碗": "bowl", "饭碗": "bowl", "热狗": "hot dog",
+    "盆栽": "potted plant", "花盆": "potted plant", "绿植": "potted plant",
+    "马桶": "toilet", "烤面包机": "toaster", "水槽": "sink", "洗手池": "sink",
+    "时钟": "clock", "挂钟": "clock", "牙刷": "toothbrush",
+    "吹风机": "hair drier", "电吹风": "hair drier",
+    "手套": "baseball glove", "熊": "bear", "棕熊": "bear",
+}
+
+def _build_reverse() -> Dict[str, str]:
+    """类名 -> 中文名。多个中文说法对应同一类名时, 取表里最先出现的 (规范说法)。"""
+    out: Dict[str, str] = {k.lower(): v for k, v in COCO_ZH.items()}
+    for zh, cls in ZH_TO_CLASS.items():
+        out.setdefault(cls.lower(), zh)
+    return out
+
+
+def _merge_aliases() -> None:
+    """把规范名和补充说法并进 ZH_TO_CLASS (已有的说法不覆盖)。"""
+    for cls, zh in COCO_ZH.items():
+        ZH_TO_CLASS.setdefault(zh, cls)
+    for zh, cls in _EXTRA_ALIASES.items():
+        ZH_TO_CLASS.setdefault(zh, cls)
+
+
+_merge_aliases()
+
+#: YOLO 类别名 -> 中文名 (播报用)
+CLASS_TO_ZH: Dict[str, str] = _build_reverse()
+
+
+def to_zh(label: str) -> str:
+    """YOLO 类别名 -> 中文名, 用于语音播报。
+
+    没有对应中文就原样返回: 自定义模型的类名本来就可能是中文
+    (见 docs/vision-training.md), 不应被改动。
+    """
+    if not label:
+        return label
+    key = label.strip()
+    return CLASS_TO_ZH.get(key.lower(), key)
 
 
 def translate(name: str) -> str:
@@ -246,4 +323,4 @@ def _strip_modifiers(name: str) -> List[str]:
     return out
 
 
-__all__ = ["ZH_TO_CLASS", "candidates", "translate"]
+__all__ = ["CLASS_TO_ZH", "COCO_ZH", "ZH_TO_CLASS", "candidates", "to_zh", "translate"]

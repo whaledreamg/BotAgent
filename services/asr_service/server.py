@@ -422,7 +422,7 @@ class VoiceASR(wakeup_asr.WakeupASR):
 
 
 class HealthHandler(BaseHTTPRequestHandler):
-    """提供 /health 与 /state 两个只读接口。"""
+    """提供 /health 与 /state 两个只读接口, 以及 /v1/submit 测试入口。"""
 
     pipeline: Pipeline = None  # type: ignore[assignment]
 
@@ -440,6 +440,33 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._send(self.pipeline.snapshot())
         else:
             self._send({"error": "not found", "path": path}, 404)
+
+    def do_POST(self):  # noqa: N802
+        """测试入口: 直接塞一段文本进流水线, 走完整的 ASR->Agent->TTS 链路。
+
+        麦克风不可用时 (CI / 远程开发机) 用它来验证整条链路。
+        """
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        if path != "/v1/submit":
+            self._send({"error": "not found", "path": path}, 404)
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            self._send({"error": f"invalid json: {exc}"}, 400)
+            return
+
+        text = (payload.get("text") or "").strip()
+        if not text:
+            self._send({"error": "missing text"}, 400)
+            return
+
+        record_ms = int(payload.get("record_ms") or 0)
+        self.pipeline.submit(text, record_ms=record_ms)
+        self._send({"ok": True, "text": text}, 202)
 
     def log_message(self, fmt, *args):  # 静音默认访问日志
         logger.debug("[http] " + fmt, *args)
