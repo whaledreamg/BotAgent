@@ -12,17 +12,7 @@ namespace {
 /// 状态圆点颜色 —— 与 StatusDelegate 保持一致。
 QColor colorForState(int state)
 {
-    switch (static_cast<ServiceState>(state)) {
-    case ServiceState::Online:
-        return QColor(0x2e, 0xcc, 0x71);
-    case ServiceState::Degraded:
-        return QColor(0xf1, 0xc4, 0x0f);
-    case ServiceState::Offline:
-        return QColor(0xe0, 0x53, 0x4d);
-    case ServiceState::Unknown:
-    default:
-        return QColor(0x9e, 0x9e, 0x9e);
-    }
+    return serviceStateColor(static_cast<ServiceState>(state));
 }
 
 QString stateTextFor(int state)

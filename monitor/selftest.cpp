@@ -3,11 +3,13 @@
 // 用法: monitor/build/botagent_monitor_selftest
 #include "core/agentclient.h"
 #include "core/appconfig.h"
+#include "core/qssmanager.h"
 #include "models/monitormodel.h"
 #include "models/thinkingmodel.h"
 #include "ui/asrstatusindicator.h"
 #include "ui/flowcard.h"
 #include "ui/flowpanel.h"
+#include "ui/servicedetaildialog.h"
 
 #include <QApplication>
 #include <QColor>
@@ -55,6 +57,9 @@ static void dumpTree(const ThinkingModel &model, const QModelIndex &parent, int 
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
+
+    // 加载全局样式 —— 自测要验证弹窗在**真实主题**下的排版。
+    QssManager::instance()->loadGlobalStyle();
 
     out << "========== 1. 配置 ==========\n";
     const AppConfig cfg = AppConfig::load();
@@ -664,6 +669,78 @@ int main(int argc, char *argv[])
             out << "  [FAIL] 重新读取拿不到保存后的 IP\n";
 
         QFile::remove(path);
+    }
+
+    out << "\n========== 10. 服务详情弹窗 ==========\n";
+    {
+        ServiceDetailDialog dlg;
+        QJsonObject js;
+        js.insert(QStringLiteral("status"), QStringLiteral("ok"));
+        js.insert(QStringLiteral("camera_connected"), true);
+        js.insert(QStringLiteral("latency"), 12);
+        js.insert(QStringLiteral("model"), QStringLiteral("yolo26n.pt"));
+        dlg.setService(QStringLiteral("Agent"), QStringLiteral("127.0.0.1"), 8800,
+                       QStringLiteral("正常"), QColor(0x2e, 0xcc, 0x71),
+                       12, QStringLiteral("model_loaded=true"),
+                       QString(), js);
+
+        // 弹窗要能画出来 (不崩)
+        QPixmap pm(780, 520);
+        pm.fill(QColor(255, 255, 255));
+        dlg.render(&pm);
+        if (!pm.isNull())
+            out << "  [PASS] 详情弹窗能正常渲染\n";
+        else
+            out << "  [FAIL] 详情弹窗渲染失败\n";
+
+        // 宽高比 3:2
+        const int w = dlg.width();
+        const int h = dlg.height();
+        const double ratio = double(w) / double(h > 0 ? h : 1);
+        if (ratio > 1.35 && ratio < 1.65)
+            out << "  [PASS] 弹窗比例合适 (" << w << "x" << h
+                << ", 宽高比 " << QString::number(ratio, 'f', 2) << ")\n";
+        else
+            out << "  [FAIL] 弹窗比例不对: " << w << "x" << h << "\n";
+
+        // JSON 要转义, 不能把 < > 当标签
+        QJsonObject tricky;
+        tricky.insert(QStringLiteral("note"), QStringLiteral("<script>alert(1)</script>"));
+        dlg.setService(QStringLiteral("X"), QStringLiteral("h"), 1,
+                       QStringLiteral("正常"), QColor(0x2e, 0xcc, 0x71),
+                       -1, QString(), QString(), tricky);
+        QPixmap pm2(780, 520);
+        pm2.fill(QColor(255, 255, 255));
+        dlg.render(&pm2);
+        if (!pm2.isNull())
+            out << "  [PASS] 含尖括号的 JSON 也能渲染\n";
+        else
+            out << "  [FAIL] 含尖括号的 JSON 渲染失败\n";
+
+        // ---- 存一张图, 方便肉眼确认排版 ----
+        {
+            QJsonObject full;
+            full.insert(QStringLiteral("status"), QStringLiteral("ok"));
+            full.insert(QStringLiteral("camera_connected"), true);
+            full.insert(QStringLiteral("detector_loaded"), true);
+            full.insert(QStringLiteral("model_loaded"), true);
+            full.insert(QStringLiteral("weights"), QStringLiteral("models/yolo/yolo26n.pt"));
+            full.insert(QStringLiteral("frame"), QStringLiteral("world"));
+            full.insert(QStringLiteral("latency_ms"), 12);
+            full.insert(QStringLiteral("extrinsic_configured"), true);
+            full.insert(QStringLiteral("errors"), QJsonArray());
+
+            ServiceDetailDialog shot;
+            shot.setService(QStringLiteral("Vision"), QStringLiteral("127.0.0.1"), 8803,
+                            QStringLiteral("正常"), QColor(0x2e, 0xcc, 0x71),
+                            12, QStringLiteral("camera_connected=true detector_loaded=true"),
+                            QString(), full);
+            shot.resize(780, 520);
+            shot.show();
+            const QString png = QDir::tempPath() + QStringLiteral("/svc_detail.png");
+            shot.grab().save(png);
+            out << "  截图: " << png << "\n";
+        }
     }
 
     out << "\n自测完成\n";

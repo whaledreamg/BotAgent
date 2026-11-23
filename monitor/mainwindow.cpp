@@ -10,6 +10,7 @@
 #include "ui/asrstatusindicator.h"
 #include "ui/flowcard.h"
 #include "ui/flowpanel.h"
+#include "ui/servicedetaildialog.h"
 #include "ui/servicebar.h"
 
 #include <QCloseEvent>
@@ -1224,31 +1225,18 @@ void MainWindow::onServiceBarClicked(const QString &name)
     if (!status)
         return;
 
-    QString text = QStringLiteral("%1 (%2:%3)\n状态: %4\n")
-                       .arg(status->name, status->host)
-                       .arg(status->port)
-                       .arg(status->stateText());
-    if (status->latencyMs >= 0)
-        text += QStringLiteral("延迟: %1 ms\n").arg(status->latencyMs);
-    if (!status->detail.isEmpty())
-        text += QStringLiteral("说明: %1\n").arg(status->detail);
-    if (!status->lastError.isEmpty())
-        text += QStringLiteral("错误: %1\n").arg(status->lastError);
-    if (!status->statusJson.isEmpty()) {
-        text += QStringLiteral("\n--- 原始状态 JSON ---\n");
-        text += QString::fromUtf8(
-            QJsonDocument(status->statusJson).toJson(QJsonDocument::Indented));
-    }
-
-    QMessageBox box(this);
-    box.setWindowTitle(QStringLiteral("%1 详情").arg(status->name));
-    box.setText(QStringLiteral("服务状态详情"));
-    box.setDetailedText(text);
-    box.setInformativeText(QStringLiteral("%1 · %2").arg(status->stateText(),
-                                                        status->detail.isEmpty()
-                                                            ? QStringLiteral("无附加信息")
-                                                            : status->detail));
-    box.exec();
+    // ---- 服务详情弹窗 ----
+    //
+    // 自己搭而不是用 QMessageBox: 后者的「详细信息」是个折叠区, 原始
+    // JSON 塞在里面既不好看 (比例字体会歪) 又不好读 (长行横向滚动)。
+    auto *dlg = new ServiceDetailDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setService(status->name, status->host, status->port,
+                    status->stateText(),
+                    serviceStateColor(status->state),
+                    status->latencyMs, status->detail, status->lastError,
+                    status->statusJson);
+    dlg->showFor(this);
 }
 
 // =====================================================

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QAbstractTableModel>
+#include <QColor>
 #include <QJsonObject>
 #include <QToolTip>
 #include <QVector>
@@ -12,6 +13,22 @@ enum class ServiceState {
     Degraded,   ///< 连上了但服务自报异常 (如 TTS 还在 loading)
     Offline,    ///< 连不上
 };
+
+/// 状态对应的颜色 —— 状态点 / 徽标 / 文字都用它, 保证各处一致。
+inline QColor serviceStateColor(ServiceState state)
+{
+    switch (state) {
+    case ServiceState::Online:
+        return QColor(0x2e, 0xcc, 0x71);
+    case ServiceState::Degraded:
+        return QColor(0xf1, 0xc4, 0x0f);
+    case ServiceState::Offline:
+        return QColor(0xe0, 0x53, 0x4d);
+    case ServiceState::Unknown:
+    default:
+        return QColor(0x9e, 0x9e, 0x9e);
+    }
+}
 
 /// 单个服务的监控快照。
 struct ServiceStatus {
