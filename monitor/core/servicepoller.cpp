@@ -13,9 +13,13 @@ ServicePoller::ServicePoller(QObject *parent)
     : QObject(parent)
     , m_nam(new QNetworkAccessManager(this))
     , m_timer(new QTimer(this))
+    , m_fastTimer(new QTimer(this))
 {
     m_timer->setInterval(m_intervalMs);
     connect(m_timer, &QTimer::timeout, this, &ServicePoller::onTimeout);
+
+    m_fastTimer->setInterval(m_fastIntervalMs);
+    connect(m_fastTimer, &QTimer::timeout, this, &ServicePoller::onFastTimeout);
 }
 
 ServicePoller::~ServicePoller()
@@ -32,6 +36,18 @@ ServicePoller::~ServicePoller()
 void ServicePoller::setServices(const QVector<ServiceConfig> &services)
 {
     m_services = services;
+
+    // 快速轮询的 URL 是按服务名算出来的 —— 服务列表变了 (换了 IP)
+    // 就得跟着重算, 否则快速轮询还在打老地址。
+    if (!m_fastServiceName.isEmpty()) {
+        m_fastUrl.clear();
+        for (const ServiceConfig &svc : m_services) {
+            if (svc.name == m_fastServiceName) {
+                m_fastUrl = svc.baseUrl() + m_fastPath;
+                break;
+            }
+        }
+    }
 }
 
 void ServicePoller::setInterval(int intervalMs)
@@ -62,6 +78,66 @@ void ServicePoller::stop()
 bool ServicePoller::isRunning() const
 {
     return m_timer->isActive();
+}
+
+// ------------------------------------------------------------ 快速轮询
+
+void ServicePoller::setFastTarget(const QString &serviceName, const QString &path,
+                                  int intervalMs)
+{
+    m_fastServiceName = serviceName;
+    m_fastPath = path.isEmpty() ? QStringLiteral("/health") : path;
+    m_fastIntervalMs = qMax(100, intervalMs);
+    m_fastTimer->setInterval(m_fastIntervalMs);
+
+    // URL 由「服务列表」里那一条算出来 —— 这样换 IP 时跟着变。
+    m_fastUrl.clear();
+    for (const ServiceConfig &svc : m_services) {
+        if (svc.name == serviceName) {
+            m_fastUrl = svc.baseUrl() + m_fastPath;
+            break;
+        }
+    }
+}
+
+void ServicePoller::startFast()
+{
+    if (m_fastServiceName.isEmpty())
+        return;
+    if (!m_fastTimer->isActive()) {
+        m_fastTimer->start();
+        // 立刻取一次, 别让用户等一个间隔才看到状态。
+        onFastTimeout();
+    }
+}
+
+void ServicePoller::stopFast()
+{
+    m_fastTimer->stop();
+}
+
+bool ServicePoller::isFastRunning() const
+{
+    return m_fastTimer->isActive();
+}
+
+void ServicePoller::onFastTimeout()
+{
+    if (m_fastUrl.isEmpty())
+        return;
+
+    QNetworkRequest req{QUrl(m_fastUrl)};
+    req.setRawHeader("Accept", "application/json");
+    req.setTransferTimeout(m_timeoutMs);
+
+    QNetworkReply *reply = m_nam->get(req);
+    Request r;
+    r.serviceName = m_fastServiceName;
+    r.isHealth = true;
+    r.isFast = true;
+    r.startedMs = QDateTime::currentMSecsSinceEpoch();
+    m_pending.insert(reply, r);
+    connect(reply, &QNetworkReply::finished, this, &ServicePoller::onReplyFinished);
 }
 
 void ServicePoller::onTimeout()
@@ -188,6 +264,11 @@ void ServicePoller::onReplyFinished()
     // ---- 失败: 连不上 / 超时 / 非 2xx ----
     if (reply->error() != QNetworkReply::NoError) {
         const QString err = reply->errorString();
+        if (req.isFast) {
+            // 快速轮询失败 —— 走它自己的信号, 不干扰普通轮询的判定。
+            emit fastFailed(req.serviceName, err);
+            return;
+        }
         if (req.isHealth) {
             emit serviceFailed(req.serviceName, err);
         } else {
@@ -205,6 +286,14 @@ void ServicePoller::onReplyFinished()
         const QJsonDocument doc = QJsonDocument::fromJson(body);
         if (doc.isObject())
             json = doc.object();
+    }
+
+    // ---- 快速轮询 ----
+    //
+    // 只把快照原样发出去 —— 状态判定由普通轮询负责, 这里不重复判定。
+    if (req.isFast) {
+        emit fastSnapshot(req.serviceName, json);
+        return;
     }
 
     if (!req.isHealth) {

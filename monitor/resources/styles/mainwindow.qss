@@ -282,6 +282,69 @@ QLabel#flowSystemEvent {
 }
 
 /* =====================================================
+ * 识别状态列 (中间那一栏)
+ * ===================================================== */
+
+/* 三态动画控件 —— 自身不画背景, 动画是 QPainter 现画的 */
+AsrStatusIndicator {
+    background-color: transparent;
+    border: none;
+}
+
+/* 标注图预览 */
+QLabel#visionImagePreview,
+QLabel#lblVisionImage {
+    color: #8A93A6;
+    background-color: rgba(74, 144, 226, 14);
+    border: 1px solid rgba(74, 144, 226, 45);
+    border-radius: 8px;
+    font-size: 8pt;
+}
+
+/* 「识别一次」按钮 —— 主操作, 颜色比别的按钮重一点 */
+QPushButton#btnDetect {
+    background-color: rgba(74, 144, 226, 210);
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 12px;
+    font-size: 9pt;
+    font-weight: bold;
+}
+
+QPushButton#btnDetect:hover {
+    background-color: rgba(74, 144, 226, 240);
+}
+
+QPushButton#btnDetect:pressed {
+    background-color: rgba(74, 144, 226, 180);
+}
+
+QPushButton#btnDetect:disabled {
+    background-color: rgba(150, 160, 180, 120);
+    color: rgba(255, 255, 255, 160);
+}
+
+/* 图像识别结果列表 */
+QListWidget#listVision {
+    color: #1E1E1E;
+    background-color: rgba(255, 255, 255, 245);
+    border: 1px solid rgba(200, 210, 230, 200);
+    border-radius: 8px;
+    font-size: 9pt;
+}
+
+QListWidget#listVision::item {
+    padding: 3px 4px;
+    border-bottom: 1px solid rgba(200, 210, 230, 90);
+}
+
+QListWidget#listVision::item:selected {
+    background-color: rgba(74, 144, 226, 40);
+    color: #1E1E1E;
+}
+
+/* =====================================================
  * 手动指令输入区 (底部状态栏上方)
  *
  * 参考 Cursor 的输入框:
@@ -391,6 +454,7 @@ QPushButton#btnSend:disabled {
  * 三面板分组框
  * ===================================================== */
 
+QGroupBox#statusGroup,
 QGroupBox#eventGroup,
 QGroupBox#thinkingGroup {
     background-color: rgba(255, 255, 255, 235);
@@ -400,6 +464,7 @@ QGroupBox#thinkingGroup {
     padding: 8px;
 }
 
+QGroupBox#statusGroup::title,
 QGroupBox#eventGroup::title,
 QGroupBox#thinkingGroup::title {
     subcontrol-origin: margin;

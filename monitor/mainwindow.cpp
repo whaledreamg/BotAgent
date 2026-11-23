@@ -3,9 +3,11 @@
 
 #include "core/agentclient.h"
 #include "core/servicepoller.h"
+#include "core/visionclient.h"
 #include "core/wsclient.h"
 #include "models/monitormodel.h"
 #include "models/thinkingmodel.h"
+#include "ui/asrstatusindicator.h"
 #include "ui/flowcard.h"
 #include "ui/flowpanel.h"
 #include "ui/servicebar.h"
@@ -18,12 +20,20 @@
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
+#include <QListWidgetItem>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QPixmap>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QTreeView>
+#include <QUrl>
 
 namespace {
 
@@ -76,6 +86,14 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onServiceFailed);
     connect(m_poller, &ServicePoller::pollCountChanged,
             this, &MainWindow::onPollCountChanged);
+
+    // ---- 快速轮询 (语音识别三态动画用) ----
+    //
+    // 普通轮询 2 秒一次, 画动画太慢 —— 单独开一路 250ms 的。
+    connect(m_poller, &ServicePoller::fastSnapshot,
+            this, &MainWindow::onFastSnapshot);
+    connect(m_poller, &ServicePoller::fastFailed,
+            this, &MainWindow::onFastFailed);
 
     connect(m_wsClient, &WsClient::eventReceived,
             this, &MainWindow::onEventReceived);
@@ -130,6 +148,48 @@ MainWindow::MainWindow(QWidget *parent)
         shadow->setColor(QColor(30, 40, 70, 24));
         ui->editCommand->setGraphicsEffect(shadow);
     }
+
+    // ---- 中间那一列: 语音识别动画 + 图像识别结果 ----
+    //
+    // 布局 (从上到下):
+    //   语音识别三态动画
+    //   「识别一次」按钮 + 状态提示
+    //   标注图预览 (缩放显示, 识别完自动刷新)
+    //   识别到的物体列表
+    //
+    // **不轮询** —— 识别只在用户点按钮时发生 (或者别处触发
+    // 的一次性检测), 结果靠 WebSocket 广播回来。
+    m_listVision = ui->listVision;
+    m_imageNam = new QNetworkAccessManager(this);
+    connect(m_listVision, &QListWidget::itemClicked,
+            this, &MainWindow::onVisionItemClicked);
+
+    m_lblVisionImage = ui->lblVisionImage;
+    m_lblVisionStatus = ui->lblVisionStatus;
+    m_btnDetect = ui->btnDetect;
+    connect(m_btnDetect, &QPushButton::clicked, this, &MainWindow::onDetectClicked);
+
+    // 标注图用「缩放显示」而不是「原图大小」——
+    // 相机出图 640x400, 直接塞进来会把这一列撑开。
+    m_lblVisionImage->setScaledContents(false);
+    m_lblVisionImage->setAlignment(Qt::AlignCenter);
+    m_lblVisionImage->setMinimumHeight(140);
+
+    m_visionClient = new VisionClient(this);
+    connect(m_visionClient, &VisionClient::failed, this, [this](const QString &err) {
+        if (m_btnDetect)
+            m_btnDetect->setEnabled(true);
+        if (m_lblVisionStatus)
+            m_lblVisionStatus->setText(QStringLiteral("识别失败: %1").arg(err));
+    });
+
+    // ---- 三栏的宽度比例 ----
+    //
+    // 对话流程最宽 (卡片要放整句话), 思考过程次之 (树里的内容能看
+    // tooltip), 识别状态最窄 (动画 + 标注图 + 列表)。
+    ui->mainSplitter->setStretchFactor(0, 45);
+    ui->mainSplitter->setStretchFactor(1, 35);
+    ui->mainSplitter->setStretchFactor(2, 20);
 
     applyConfig();
     updateOverview();
@@ -308,8 +368,38 @@ void MainWindow::applyHost()
     }
     m_agentClient->setBaseUrl(QStringLiteral("http://%1:%2").arg(host).arg(agentPort));
 
+    // ---- 视觉服务地址 (拉标注图 / 触发识别时要用) ----
+    m_visionHost = host;
+    m_visionPort = 8803;
+    for (const ServiceConfig &svc : services) {
+        if (svc.name.compare(QStringLiteral("Vision"), Qt::CaseInsensitive) == 0) {
+            m_visionPort = svc.port;
+            break;
+        }
+    }
+    m_visionClient->setBaseUrl(
+        QStringLiteral("http://%1:%2").arg(host).arg(m_visionPort));
+
     m_currentHost = host;
+    // 换了地址 -> 之前存的那份作废, 连上后要重新存。
+    m_hostSaved = false;
     qInfo("[监控] 目标地址已切换到 %s", qPrintable(host));
+}
+
+/// 把当前 IP 持久化到 config.json。
+///
+/// **只在真正连上之后调** —— 连不上的地址不该被记住, 否则下次启动
+/// 会指向一个根本连不通的地方。
+void MainWindow::saveHost(const QString &host)
+{
+    const QString h = host.trimmed();
+    if (h.isEmpty() || m_hostSaved)
+        return;
+
+    AppConfig cfg = AppConfig::load();
+    cfg.defaultHost = h;
+    if (AppConfig::save(cfg))
+        m_hostSaved = true;
 }
 
 void MainWindow::setMonitoring(bool on)
@@ -320,14 +410,30 @@ void MainWindow::setMonitoring(bool on)
 
         m_poller->start();
         m_wsClient->start();
+
+        // ---- 快速轮询 (语音识别三态动画) ----
+        //
+        // 只盯 ASR 的 /health, 250ms 一次 —— 普通轮询 2 秒太慢,
+        // 动画会一顿一顿的。
+        m_poller->setFastTarget(QStringLiteral("ASR"),
+                                QStringLiteral("/health"), 250);
+        m_poller->startFast();
     } else {
         m_poller->stop();
+        m_poller->stopFast();
         m_wsClient->stop();
 
         // 停止监控时重置 ASR 基线 —— 否则重新开始监控后,
         // ASR /health 里残留的「上一轮」会被当成新一轮显示出来。
         m_turnStarted = false;
         m_asrBaselineText.clear();
+        m_lastRecResultKey.clear();
+        m_asrPrimed = false;
+        m_asrDoneShown = false;
+
+        // 动画回到「未连接」, 别停在一个过时的状态上。
+        ui->asrIndicator->setState(AsrStatusIndicator::State::Offline,
+                                   QStringLiteral("监控已停止"));
     }
 
     ui->btnToggle->setText(on ? QStringLiteral("暂停监控")
@@ -419,6 +525,13 @@ void MainWindow::onServiceUpdated(const QString &name, int state, int latencyMs,
     m_monitorModel->updateStatus(name, state, latencyMs, detail, rawStatus, statusJson);
     m_serviceBar->updateService(name, state, detail, latencyMs);
     updateOverview();
+
+    // ---- 连上了 -> 把这个 IP 存下来 ----
+    //
+    // state >= Online (1) 表示这个服务真的应答了 —— 这时候记下 IP
+    // 才有意义。连不上的地址不该被记住。
+    if (state >= static_cast<int>(ServiceState::Online))
+        saveHost(m_currentHost);
 
     // ASR 的 /health 快照里带着「最近一轮」的完整信息 ——
     // 这是 ASR 识别文本和 TTS 播报的**唯一**来源 (ASR 服务没有 WS 推送)。
@@ -530,7 +643,29 @@ void MainWindow::onEventReceived(const QString &source, const QJsonObject &event
         return;
     }
 
-    // ---- Arm / Vision: 不属于对话流程, 归到「系统事件」 ----
+    // ---- Vision: 刷新「图像识别结果」区域 ----
+    //
+    // 每次 detection 是一次完整快照 —— 列表整个换掉, 标注图自动刷新。
+    //
+    // **不进系统事件流** —— 识别结果有自己的展示区 (标注图 + 列表),
+    // 再往对话流程里塞一条只是噪音。
+    if (source == QStringLiteral("Vision")) {
+        const QString type = event.value(QStringLiteral("type")).toString();
+        if (type == QStringLiteral("detection")) {
+            updateVisionList(event);
+        } else if (type == QStringLiteral("error")) {
+            if (m_lblVisionStatus) {
+                m_lblVisionStatus->setText(
+                    QStringLiteral("识别失败: %1")
+                        .arg(event.value(QStringLiteral("message")).toString()));
+            }
+            if (m_btnDetect)
+                m_btnDetect->setEnabled(true);
+        }
+        return;
+    }
+
+    // ---- Arm: 不属于对话流程, 归到「系统事件」 ----
     ui->scrollFlow->appendSystemEvent(source, summarize(source, event));
 }
 
@@ -700,26 +835,338 @@ void MainWindow::updateFromAsrSnapshot(const QJsonObject &snapshot)
         card->setAsrTiming(timings);
 }
 
+// ------------------------------------------------------------ 三态动画
+
+void MainWindow::onFastSnapshot(const QString &name, const QJsonObject &json)
+{
+    if (name != QStringLiteral("ASR"))
+        return;
+    updateAsrIndicator(json);
+}
+
+void MainWindow::onFastFailed(const QString &name, const QString &error)
+{
+    if (name != QStringLiteral("ASR"))
+        return;
+    // 错误详情放在 tooltip 里 —— 动画区只有一行, 塞不下长串错误。
+    ui->asrIndicator->setToolTip(error);
+    ui->asrIndicator->setState(AsrStatusIndicator::State::Offline,
+                               QStringLiteral("连不上 ASR"));
+}
+
+/// 根据 ASR 的 /health 快照更新三态动画。
+///
+/// 三态怎么判 (顺序很重要):
+///
+/// 1. **识别中** —— ``rec_state == "RECORDING"``。
+///    ASR 已唤醒, 正在录用户的语音。
+/// 2. **识别完成** —— ``rec_result`` 比上一次「新」。
+///    ASR 在识别完的那一瞬间就写了这个标记 (不等 Agent) ——
+///    所以这里能第一时间显示「识别完成」。
+/// 3. **等待唤醒** —— 其余情况。
+void MainWindow::updateAsrIndicator(const QJsonObject &snapshot)
+{
+    if (snapshot.isEmpty())
+        return;
+
+    const QString recState = snapshot.value(QStringLiteral("rec_state")).toString();
+    const QJsonObject recResult =
+        snapshot.value(QStringLiteral("rec_result")).toObject();
+
+    // ---- 「识别完成」的标记 ----
+    //
+    // rec_result 一直在快照里 (ASR 不清它), 所以光看「有没有 rec_result」
+    // 分不出「刚识别完」和「上次会话就识别完了」。
+    //
+    // 用 (turn, at) 当钥匙, 记住上一次看到的值 —— 值变了才是「刚完成」。
+    const QString key = recResult.isEmpty()
+        ? QString()
+        : QStringLiteral("%1|%2")
+              .arg(recResult.value(QStringLiteral("turn")).toInt())
+              .arg(recResult.value(QStringLiteral("at")).toDouble(), 0, 'f', 3);
+
+    bool justDone = false;
+    if (!key.isEmpty()) {
+        if (m_asrPrimed && key != m_lastRecResultKey) {
+            // 真的刚完成 (第一次快照除外, 见下)
+            justDone = true;
+        }
+        m_lastRecResultKey = key;
+    }
+    m_asrPrimed = true;
+
+    if (justDone) {
+        const QString text = recResult.value(QStringLiteral("text")).toString();
+        m_asrDoneShown = true;
+        ui->asrIndicator->setState(
+            AsrStatusIndicator::State::Done,
+            text.isEmpty() ? QStringLiteral("识别完成") : text);
+        return;
+    }
+
+    // ---- 「识别完成」的展示期 ----
+    //
+    // 动画自己会停留 2 秒再淡出回「等待」。这期间**不能**被下一轮
+    // 轮询 (250ms 一次) 覆盖掉 —— 否则「识别完成」一闪而过, 根本看不见。
+    //
+    // 所以这里加一道锁: 展示期内只让「开始新录音」打断它。
+    if (m_asrDoneShown) {
+        if (recState == QStringLiteral("RECORDING")) {
+            // 用户又开始说了 —— 回到「识别中」。
+            m_asrDoneShown = false;
+            ui->asrIndicator->setState(AsrStatusIndicator::State::Recording,
+                                       QStringLiteral("正在录音…"));
+            return;
+        }
+        // 动画已经自己淡回「等待」了 -> 解锁, 继续往下走。
+        if (ui->asrIndicator->state() == AsrStatusIndicator::State::Waiting) {
+            m_asrDoneShown = false;
+        } else {
+            return;   // 还在展示「识别完成」, 别动它
+        }
+    }
+
+    // ---- 识别中? ----
+    if (recState == QStringLiteral("RECORDING")) {
+        ui->asrIndicator->setState(AsrStatusIndicator::State::Recording,
+                                   QStringLiteral("正在录音…"));
+        return;
+    }
+
+    // ---- 等待唤醒 ----
+    //
+    // 顺便把流水线状态也带出来 —— 用户想看的是「现在到哪一步了」。
+    const QString state = snapshot.value(QStringLiteral("state")).toString();
+    QString detail;
+    if (state == QStringLiteral("THINK"))
+        detail = QStringLiteral("等待 Agent 分流…");
+    else if (state == QStringLiteral("SAY"))
+        detail = QStringLiteral("正在播报…");
+    else
+        detail = QStringLiteral("等待唤醒词…");
+
+    ui->asrIndicator->setState(AsrStatusIndicator::State::Waiting, detail);
+}
+
+// ------------------------------------------------------------ 图像识别结果
+
+namespace {
+
+/// 把服务端的 ISO 时间戳压成「时分秒」。
+///
+/// 服务端给的是 ``2026-11-23T17:10:03.123456`` —— 列表里显示全串
+/// 太长, 毫秒和日期用不上, 只留时分秒。
+///
+/// 解析不了就**原样返回** —— 万一服务端换了格式, 至少还能看到
+/// 点什么, 总比空着强。
+QString formatTimestamp(const QString &iso)
+{
+    if (iso.isEmpty())
+        return QStringLiteral("--:--:--");
+
+    QDateTime dt = QDateTime::fromString(iso, Qt::ISODateWithMs);
+    if (!dt.isValid())
+        dt = QDateTime::fromString(iso, Qt::ISODate);
+    if (!dt.isValid())
+        return iso;
+
+    return dt.toString(QStringLiteral("HH:mm:ss"));
+}
+
+}  // namespace
+
+void MainWindow::updateVisionList(const QJsonObject &event)
+{
+    if (!m_listVision)
+        return;
+
+    // Vision 的 detection 事件字段是**平铺**的 (不在 payload 里)。
+    const QJsonArray objects = event.value(QStringLiteral("objects")).toArray();
+
+    // 每次 detection 是一次**完整快照** —— 整个列表换掉。
+    m_listVision->clear();
+
+    if (objects.isEmpty()) {
+        m_listVision->addItem(QStringLiteral("(未识别到物体)"));
+        if (m_lblVisionStatus)
+            m_lblVisionStatus->setText(QStringLiteral("识别完成 · 未发现物体"));
+        return;
+    }
+
+    for (const QJsonValue &v : objects) {
+        const QJsonObject o = v.toObject();
+
+        const int index = o.value(QStringLiteral("index")).toInt();
+        const QString label = o.value(QStringLiteral("label")).toString();
+        const QString labelZh = o.value(QStringLiteral("label_zh")).toString();
+        const double confidence = o.value(QStringLiteral("confidence")).toDouble();
+        const QString recordId = o.value(QStringLiteral("record_id")).toString();
+        const QString imageFile = o.value(QStringLiteral("image_filename")).toString();
+        const QString timestamp = o.value(QStringLiteral("timestamp")).toString();
+
+        // 显示: 序号 + 物体名 + 识别率 + 时间戳
+        //
+        // 类别名优先用中文 (label_zh), 没有就退回英文 label。
+        // 追溯编号和图片路径是内部细节, 不摆在这儿 (那只是噪音) ——
+        // 但要看某个目标的单框图, 点一下列表项就行。
+        QString text;
+        if (index > 0)
+            text += QStringLiteral("#%1").arg(index);
+        else
+            text += QStringLiteral("#-");
+        const QString name = labelZh.isEmpty() ? label : labelZh;
+        if (!name.isEmpty())
+            text += QStringLiteral(" %1").arg(name);
+        if (confidence > 0.0)
+            text += QStringLiteral(" %1%").arg(confidence * 100, 0, 'f', 0);
+        text += QStringLiteral(" %1").arg(formatTimestamp(timestamp));
+
+        auto *item = new QListWidgetItem(text, m_listVision);
+        // 原始数据挂在 item 上 —— 点开大图时要用。
+        item->setData(Qt::UserRole, recordId);
+        item->setData(Qt::UserRole + 1, imageFile);
+        item->setData(Qt::UserRole + 2, o.value(QStringLiteral("bbox")));
+        // tooltip 里补上英文类名 —— 中文名是翻译过的, 想看模型
+        // 原始输出时能对照。
+        if (!label.isEmpty() && label != name) {
+            item->setToolTip(QStringLiteral("%1 (%2) · 识别率 %3%")
+                                 .arg(name, label)
+                                 .arg(confidence * 100, 0, 'f', 0));
+        }
+    }
+
+    // ---- 状态提示 ----
+    if (m_lblVisionStatus) {
+        m_lblVisionStatus->setText(
+            QStringLiteral("识别完成 · %1 个目标").arg(objects.size()));
+    }
+
+    // ---- 自动显示标注图 ----
+    //
+    // **不再要点一下才出图** —— 识别完直接把那张画了所有框的
+    // 整图拉下来缩放显示。
+    //
+    // 优先用整图 (`annotated_image`); 服务端没有 (老版本) 就退回
+    // 用第一个物体的那张单框图。
+    const QString annotated = event.value(QStringLiteral("annotated_image")).toString();
+    if (!annotated.isEmpty()) {
+        showVisionImage(annotated);
+    } else if (!objects.isEmpty()) {
+        const QString fallback =
+            objects.first().toObject().value(QStringLiteral("image_filename")).toString();
+        if (!fallback.isEmpty())
+            showVisionImage(fallback);
+    }
+}
+
+void MainWindow::showVisionImage(const QString &imageFile)
+{
+    if (imageFile.isEmpty() || !m_imageNam || !m_lblVisionImage)
+        return;
+
+    // 视觉服务的追溯图像接口: /v1/traces/image/<相对路径>
+    const QString url = QStringLiteral("http://%1:%2/v1/traces/image/%3")
+                            .arg(m_visionHost)
+                            .arg(m_visionPort)
+                            .arg(QUrl::toPercentEncoding(imageFile));
+
+    m_lblVisionImage->setText(QStringLiteral("正在加载…"));
+
+    QNetworkRequest req{QUrl(url)};
+    req.setTransferTimeout(8000);
+    QNetworkReply *reply = m_imageNam->get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            m_lblVisionImage->setPixmap(QPixmap());
+            m_lblVisionImage->setText(
+                QStringLiteral("加载失败: %1").arg(reply->errorString()));
+            return;
+        }
+        QPixmap pix;
+        if (!pix.loadFromData(reply->readAll())) {
+            m_lblVisionImage->setPixmap(QPixmap());
+            m_lblVisionImage->setText(QStringLiteral("图像解码失败"));
+            return;
+        }
+        // 缩到预览区大小 —— 别让一张大图把布局撑开。
+        //
+        // 宽度按**实际控件宽度**算 (不是当前 width, 那时候布局
+        // 可能还没算完), 高度留个上限。
+        const int availW = qMax(120, m_lblVisionImage->width() - 8);
+        const int availH = qMax(120, m_lblVisionImage->height() - 8);
+        m_lblVisionImage->setPixmap(pix.scaled(
+            availW, availH, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    });
+}
+
+void MainWindow::onVisionItemClicked(QListWidgetItem *item)
+{
+    if (!item)
+        return;
+
+    const QString imageFile = item->data(Qt::UserRole + 1).toString();
+    if (imageFile.isEmpty()) {
+        if (m_lblVisionImage) {
+            m_lblVisionImage->setPixmap(QPixmap());
+            m_lblVisionImage->setText(QStringLiteral("(该结果没有保存图像)"));
+        }
+        return;
+    }
+
+    showVisionImage(imageFile);
+}
+
+void MainWindow::onDetectClicked()
+{
+    if (!m_visionClient)
+        return;
+
+    if (m_btnDetect)
+        m_btnDetect->setEnabled(false);
+    if (m_lblVisionStatus)
+        m_lblVisionStatus->setText(QStringLiteral("识别中…"));
+
+    // 结果走 WebSocket 广播回来 (所有订阅者都看得到同一帧)。
+    // HTTP 这条路只是「把这次检测跑起来」。
+    m_visionClient->detect();
+}
+
 QString MainWindow::summarize(const QString &source, const QJsonObject &event)
 {
     const QString type = event.value(QStringLiteral("type")).toString();
     const QJsonObject payload = event.value(QStringLiteral("payload")).toObject();
 
+    // ---- 取字段: 平铺 or 嵌在 payload 里 ----
+    //
+    // 三种服务的信封格式不一样:
+    //   - Agent:  ``{"type":..., "payload": {...}}``      (嵌在 payload 里)
+    //   - Arm:    ``{"type":"state", "phase":..., ...}``  (平铺)
+    //   - Vision: ``{"type":"detection", "objects":[...]}`` (平铺)
+    //
+    // 之前 Arm/Vision 都按 payload 读 -> 永远读到空对象,
+    // 界面上一直显示「检测到 0 个物体」。这里两种都支持。
+    const auto field = [&event, &payload](const QString &key) -> QJsonValue {
+        if (event.contains(key))
+            return event.value(key);
+        return payload.value(key);
+    };
+
     if (source == QStringLiteral("Arm")) {
         if (type == QStringLiteral("state"))
             return QStringLiteral("%1 | %2")
-                .arg(payload.value(QStringLiteral("phase")).toString(),
-                     payload.value(QStringLiteral("detail")).toString());
+                .arg(field(QStringLiteral("phase")).toString(),
+                     field(QStringLiteral("detail")).toString());
         if (type == QStringLiteral("finished"))
             return QStringLiteral("动作播放结束");
         if (type == QStringLiteral("error"))
-            return payload.value(QStringLiteral("message")).toString();
+            return field(QStringLiteral("message")).toString();
         return QString();
     }
 
     if (source == QStringLiteral("Vision")) {
         if (type == QStringLiteral("detection")) {
-            const QJsonArray objects = payload.value(QStringLiteral("objects")).toArray();
+            const QJsonArray objects = field(QStringLiteral("objects")).toArray();
             QStringList names;
             for (const QJsonValue &v : objects) {
                 const QJsonObject o = v.toObject();
@@ -730,10 +1177,10 @@ QString MainWindow::summarize(const QString &source, const QJsonObject &event)
             return QStringLiteral("检测到 %1 个物体: %2 (%3ms)")
                 .arg(objects.size())
                 .arg(names.join(QStringLiteral(", ")))
-                .arg(payload.value(QStringLiteral("latency_ms")).toInt());
+                .arg(field(QStringLiteral("latency_ms")).toInt());
         }
         if (type == QStringLiteral("error"))
-            return payload.value(QStringLiteral("message")).toString();
+            return field(QStringLiteral("message")).toString();
         return QString();
     }
 

@@ -3,6 +3,7 @@ HEADERS += \
     $$PWD/appconfig.h \
     $$PWD/servicepoller.h \
     $$PWD/agentclient.h \
+    $$PWD/visionclient.h \
     $$PWD/wsclient.h
 
 SOURCES += \
@@ -10,4 +11,5 @@ SOURCES += \
     $$PWD/appconfig.cpp \
     $$PWD/servicepoller.cpp \
     $$PWD/agentclient.cpp \
+    $$PWD/visionclient.cpp \
     $$PWD/wsclient.cpp

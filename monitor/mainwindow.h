@@ -14,6 +14,7 @@ QT_END_NAMESPACE
 
 class QEvent;
 class QKeyEvent;
+class QListWidgetItem;
 
 class AgentClient;
 class FlowCard;
@@ -22,6 +23,7 @@ class MonitorModel;
 class ServiceBar;
 class ServicePoller;
 class ThinkingModel;
+class VisionClient;
 class WsClient;
 
 /// BotAgent 监控主窗口。
@@ -95,11 +97,22 @@ private slots:
     /// 点击底部服务胶囊 -> 弹原始 JSON 详情。
     void onServiceBarClicked(const QString &name);
 
+    // ===== 快速轮询 (语音识别三态动画) =====
+    /// ASR 的 /health 高频快照 -> 更新三态动画。
+    void onFastSnapshot(const QString &name, const QJsonObject &json);
+    /// 快速轮询失败 -> 动画切到「未连接」。
+    void onFastFailed(const QString &name, const QString &error);
+
 private:
     /// 读配置并把服务名灌进模型。
     void applyConfig();
     /// 把「监控 IP」输入框里的地址套用到所有服务与 WebSocket 上。
     void applyHost();
+    /// 把当前 IP **持久化** 到 config.json。
+    ///
+    /// 只在**真正连上之后**调 —— 连不上就别存, 否则下次启动会指向
+    /// 一个连不上的地址。
+    void saveHost(const QString &host);
     /// 监控总开关 —— 统一起停轮询与 WebSocket, 并同步 UI。
     void setMonitoring(bool on);
     /// 找到「本轮」对应的卡片; 没有就新建一张。
@@ -116,6 +129,32 @@ private:
     void updateOverview();
     /// 刷新底部状态栏的 WS 连接状态。
     void updateWsStatus();
+
+    // ===== 语音识别三态动画 =====
+
+    /// 根据 ASR 快照更新三态动画。
+    ///
+    /// 三态怎么判:
+    ///   - **识别中**: ``rec_state == "RECORDING"`` (已唤醒, 在录音)
+    ///   - **识别完成**: ``rec_result`` 刚更新过 (识别那一刻就写进来了)
+    ///   - **等待唤醒**: 其余情况
+    void updateAsrIndicator(const QJsonObject &snapshot);
+
+    /// 根据 Vision 的 detection 事件刷新「图像识别结果」区域。
+    ///
+    /// 每次 detection 是一次**完整快照** (不是增量) —— 所以整个列表替换掉。
+    void updateVisionList(const QJsonObject &event);
+
+    /// 拉取并显示标注图 (缩放到预览区大小)。
+    ///
+    /// @param imageFile  相对 trace_root 的图片路径 (如 ``20261123_101010_123/_annotated.jpg``)
+    void showVisionImage(const QString &imageFile);
+
+    /// 点图像识别结果 -> 去视觉服务拉那张标注图并显示。
+    void onVisionItemClicked(QListWidgetItem *item);
+
+    /// 点「识别一次」-> 触发一次视觉检测。
+    void onDetectClicked();
 
     // ===== 平板适配 =====
     ///
@@ -149,6 +188,8 @@ private:
     WsClient *m_wsClient = nullptr;
     /// 手动指令客户端 (POST /v1/dispatch)。
     AgentClient *m_agentClient = nullptr;
+    /// 视觉服务客户端 (POST /v1/detect) —— 按需触发识别。
+    VisionClient *m_visionClient = nullptr;
 
     // ---- 视图 ----
     ServiceBar *m_serviceBar = nullptr;
@@ -161,6 +202,11 @@ private:
 
     /// 当前实际生效的目标 IP (最后一次 applyHost 时用的)。
     QString m_currentHost;
+
+    /// 当前 IP 是否已经**存进 config.json** 了。
+    ///
+    /// 连上之后才存一次 —— 每次连接只存一次, 别每轮询一次写一遍盘。
+    bool m_hostSaved = false;
 
     /// 手动指令用的 session id (默认 monitor-ui)。
     QString m_agentSessionId;
@@ -176,6 +222,40 @@ private:
 
     /// WebSocket 源的名字 (状态栏显示用)
     QStringList m_wsNames;
+
+    /// 上一次看到的「识别完成」标记 (``rec_result`` 的 turn + at)。
+    ///
+    /// 用来判断「这一轮是不是刚识别完」—— ``rec_result`` 一直在快照里,
+    /// 不记住上一次的值就没法区分「刚完成」和「早就完成了」。
+    QString m_lastRecResultKey;
+
+    /// 已经收到过至少一份 ASR 快照了吗?
+    ///
+    /// 第一份快照里的 ``rec_result`` 可能是**上一次会话**留下的 ——
+    /// 那不该触发「识别完成」动画 (会让人以为刚刚说过话)。
+    bool m_asrPrimed = false;
+
+    /// 「识别完成」动画正在展示中。
+    ///
+    /// 动画会停留 2 秒才淡出, 这期间每 250ms 来一份快照 ——
+    /// 不加这把锁, 「识别完成」会被下一份快照立刻覆盖, 一闪而过。
+    bool m_asrDoneShown = false;
+
+    /// 当前生效的目标 IP —— 拉视觉标注图时要用 (拼 URL)。
+    QString m_visionHost;
+    /// 视觉服务端口。
+    int m_visionPort = 8803;
+
+    /// 拉图像用的网络管理器 (跟 ServicePoller 的分开 —— 那边是轮询用的)。
+    class QNetworkAccessManager *m_imageNam = nullptr;
+    /// 显示标注图的标签页。
+    class QLabel *m_lblVisionImage = nullptr;
+    /// 「图像识别结果」列表。
+    class QListWidget *m_listVision = nullptr;
+    /// 识别状态提示 (识别中 / 成功 / 失败)。
+    class QLabel *m_lblVisionStatus = nullptr;
+    /// 「识别一次」按钮。
+    class QPushButton *m_btnDetect = nullptr;
     /// 本次运行是否已经经历过一轮对话。
     ///
     /// 启动时 ASR 的 /health 里存着「上一轮」的残留, 那不是本次运行

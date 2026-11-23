@@ -1,11 +1,11 @@
 #pragma once
 
+#include <QByteArray>
 #include <QString>
 #include <QVector>
 
 /// 一个要监控的 HTTP 服务。
-struct ServiceConfig {
-    QString name;
+struct ServiceConfig {    QString name;
     QString host;
     int port = 0;
     /// 健康检查路径 (必填)
@@ -56,4 +56,35 @@ struct AppConfig {
     static AppConfig load(const QString &path = QString());
     /// 内置默认配置 (与 monitor/config.json 一致)。
     static AppConfig defaults();
+
+    /// **把配置写回 JSON 文件**。
+    ///
+    /// 只写 `defaultHost` 一个字段 —— 文件里其余内容 (services /
+    /// websockets / pollIntervalMs ...) **原样保留**。
+    ///
+    /// 为什么要保留而不是整体重写: 用户可能手改过 config.json 里的
+    /// 端口、路径。整体重写会把那些改动抹掉。
+    ///
+    /// 写回的位置是**上次 load() 实际读的那个文件** (见 loadedPath());
+    /// 没读到过就写 `config.json` 到当前工作目录。
+    ///
+    /// Returns: 写成功返回 true; 失败 (只读介质/权限不足) 返回 false。
+    static bool save(const AppConfig &cfg, const QString &path = QString());
+
+    /// 上次 load() **实际读到**的配置文件路径。
+    ///
+    /// 没读到过 (用了内置默认配置) 返回空串。
+    static QString loadedPath();
+
+    /// 配置文件的**候选路径** —— 按优先级从高到低。
+    ///
+    /// 暴露出来是为了让 save() 和 load() 用同一套候选。
+    static QStringList candidatePaths(const QString &path = QString());
+
+private:
+    /// 在 JSON 文本里**就地**替换 defaultHost 的值, 保持其余排版不变。
+    ///
+    /// 找不到该键 / 值不是字符串时返回空 QByteArray ——
+    /// 调用方会退回「整体重写」。
+    static QByteArray replaceHostInJson(const QByteArray &json, const QString &host);
 };

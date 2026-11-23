@@ -332,6 +332,60 @@ void ThinkingModel::handleEvent(const QJsonObject &event)
         if (!turn)
             return;
 
+        if (phase == QStringLiteral("chat")) {
+            // ---- 闲聊时的思考 ----
+            //
+            // 聊天分支的思考 (configs/agent.yaml 的 llm.thinking)。
+            // 与工具调用分开显示 —— 一个是「模型自己想问题」,
+            // 一个是「模型在决定调哪个工具」。
+            // reasoning = 模型真正的推理过程 (reasoning_content)。
+            // content 里放的是同一份内容 (Agent 端两个字段都发, 保持兼容)。
+            const QString reasoning = payload.value(QStringLiteral("reasoning")).toString()
+                                     .isEmpty()
+                                 ? payload.value(QStringLiteral("content")).toString()
+                                 : payload.value(QStringLiteral("reasoning")).toString();
+            const QString model = payload.value(QStringLiteral("model")).toString();
+            const int promptTokens = payload.value(QStringLiteral("prompt_tokens")).toInt();
+            const int completionTokens = payload.value(QStringLiteral("completion_tokens")).toInt();
+            const int reasoningTokens = payload.value(QStringLiteral("reasoning_tokens")).toInt();
+            const double elapsed = payload.value(QStringLiteral("elapsed_ms")).toDouble();
+
+            ThinkingNode *sec = appendSection(turn, QStringLiteral("闲聊思考"), QString(), QString());
+            if (!sec)
+                return;
+
+            struct Field {
+                QString title;
+                QString value;
+                QString tooltip;
+            };
+            QVector<Field> fields;
+            if (!reasoning.isEmpty())
+                fields.append({QStringLiteral("推理"), reasoning,
+                               QStringLiteral("模型的思考过程:\n%1").arg(reasoning)});
+            if (!model.isEmpty())
+                fields.append({QStringLiteral("模型"), model, model});
+            fields.append({QStringLiteral("Token"),
+                           QStringLiteral("prompt %1 / completion %2 / 思考 %3")
+                               .arg(promptTokens).arg(completionTokens).arg(reasoningTokens),
+                           QString()});
+            fields.append({QStringLiteral("耗时"),
+                           QStringLiteral("%1 ms").arg(elapsed, 0, 'f', 1), QString()});
+
+            for (const Field &f : fields) {
+                ThinkingNode *node = ensureField(sec, f.title);
+                if (node) {
+                    node->value = f.value;
+                    node->tooltip = f.tooltip;
+                } else {
+                    insertField(sec, f.title, f.value, f.tooltip);
+                }
+            }
+            const int row = rowOf(turn);
+            emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+            return;
+        }
+
         if (phase == QStringLiteral("param_extraction")) {
             // ---- 参数提取: 最有价值的一段 ----
             //
@@ -392,6 +446,13 @@ void ThinkingModel::handleEvent(const QJsonObject &event)
 
             const QJsonArray tools = payload.value(QStringLiteral("tools")).toArray();
             const QString content = payload.value(QStringLiteral("content")).toString();
+            // reasoning = 模型**真正的推理过程** (reasoning_content)。
+            // 与 content 不同: content 是模型「说出来的话」(决定调不调工具),
+            // reasoning 是它「心里想的」—— 更能说明为什么选了这个工具。
+            //
+            // 不回退到 content —— 两者语义不同, 回退会显示错内容。
+            const QString reasoning = payload.value(QStringLiteral("reasoning")).toString();
+            const int reasoningTokens = payload.value(QStringLiteral("reasoning_tokens")).toInt();
             const QString model = payload.value(QStringLiteral("model")).toString();
             const int promptTokens = payload.value(QStringLiteral("prompt_tokens")).toInt();
             const int completionTokens = payload.value(QStringLiteral("completion_tokens")).toInt();
@@ -407,6 +468,9 @@ void ThinkingModel::handleEvent(const QJsonObject &event)
                 QString tooltip;
             };
             QVector<Field> fields;
+            if (!reasoning.isEmpty())
+                fields.append({QStringLiteral("推理"), reasoning,
+                               QStringLiteral("模型的思考过程:\n%1").arg(reasoning)});
             if (!content.isEmpty())
                 fields.append({QStringLiteral("模型输出"), content, content});
             for (const QJsonValue &tv : tools) {
@@ -419,8 +483,8 @@ void ThinkingModel::handleEvent(const QJsonObject &event)
             }
             fields.append({QStringLiteral("模型"), model, model});
             fields.append({QStringLiteral("Token"),
-                           QStringLiteral("prompt %1 / completion %2")
-                               .arg(promptTokens).arg(completionTokens),
+                           QStringLiteral("prompt %1 / completion %2 / 思考 %3")
+                               .arg(promptTokens).arg(completionTokens).arg(reasoningTokens),
                            QString()});
             fields.append({QStringLiteral("耗时"),
                            QStringLiteral("%1 ms").arg(elapsed, 0, 'f', 1), QString()});

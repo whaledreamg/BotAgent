@@ -70,7 +70,7 @@
        <item>
         <spacer name="topSpacer">
          <property name="orientation">
-          <enum>Qt::Horizontal</enum>
+          <enum>Qt::Orientation::Horizontal</enum>
          </property>
          <property name="sizeHint" stdset="0">
           <size>
@@ -102,10 +102,10 @@
           </size>
          </property>
          <property name="frameShape">
-          <enum>QFrame::VLine</enum>
+          <enum>QFrame::Shape::VLine</enum>
          </property>
          <property name="frameShadow">
-          <enum>QFrame::Plain</enum>
+          <enum>QFrame::Shadow::Plain</enum>
          </property>
         </widget>
        </item>
@@ -118,23 +118,20 @@
        </item>
        <item>
         <widget class="QLineEdit" name="editHost">
+         <property name="cursor">
+          <cursorShape>IBeamCursor</cursorShape>
+         </property>
          <property name="toolTip">
           <string>要监控的服务地址 (IP 或主机名), 开始监控时生效</string>
-         </property>
-         <property name="placeholderText">
-          <string>127.0.0.1</string>
          </property>
          <property name="text">
           <string>127.0.0.1</string>
          </property>
+         <property name="placeholderText">
+          <string>127.0.0.1</string>
+         </property>
          <property name="clearButtonEnabled">
           <bool>true</bool>
-         </property>
-         <property name="maximumWidth">
-          <number>180</number>
-         </property>
-         <property name="cursor">
-          <cursorShape>IBeamCursor</cursorShape>
          </property>
         </widget>
        </item>
@@ -163,31 +160,31 @@
        </item>
        <item>
         <widget class="QPushButton" name="btnToggle">
-         <property name="text">
-          <string>开始监控</string>
-         </property>
          <property name="cursor">
           <cursorShape>PointingHandCursor</cursorShape>
+         </property>
+         <property name="text">
+          <string>开始监控</string>
          </property>
         </widget>
        </item>
        <item>
         <widget class="QPushButton" name="btnClearEvents">
-         <property name="text">
-          <string>清空事件流</string>
-         </property>
          <property name="cursor">
           <cursorShape>PointingHandCursor</cursorShape>
+         </property>
+         <property name="text">
+          <string>清空事件流</string>
          </property>
         </widget>
        </item>
        <item>
         <widget class="QPushButton" name="btnClearThinking">
-         <property name="text">
-          <string>清空思考过程</string>
-         </property>
          <property name="cursor">
           <cursorShape>PointingHandCursor</cursorShape>
+         </property>
+         <property name="text">
+          <string>清空思考过程</string>
          </property>
         </widget>
        </item>
@@ -206,10 +203,10 @@
           </size>
          </property>
          <property name="frameShape">
-          <enum>QFrame::VLine</enum>
+          <enum>QFrame::Shape::VLine</enum>
          </property>
          <property name="frameShadow">
-          <enum>QFrame::Plain</enum>
+          <enum>QFrame::Shadow::Plain</enum>
          </property>
         </widget>
        </item>
@@ -226,7 +223,7 @@
     <item>
      <widget class="QSplitter" name="mainSplitter">
       <property name="orientation">
-       <enum>Qt::Horizontal</enum>
+       <enum>Qt::Orientation::Horizontal</enum>
       </property>
       <property name="childrenCollapsible">
        <bool>false</bool>
@@ -259,21 +256,11 @@
         </property>
         <item>
          <widget class="FlowPanel" name="scrollFlow">
+          <property name="horizontalScrollBarPolicy">
+           <enum>Qt::ScrollBarPolicy::ScrollBarAlwaysOff</enum>
+          </property>
           <property name="widgetResizable">
            <bool>true</bool>
-          </property>
-          <property name="horizontalScrollBarPolicy">
-           <enum>Qt::ScrollBarAlwaysOff</enum>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QLabel" name="lblFlowHint">
-          <property name="text">
-           <string>提示: 每一轮对话一张卡片, 文字自动换行完整显示</string>
-          </property>
-          <property name="styleSheet">
-           <string notr="true">color: #8A93A6; font-size: 9pt;</string>
           </property>
          </widget>
         </item>
@@ -307,13 +294,154 @@
         </property>
         <item>
          <widget class="QTreeView" name="treeThinking">
+          <property name="editTriggers">
+           <set>QAbstractItemView::EditTrigger::NoEditTriggers</set>
+          </property>
           <property name="alternatingRowColors">
            <bool>true</bool>
           </property>
-          <property name="editTriggers">
-           <set>QAbstractItemView::NoEditTriggers</set>
-          </property>
           <property name="uniformRowHeights">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QGroupBox" name="statusGroup">
+       <property name="minimumSize">
+        <size>
+         <width>0</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="title">
+        <string>识别状态</string>
+       </property>
+       <layout class="QVBoxLayout" name="statusLayout">
+        <property name="spacing">
+         <number>6</number>
+        </property>
+        <property name="leftMargin">
+         <number>4</number>
+        </property>
+        <property name="topMargin">
+         <number>4</number>
+        </property>
+        <property name="rightMargin">
+         <number>4</number>
+        </property>
+        <property name="bottomMargin">
+         <number>4</number>
+        </property>
+        <item>
+         <widget class="AsrStatusIndicator" name="asrIndicator" native="true">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="lblVisionTitle">
+          <property name="styleSheet">
+           <string notr="true">color: #8A93A6; font-size: 9pt; font-weight: bold;</string>
+          </property>
+          <property name="text">
+           <string>图像识别</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="visionActionLayout">
+          <property name="spacing">
+           <number>6</number>
+          </property>
+          <item>
+           <widget class="QPushButton" name="btnDetect">
+            <property name="cursor">
+             <cursorShape>PointingHandCursor</cursorShape>
+            </property>
+            <property name="toolTip">
+             <string>拍一帧做识别, 结果显示在下面</string>
+            </property>
+            <property name="text">
+             <string>识别一次</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="lblVisionStatus">
+            <property name="styleSheet">
+             <string notr="true">color: #8A93A6; font-size: 8pt;</string>
+            </property>
+            <property name="text">
+             <string>点「识别一次」开始</string>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <widget class="QLabel" name="lblVisionImage">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+            <horstretch>1</horstretch>
+            <verstretch>3</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="minimumSize">
+           <size>
+            <width>0</width>
+            <height>150</height>
+           </size>
+          </property>
+          <property name="maximumSize">
+           <size>
+            <width>16777215</width>
+            <height>260</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>识别后这里显示标注图</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignmentFlag::AlignCenter</set>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="lblVisionListTitle">
+          <property name="styleSheet">
+           <string notr="true">color: #8A93A6; font-size: 8pt; font-weight: bold;</string>
+          </property>
+          <property name="text">
+           <string>识别到了</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QListWidget" name="listVision">
+          <property name="toolTip">
+           <string>点击查看该目标单独的标注图</string>
+          </property>
+          <property name="editTriggers">
+           <set>QAbstractItemView::EditTrigger::NoEditTriggers</set>
+          </property>
+          <property name="alternatingRowColors">
+           <bool>true</bool>
+          </property>
+          <property name="uniformItemSizes">
+           <bool>false</bool>
+          </property>
+          <property name="wordWrap">
            <bool>true</bool>
           </property>
          </widget>
@@ -348,15 +476,6 @@
        </property>
        <item>
         <widget class="QPushButton" name="btnAttach">
-         <property name="text">
-          <string>+</string>
-         </property>
-         <property name="toolTip">
-          <string>手动指令 · 直接向 Agent 提问&#10;⚠ 会触发真实设备动作 (与语音链路同权)&#10;会话: monitor-ui</string>
-         </property>
-         <property name="cursor">
-          <cursorShape>PointingHandCursor</cursorShape>
-         </property>
          <property name="minimumSize">
           <size>
            <width>26</width>
@@ -369,38 +488,44 @@
            <height>26</height>
           </size>
          </property>
+         <property name="cursor">
+          <cursorShape>PointingHandCursor</cursorShape>
+         </property>
          <property name="focusPolicy">
-          <enum>Qt::NoFocus</enum>
+          <enum>Qt::FocusPolicy::NoFocus</enum>
+         </property>
+         <property name="toolTip">
+          <string>手动指令 · 直接向 Agent 提问
+⚠ 会触发真实设备动作 (与语音链路同权)
+会话: monitor-ui</string>
+         </property>
+         <property name="text">
+          <string>+</string>
          </property>
         </widget>
        </item>
        <item>
         <widget class="QPlainTextEdit" name="editCommand">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
          <property name="toolTip">
-          <string>回车发送, Shift+回车换行&#10;⚠ 会触发真实设备动作</string>
-         </property>
-         <property name="placeholderText">
-          <string>问点什么...  (Enter 发送, Shift+Enter 换行)</string>
-         </property>
-         <property name="maximumHeight">
-          <number>56</number>
+          <string>回车发送, Shift+回车换行
+⚠ 会触发真实设备动作</string>
          </property>
          <property name="tabChangesFocus">
           <bool>false</bool>
+         </property>
+         <property name="placeholderText">
+          <string>问点什么...  (Enter 发送, Shift+Enter 换行)</string>
          </property>
         </widget>
        </item>
        <item>
         <widget class="QPushButton" name="btnSend">
-         <property name="text">
-          <string>↑</string>
-         </property>
-         <property name="toolTip">
-          <string>发送到 Agent (回车)</string>
-         </property>
-         <property name="cursor">
-          <cursorShape>PointingHandCursor</cursorShape>
-         </property>
          <property name="minimumSize">
           <size>
            <width>28</width>
@@ -413,8 +538,17 @@
            <height>28</height>
           </size>
          </property>
+         <property name="cursor">
+          <cursorShape>PointingHandCursor</cursorShape>
+         </property>
          <property name="focusPolicy">
-          <enum>Qt::NoFocus</enum>
+          <enum>Qt::FocusPolicy::NoFocus</enum>
+         </property>
+         <property name="toolTip">
+          <string>发送到 Agent (回车)</string>
+         </property>
+         <property name="text">
+          <string>↑</string>
          </property>
         </widget>
        </item>
@@ -460,19 +594,28 @@
            <verstretch>0</verstretch>
           </sizepolicy>
          </property>
+         <property name="frameShape">
+          <enum>QFrame::Shape::NoFrame</enum>
+         </property>
+         <property name="verticalScrollBarPolicy">
+          <enum>Qt::ScrollBarPolicy::ScrollBarAlwaysOff</enum>
+         </property>
+         <property name="horizontalScrollBarPolicy">
+          <enum>Qt::ScrollBarPolicy::ScrollBarAsNeeded</enum>
+         </property>
          <property name="widgetResizable">
           <bool>true</bool>
          </property>
-         <property name="horizontalScrollBarPolicy">
-          <enum>Qt::ScrollBarAsNeeded</enum>
-         </property>
-         <property name="verticalScrollBarPolicy">
-          <enum>Qt::ScrollBarAlwaysOff</enum>
-         </property>
-         <property name="frameShape">
-          <enum>QFrame::NoFrame</enum>
-         </property>
-         <widget class="ServiceBar" name="serviceBar"/>
+         <widget class="ServiceBar" name="serviceBar">
+          <property name="geometry">
+           <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>1270</width>
+            <height>68</height>
+           </rect>
+          </property>
+         </widget>
         </widget>
        </item>
        <item>
@@ -490,10 +633,10 @@
           </size>
          </property>
          <property name="frameShape">
-          <enum>QFrame::VLine</enum>
+          <enum>QFrame::Shape::VLine</enum>
          </property>
          <property name="frameShadow">
-          <enum>QFrame::Plain</enum>
+          <enum>QFrame::Shadow::Plain</enum>
          </property>
         </widget>
        </item>
@@ -517,9 +660,13 @@
    </layout>
   </widget>
  </widget>
- <resources/>
- <connections/>
  <customwidgets>
+  <customwidget>
+   <class>AsrStatusIndicator</class>
+   <extends>QWidget</extends>
+   <header>ui/asrstatusindicator.h</header>
+   <container>1</container>
+  </customwidget>
   <customwidget>
    <class>FlowPanel</class>
    <extends>QScrollArea</extends>
@@ -533,4 +680,6 @@
    <container>1</container>
   </customwidget>
  </customwidgets>
+ <resources/>
+ <connections/>
 </ui>

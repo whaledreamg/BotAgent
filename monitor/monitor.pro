@@ -53,7 +53,20 @@ DISTFILES += \
 #
 # Qt 的 Android 部署需要 OpenSSL (WebSocket 的 wss:// 与 TLS 后端依赖它)。
 # openssl.pri 会把预编译的 libssl/libcrypto 塞进 ANDROID_EXTRA_LIBS。
-android: include(/home/gxh/Android/Sdk/android_openssl/openssl.pri)
+#
+# 路径不能写死 —— 开发机换路径后就找不到了。这里按优先级探测:
+#   1. ANDROID_SDK_ROOT 环境变量 (build_android.sh 会导出)
+#   2. 常见的 SDK 安装位置
+ANDROID_OPENSSL_PRI = $$ANDROID_SDK_ROOT/android_openssl/openssl.pri
+!exists($$ANDROID_OPENSSL_PRI) {
+    ANDROID_OPENSSL_PRI = \
+        /home/*/Android/Sdk/android_openssl/openssl.pri
+}
+exists($$ANDROID_OPENSSL_PRI) {
+    android: include($$ANDROID_OPENSSL_PRI)
+} else {
+    android: warning("找不到 android_openssl/openssl.pri —— wss:// 将不可用")
+}
 
 contains(ANDROID_TARGET_ARCH,arm64-v8a) {
     ANDROID_PACKAGE_SOURCE_DIR = \

@@ -5,15 +5,20 @@
 #include "core/appconfig.h"
 #include "models/monitormodel.h"
 #include "models/thinkingmodel.h"
+#include "ui/asrstatusindicator.h"
 #include "ui/flowcard.h"
 #include "ui/flowpanel.h"
 
 #include <QApplication>
+#include <QColor>
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QPixmap>
 #include <QTextStream>
 
 static QTextStream out(stdout);
@@ -105,6 +110,9 @@ int main(int argc, char *argv[])
             {"phase", "tool_calling"},
             {"text", "查北京天气"},
             {"content", "用户想查询北京的天气"},
+            // reasoning = 模型真正的推理过程 (reasoning_content)
+            {"reasoning", "用户提到了'天气'和'北京'，应该调用 query_weather 工具，城市参数是北京"},
+            {"reasoning_tokens", 36},
             {"model", "agnes-2.5-flash"},
             {"prompt_tokens", 369},
             {"completion_tokens", 115},
@@ -113,6 +121,22 @@ int main(int argc, char *argv[])
                 {"name", "query_weather"},
                 {"arguments", QJsonObject{{"city", "北京"}}}}}}}}};
     thinking.handleEvent(thinking2);
+
+    // 闲聊分支的思考 (configs/agent.yaml 的 llm.thinking)
+    QJsonObject thinking3{
+        {"type", "thinking"},
+        {"ts", "2026-11-18T15:01:18.500000"},
+        {"session_id", "robot-01"},
+        {"payload", QJsonObject{
+            {"phase", "chat"},
+            {"text", "讲个故事"},
+            {"content", "用户想要一个故事，我先构思一个关于星空的短故事，要口语化，不要markdown"},
+            {"model", "agnes-2.5-flash"},
+            {"prompt_tokens", 120},
+            {"completion_tokens", 340},
+            {"reasoning_tokens", 125},
+            {"elapsed_ms", 1420.0}}}};
+    thinking.handleEvent(thinking3);
 
     QJsonObject turnEnd{
         {"type", "turn_end"},
@@ -188,6 +212,63 @@ int main(int argc, char *argv[])
         }
         if (!found)
             out << "  [FAIL] 没找到「工具 · xxx」节点或 tooltip 不完整\n";
+    }
+
+    out << "\n========== 3.1.1 工具调用的 reasoning 字段 ==========\n";
+    {
+        // tool_calling 的 reasoning (模型的推理过程) 应显示为「推理」子节点。
+        const QModelIndex turnIdx = thinking.index(0, 0);
+        bool found = false;
+        for (int r = 0; r < thinking.rowCount(turnIdx); ++r) {
+            const QModelIndex sec = thinking.index(r, 0, turnIdx);
+            if (thinking.data(sec, Qt::DisplayRole).toString() != QStringLiteral("工具调用"))
+                continue;
+            for (int f = 0; f < thinking.rowCount(sec); ++f) {
+                const QModelIndex field = thinking.index(f, 0, sec);
+                if (thinking.data(field, Qt::DisplayRole).toString() != QStringLiteral("推理"))
+                    continue;
+                const QString value = thinking.data(field, ThinkingModel::ValueRole).toString();
+                const QString tip = thinking.data(field, Qt::ToolTipRole).toString();
+                out << "  推理 value = " << value << "\n";
+                out << "  推理 tooltip = " << tip << "\n";
+                if (value.contains(QStringLiteral("query_weather"))
+                    && tip.contains(QStringLiteral("思考过程"))) {
+                    out << "  [PASS] tool_calling 的 reasoning 已显示\n";
+                    found = true;
+                } else {
+                    out << "  [FAIL] tool_calling 的 reasoning 缺失或 tooltip 不完整\n";
+                }
+            }
+        }
+        if (!found)
+            out << "  [FAIL] 没找到「工具调用 -> 推理」节点\n";
+    }
+
+    out << "\n========== 3.1.2 闲聊思考 (phase=chat) ==========\n";
+    {
+        const QModelIndex turnIdx = thinking.index(0, 0);
+        bool foundSec = false;
+        bool foundReasoning = false;
+        for (int r = 0; r < thinking.rowCount(turnIdx); ++r) {
+            const QModelIndex sec = thinking.index(r, 0, turnIdx);
+            if (thinking.data(sec, Qt::DisplayRole).toString() != QStringLiteral("闲聊思考"))
+                continue;
+            foundSec = true;
+            for (int f = 0; f < thinking.rowCount(sec); ++f) {
+                const QModelIndex field = thinking.index(f, 0, sec);
+                const QString title = thinking.data(field, Qt::DisplayRole).toString();
+                const QString value = thinking.data(field, ThinkingModel::ValueRole).toString();
+                out << "  " << title << " = " << value << "\n";
+                if (title == QStringLiteral("推理") && value.contains(QStringLiteral("星空"))) {
+                    out << "  [PASS] phase=chat 的思考内容已显示\n";
+                    foundReasoning = true;
+                }
+            }
+        }
+        if (!foundSec)
+            out << "  [FAIL] 没找到「闲聊思考」阶段\n";
+        if (foundSec && !foundReasoning)
+            out << "  [FAIL] 「闲聊思考」里没有推理内容\n";
     }
 
     out << "\n========== 3.2 多轮分轮 (turn_id / turn_start 边界) ==========\n";
@@ -451,6 +532,138 @@ int main(int argc, char *argv[])
             out << "  [PASS] 手动指令用独立 session, 不污染语音历史\n";
         else
             out << "  [FAIL] agentSessionId 不对\n";
+    }
+
+    out << "\n========== 8. 语音识别三态动画控件 ==========\n";
+    {
+        AsrStatusIndicator ind;
+
+        // ---- 默认是「等待唤醒」 ----
+        out << "  默认状态 = " << int(ind.state()) << " (Waiting=" << int(AsrStatusIndicator::State::Waiting)
+            << ")\n";
+        if (ind.state() == AsrStatusIndicator::State::Waiting)
+            out << "  [PASS] 默认是「等待唤醒」\n";
+        else
+            out << "  [FAIL] 默认状态不对\n";
+
+        // ---- 三态都能切过去 ----
+        ind.setState(AsrStatusIndicator::State::Recording, QStringLiteral("正在录音…"));
+        if (ind.state() == AsrStatusIndicator::State::Recording
+            && ind.detail() == QStringLiteral("正在录音…"))
+            out << "  [PASS] 能切到「识别中」\n";
+        else
+            out << "  [FAIL] 切不到「识别中」\n";
+
+        ind.setState(AsrStatusIndicator::State::Done, QStringLiteral("你好助手"));
+        if (ind.state() == AsrStatusIndicator::State::Done
+            && ind.detail() == QStringLiteral("你好助手"))
+            out << "  [PASS] 能切到「识别完成」\n";
+        else
+            out << "  [FAIL] 切不到「识别完成」\n";
+
+        ind.setState(AsrStatusIndicator::State::Offline, QStringLiteral("连不上"));
+        if (ind.state() == AsrStatusIndicator::State::Offline)
+            out << "  [PASS] 能切到「未连接」\n";
+        else
+            out << "  [FAIL] 切不到「未连接」\n";
+
+        // ---- 各状态都要能画出来 (不崩) ----
+        const AsrStatusIndicator::State states[] = {
+            AsrStatusIndicator::State::Waiting,
+            AsrStatusIndicator::State::Recording,
+            AsrStatusIndicator::State::Done,
+            AsrStatusIndicator::State::Offline};
+        bool painted = true;
+        for (AsrStatusIndicator::State s : states) {
+            ind.setState(s, QStringLiteral("测试"));
+            QPixmap pm(120, 90);
+            pm.fill(QColor(242, 244, 248));
+            ind.render(&pm);
+            if (pm.isNull())
+                painted = false;
+        }
+        if (painted)
+            out << "  [PASS] 四种状态都能正常绘制\n";
+        else
+            out << "  [FAIL] 有状态画不出来\n";
+    }
+
+    out << "\n========== 9. 配置持久化 (defaultHost) ==========\n";
+    {
+        // 用临时文件当 config.json —— 不动真实的那个。
+        const QString path = QDir::tempPath() + QStringLiteral("/botagent_cfg_test.json");
+        QFile::remove(path);
+
+        // 写一个带自定义字段的 config.json
+        {
+            QFile f(path);
+            f.open(QIODevice::WriteOnly);
+            f.write(R"({
+  "pollIntervalMs": 3000,
+  "autoStart": true,
+  "defaultHost": "10.0.0.1",
+  "agentSessionId": "custom-session",
+  "services": [{"name":"ASR","host":"1.2.3.4","port":9999,"healthPath":"/h"}],
+  "websockets": [{"name":"Agent","url":"ws://1.2.3.4:8800/v1/events/"}]
+})");
+            f.close();
+        }
+
+        const AppConfig c1 = AppConfig::load(path);
+        out << "  loadedPath   = " << AppConfig::loadedPath() << "\n";
+        out << "  defaultHost  = " << c1.defaultHost << "\n";
+        out << "  pollInterval = " << c1.pollIntervalMs << "\n";
+        out << "  ASR port     = " << c1.services.first().port << "\n";
+
+        bool ok = true;
+        ok &= c1.defaultHost == QStringLiteral("10.0.0.1");
+        ok &= c1.pollIntervalMs == 3000;
+        ok &= c1.autoStart;
+        ok &= c1.agentSessionId == QStringLiteral("custom-session");
+        ok &= c1.services.first().port == 9999;
+        if (ok)
+            out << "  [PASS] config.json 各项都读对了\n";
+        else
+            out << "  [FAIL] config.json 读取有问题\n";
+
+        // ---- 改 IP 并保存 ----
+        AppConfig c2 = c1;
+        c2.defaultHost = QStringLiteral("192.168.1.50");
+        const bool saved = AppConfig::save(c2, path);
+        out << "  save 返回 = " << (saved ? "true" : "false") << "\n";
+
+        // ---- 读回来验证 ----
+        QFile in(path);
+        in.open(QIODevice::ReadOnly);
+        const QJsonObject root = QJsonDocument::fromJson(in.readAll()).object();
+        in.close();
+
+        bool kept = true;
+        kept &= root.value(QStringLiteral("defaultHost")).toString()
+                 == QStringLiteral("192.168.1.50");
+        // 其余字段必须**原样保留** —— 不能把用户手改的端口抹掉。
+        kept &= root.value(QStringLiteral("pollIntervalMs")).toInt() == 3000;
+        kept &= root.value(QStringLiteral("autoStart")).toBool();
+        kept &= root.value(QStringLiteral("agentSessionId")).toString()
+                 == QStringLiteral("custom-session");
+        kept &= root.value(QStringLiteral("services")).toArray().size() == 1;
+        kept &= root.value(QStringLiteral("services")).toArray().at(0).toObject()
+                 .value(QStringLiteral("port")).toInt() == 9999;
+        kept &= root.value(QStringLiteral("websockets")).toArray().size() == 1;
+
+        if (saved && kept)
+            out << "  [PASS] 只改 defaultHost, 其余字段原样保留\n";
+        else
+            out << "  [FAIL] 保存后字段不对\n";
+
+        // ---- 再读一次, 确认新 IP 生效 ----
+        const AppConfig c3 = AppConfig::load(path);
+        if (c3.defaultHost == QStringLiteral("192.168.1.50"))
+            out << "  [PASS] 重新读取拿到保存后的 IP\n";
+        else
+            out << "  [FAIL] 重新读取拿不到保存后的 IP\n";
+
+        QFile::remove(path);
     }
 
     out << "\n自测完成\n";

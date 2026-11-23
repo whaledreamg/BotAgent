@@ -14,8 +14,29 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$HERE/build-android"
 
 # ---- 工具链路径 (可用环境变量覆盖) ----
+#
+# 默认值写死的是原始开发机 (/home/gxh/...)。换机器后如果不存在,
+# 就自动探测 —— 否则每次都得手动 export 一堆变量。
 QT_PREFIX="${QT_PREFIX:-/home/gxh/Qt/6.8.3}"
+if [ ! -d "$QT_PREFIX/android_arm64_v8a" ] && [ ! -d "$QT_PREFIX/gcc_64" ]; then
+    for _cand in /home/*/Qt/6.* /opt/Qt/6.* /usr/local/Qt/6.*; do
+        if [ -d "$_cand/android_arm64_v8a" ] || [ -d "$_cand/gcc_64" ]; then
+            QT_PREFIX="$_cand"
+            break
+        fi
+    done
+fi
+
 ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/home/gxh/Android/Sdk}"
+if [ ! -d "$ANDROID_SDK_ROOT" ]; then
+    for _cand in /home/*/Android/Sdk /opt/android-sdk /usr/local/android-sdk; do
+        if [ -d "$_cand" ]; then
+            ANDROID_SDK_ROOT="$_cand"
+            break
+        fi
+    done
+fi
+
 ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-$ANDROID_SDK_ROOT/ndk/26.1.10909125}"
 JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
 

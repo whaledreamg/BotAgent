@@ -11,7 +11,24 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$HERE/build"
 
 # Qt 6.8.3 安装位置 (可用 QT_PREFIX 环境变量覆盖)
+#
+# 默认路径写死的是原始开发机 (/home/gxh/...)。换机器后如果那个目录
+# 不存在, 就自动在常见位置里找一个 —— 否则每次都得手动 export
+# QT_PREFIX, 很容易忘。
 QT_PREFIX="${QT_PREFIX:-/home/gxh/Qt/6.8.3/gcc_64}"
+if [ ! -d "$QT_PREFIX/lib/cmake/Qt6" ]; then
+    for _cand in \
+        /home/*/Qt/6.*/gcc_64 \
+        /home/*/Qt/6.* \
+        /opt/Qt/6.*/gcc_64 \
+        /usr/local/Qt/6.*/gcc_64
+    do
+        if [ -d "$_cand/lib/cmake/Qt6" ]; then
+            QT_PREFIX="$_cand"
+            break
+        fi
+    done
+fi
 
 if [ ! -d "$QT_PREFIX/lib/cmake/Qt6" ]; then
     echo "[error] 找不到 Qt6: $QT_PREFIX" >&2
