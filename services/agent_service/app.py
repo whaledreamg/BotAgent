@@ -24,12 +24,12 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import Config, load_config
-from handlers.base import AgentRequest, BranchResult
+from handlers.base import AgentRequest, BranchResult, prepare_speak_text
 from llm import LLMClient, LLMError
 from registry import Registry
 from router import Router
@@ -194,6 +194,35 @@ class Service:
                 )
         handler_ms = int((time.time() - t_handler) * 1000)
 
+        # ---- 朗读文本出口: 净化 + 裁长度 ----
+        #
+        # 所有分支的产出会话在这里, 所以**只在这一处**处理就够了 ——
+        # chat 的 LLM 长回复、tool 的聚合文本 (orchestrator 的 join)、
+        # tool calling 直接返回的 content, 全都会被管住。
+        #
+        # 做两件事:
+        # 1. 去掉 markdown 标记 (否则会被 TTS 念出「星号星号」)
+        # 2. 裁到合理长度 (太长会被 ChatTTS 提前 EOS 截断, 念不全)
+        #
+        # **注意**: 存进历史会话的必须是**裁剪前**的原文。
+        # 裁剪后的文本带着「内容有点长，我只说重点，」这个前缀, 下一轮
+        # 模型看到历史里有它, 就会把这个前缀当成回复的固定开头 ——
+        # 于是用户听到「内容有点长我只说重点, 内容有点长我只说重点, ...」。
+        # （实测踩过: 回复里出现两个前缀, 就是这么来的）
+        raw_reply = result.reply
+        if result.speak and raw_reply:
+            prepared = prepare_speak_text(raw_reply)
+            if prepared != raw_reply:
+                logger.info(
+                    "[朗读净化] %d 字 -> %d 字 (去 markdown / 裁长度)",
+                    len(raw_reply),
+                    len(prepared),
+                )
+                result.reply = prepared
+                result.action = result.action or {}
+                if isinstance(result.action, dict):
+                    result.action["detail"] = prepared
+
         all_trace = list(trace) + list(result.trace or [])
         all_trace.append(
             {"step": "timing", "ms": route_ms, "detail": f"route:{route_ms}ms"}
@@ -202,7 +231,8 @@ class Service:
             {"step": "timing", "ms": handler_ms, "detail": f"handler:{handler_ms}ms"}
         )
         if result.speak and req.use_history:
-            self.sessions.append(req.session_id, req.text, result.reply)
+            # 存**裁剪前**的原文 —— 见上面「朗读文本出口」的说明
+            self.sessions.append(req.session_id, req.text, raw_reply or result.reply)
 
         total_ms = int((time.time() - started) * 1000)
         logger.info(
@@ -377,8 +407,12 @@ class Service:
             history=self._history(req.session_id, req.use_history),
         )
         result = await handler.handle(areq)
+        raw_reply = result.reply
+        if result.speak and raw_reply:
+            result.reply = prepare_speak_text(raw_reply)
         if req.use_history:
-            self.sessions.append(req.session_id, req.text, result.reply)
+            # 存**裁剪前**的原文 (前缀不该进历史, 见 dispatch 里的说明)
+            self.sessions.append(req.session_id, req.text, raw_reply or result.reply)
         return {
             "session_id": req.session_id,
             "reply": result.reply,
@@ -515,6 +549,107 @@ async def skills():
 @app.post("/v1/dispatch", response_model=DispatchResponse)
 async def dispatch(req: DispatchRequest):
     return await _svc().dispatch(req)
+
+
+# ------------------------------------------------------------ 抓取模式
+#
+# 「只计算, 不真的抓」—— 调试抓取时最要紧的一件事。
+#
+# 抓取要过视觉识别 + 手眼标定 + 机械臂逆解三层, 任何一层不对, 机械臂
+# 就会往错的地方去。所以必须有个「只算不动」的档位, 用来先确认
+# 算出来的位置对不对。
+
+
+class GraspModeRequest(BaseModel):
+    #: true = 试算 (只算位置, 机械臂不动); false = 实抓 (会动)
+    dry_run: Optional[bool] = Field(
+        None,
+        description=(
+            "true=只计算不抓 (机械臂不动); false=真的抓; "
+            "不传=回到配置文件里的默认值"
+        ),
+    )
+
+
+def _tool_handler():
+    """取 tool 分支的 handler (抓取模式开关在它身上)。"""
+    handler = _svc().registry.get("tool")
+    if handler is None:
+        raise HTTPException(status_code=503, detail="tool 分支未启用")
+    return handler
+
+
+@app.get("/v1/grasp_mode")
+async def get_grasp_mode():
+    """看当前抓取模式。
+
+    **实际由机械臂服务决定** (``configs/arm.yaml`` 的 ``arm.enabled``),
+    这里只是转发查询 —— 保证 agent 看到的和机械臂真正的状态一致。
+    """
+    svc = _svc()
+    handler = _tool_handler()
+    arm_client = getattr(handler, "arm_client", None)
+    control: Dict[str, Any] = {}
+    if arm_client is not None:
+        try:
+            control = await arm_client.get_control_enabled()
+        except Exception as exc:
+            logger.warning("[抓取模式] 查询机械臂控制总闸失败: %s", exc)
+    enabled = bool(control.get("enabled", True))
+    return {
+        "dry_run": not enabled,
+        "mode": "control" if enabled else "plan_only",
+        "description": (
+            "会真的让机械臂移动过去" if enabled
+            else "只计算位置, 机械臂不会动"
+        ),
+        "control_enabled": enabled,
+        "grasp_enabled": "vision.grasp" not in (svc.cfg.disabled_skills),
+        "disabled_skills": list(svc.cfg.disabled_skills),
+    }
+
+
+@app.post("/v1/grasp_mode")
+async def set_grasp_mode(req: GraspModeRequest):
+    """切换抓取模式 (运行时生效, 不用重启服务)。
+
+    **实际改的是机械臂服务的「控制指令总闸」** —— 那是下发控制指令的
+    最后一道闸, 关着就一个控制指令都不会发出去。
+
+        # 只算不动
+        curl -X POST localhost:8800/v1/grasp_mode -d '{"dry_run": true}'
+
+        # 真的抓
+        curl -X POST localhost:8800/v1/grasp_mode -d '{"dry_run": false}'
+
+        # 回到配置默认值
+        curl -X POST localhost:8800/v1/grasp_mode -d '{}'
+    """
+    handler = _tool_handler()
+    arm_client = getattr(handler, "arm_client", None)
+    if arm_client is None:
+        raise HTTPException(status_code=503, detail="机械臂客户端未配置")
+
+    # dry_run=True -> 关闭控制总闸 (只算不动); False -> 打开
+    # None -> 回到 configs/arm.yaml 的默认值
+    enabled: Optional[bool] = None if req.dry_run is None else (not req.dry_run)
+    try:
+        result = await arm_client.set_control_enabled(enabled)
+    except Exception as exc:
+        logger.error("[抓取模式] 切换控制总闸失败: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    now_enabled = bool(result.get("enabled", True))
+    logger.info("[抓取模式] 切到 %s", "实抓" if now_enabled else "试算")
+    return {
+        "dry_run": not now_enabled,
+        "mode": "control" if now_enabled else "plan_only",
+        "description": (
+            "会真的让机械臂移动过去" if now_enabled
+            else "只计算位置, 机械臂不会动"
+        ),
+        "control_enabled": now_enabled,
+    }
 
 
 @app.post("/v1/chat")

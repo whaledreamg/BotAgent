@@ -175,6 +175,29 @@ class RoleConfig:
 
 
 @dataclass
+class ThinkingConfig:
+    """Thinking Mode 配置。
+
+    **两处独立的开关**:
+    - :class:`ToolCallingConfig` 里的 —— 用于 tool calling (复合查询拆任务)
+    - :class:`LLMConfig` 里的 ``thinking`` —— 用于普通聊天
+    """
+
+    #: 是否启用 Thinking Mode
+    enabled: bool = False
+    #: 思考预算 (tokens)
+    budget_tokens: int = 8000
+    #: 最少任务数才启用 thinking (简单查询不用 thinking 节省成本)
+    min_complexity: int = 2
+
+    def to_payload(self) -> Optional[Dict[str, Any]]:
+        """转成请求 payload 用的格式 (关闭时返回 None)。"""
+        if not self.enabled:
+            return None
+        return {"type": "enabled", "budget_tokens": self.budget_tokens}
+
+
+@dataclass
 class LLMConfig:
     """LLM 配置容器。
 
@@ -197,6 +220,17 @@ class LLMConfig:
     max_retries: int = 3
     temperature: float = 0.7
     max_tokens: int = 2048
+    #: **聊天分支**的思考配置 (llm.thinking)。
+    #:
+    #: 之前 thinking 只挂在 tool calling 上, 所以纯闲聊永远不会思考。
+    #: 这里给 chat 单独一份开关 —— 因为两者的成本收益不同:
+    #:
+    #: - tool calling: 拆复合任务时思考很值 (理解「先查A再查B」)
+    #: - chat: 简单闲聊开思考纯属浪费 (多几百毫秒 + 多几百 token),
+    #:   但「介绍一下埃斯顿」这种要展开讲的问题值得想一下再答
+    #:
+    #: 留空 (enabled=false) 表示不给聊天请求发 thinking 参数。
+    thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
 
     @property
     def provider_names(self) -> List[str]:
@@ -211,18 +245,6 @@ class LLMConfig:
 
     def role_names(self) -> List[str]:
         return list(self.roles.keys())
-
-
-@dataclass
-class ThinkingConfig:
-    """Thinking Mode 配置 (仅在 NLU 阶段使用, 改进复合意图理解)。"""
-
-    #: 是否启用 Thinking Mode
-    enabled: bool = False
-    #: 思考预算 (tokens)
-    budget_tokens: int = 8000
-    #: 最少任务数才启用 thinking (简单查询不用 thinking 节省成本)
-    min_complexity: int = 2
 
 
 @dataclass
@@ -704,6 +726,12 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
 
     # 扁平字段 = default_provider 的取值, 兼容旧代码 (cfg.llm.model 等)
     dp = providers.get(default_provider)
+    # 聊天分支的思考配置 (llm.thinking) —— 与 tool_calling.thinking 相互独立
+    llm_thinking_raw = llm_raw.get("thinking") or {}
+    llm_thinking = ThinkingConfig(
+        enabled=bool(llm_thinking_raw.get("enabled", False)),
+        budget_tokens=int(llm_thinking_raw.get("budget_tokens", 4000)),
+    )
     llm = LLMConfig(
         providers=providers,
         roles=roles,
@@ -715,6 +743,7 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
         max_retries=g_max_retries,
         temperature=g_temperature,
         max_tokens=g_max_tokens,
+        thinking=llm_thinking,
     )
 
     # provider 未单独指定的项继承全局默认

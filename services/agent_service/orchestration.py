@@ -85,10 +85,7 @@ class OrchestrationManager:
                 and tool_calling_config.thinking
                 and tool_calling_config.thinking.enabled
             ):
-                thinking_param = {
-                    "type": "enabled",
-                    "budget_tokens": tool_calling_config.thinking.budget_tokens,
-                }
+                thinking_param = tool_calling_config.thinking.to_payload()
                 logger.info(
                     "[编排] 启用 Thinking Mode (budget=%d tokens)",
                     tool_calling_config.thinking.budget_tokens,
@@ -106,9 +103,16 @@ class OrchestrationManager:
 
             # 第 2 步：解析任务序列
             logger.info("[编排] 解析 LLM 响应为任务序列...")
-            thinking_summary = ""
-            if hasattr(result, "thinking") and result.thinking:
-                thinking_summary = str(result.thinking).strip()[:200]
+            # 模型的思考过程 —— 之前这里读的是 result.thinking, 但 ToolCallResult
+            # **根本没有这个字段**, 所以 hasattr 永远 False, 整段是死代码。
+            # 现在字段补上了, 这行才真正生效。
+            thinking_summary = (result.thinking or "").strip()[:200]
+            if thinking_summary:
+                logger.info(
+                    "[编排] 模型思考 (%d reasoning tokens): %s",
+                    result.reasoning_tokens,
+                    thinking_summary[:120],
+                )
 
             sequence = parse_task_sequence(result.content or "", thinking_summary)
 

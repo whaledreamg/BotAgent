@@ -96,10 +96,101 @@ class ToolCallResult:
     provider: str = ""
     #: 实际使用的模型名
     model: str = ""
+    #: **模型的思考过程** (reasoning_content)。
+    #:
+    #: 开启 thinking 后, OpenAI 兼容接口会把推理过程放在
+    #: ``message.reasoning_content`` 里 (Agnes / DeepSeek 都这样)。
+    #:
+    #: 之前这个字段**根本没有被读取** —— 于是模型思考了、也烧了 token,
+    #: 但思考内容直接丢了, 监控端只能看到 ``content: None``。
+    #: orchestration.py 里那句 ``result.thinking`` 是死代码 (hasattr
+    #: 永远 False), 就是因为这个字段不存在。
+    thinking: str = ""
+    #: 思考过程消耗的 token 数 (来自 usage.completion_tokens_details)
+    reasoning_tokens: int = 0
 
     @property
     def has_calls(self) -> bool:
         return bool(self.calls)
+
+    @property
+    def has_thinking(self) -> bool:
+        """模型是否真的产生了思考内容。"""
+        return bool(self.thinking.strip())
+
+
+@dataclass
+class ChatResult:
+    """一次普通对话的结果 (正文 + 思考过程)。"""
+
+    #: 模型给出的正文
+    content: str = ""
+    #: 模型的思考过程 (reasoning_content)
+    thinking: str = ""
+    #: 思考消耗的 token
+    reasoning_tokens: int = 0
+    #: 用量统计
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    #: 实际服务的 provider / 模型
+    provider: str = ""
+    model: str = ""
+    #: 耗时 (毫秒)
+    elapsed_ms: int = 0
+
+    @property
+    def has_thinking(self) -> bool:
+        return bool(self.thinking.strip())
+
+
+#: **支持「思考」语义的 provider**。
+#:
+#: 这些家的 OpenAI 兼容接口接受 ``thinking: {"type": "enabled", ...}``
+#: (Anthropic 风格), 并把推理过程放在 ``message.reasoning_content``。
+#:
+#: 实测 (Agnes agnes-2.5-flash, 2026-11-20):
+#:   - 不带 thinking                -> 无 reasoning_content, 0 reasoning tokens
+#:   - thinking {"type":"enabled"}   -> 有 reasoning_content, ~135 reasoning tokens
+#:   - chat_template_kwargs         -> 有 reasoning_content, ~370 reasoning tokens
+#:
+#: 两种格式在 Agnes 上都生效, 但 ``thinking`` 明显更省 token 且更可控。
+#: 未在列表里的 provider 一律**不发** thinking 参数 (OpenAI 兼容接口会忽略
+#: 未知字段, 但有些服务端会直接 400, 不发最稳)。
+THINKING_CAPABLE_PROVIDERS = frozenset({
+    "agnes",
+    "deepseek",
+})
+
+
+def _apply_thinking(
+    payload: Dict[str, Any],
+    thinking: Optional[Dict[str, Any]],
+    provider: str = "",
+) -> None:
+    """把 thinking 配置写进请求 payload (原地修改)。
+
+    ``thinking`` 的格式 (与 Anthropic 一致)::
+
+        {"type": "enabled", "budget_tokens": 8000}
+
+    只有 :data:`THINKING_CAPABLE_PROVIDERS` 里的 provider 才会带上这个参数。
+
+    为什么要有这个开关: 思考会**显著增加** token 消耗和延迟
+    (实测 reasoning tokens 135~370, 延迟多几百毫秒)。语音场景下
+    不是每条请求都值得开 —— 简单闲聊没必要, 复合查询才需要。
+    """
+    if not thinking:
+        return
+    if not isinstance(thinking, dict):
+        return
+    if thinking.get("type") != "enabled":
+        return
+    if provider and provider not in THINKING_CAPABLE_PROVIDERS:
+        logger.info(
+            "[LLM] provider=%s 不支持 thinking, 跳过", provider
+        )
+        return
+    payload["thinking"] = dict(thinking)
 
 
 #: httpx 不认识的代理协议 (如 socks://)。出现这类环境变量时 httpx 会直接抛
@@ -501,7 +592,41 @@ class LLMClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
         role: Optional[str] = None,
+        thinking: Optional[Dict[str, Any]] = None,
     ) -> str:
+        """普通对话, 返回正文。
+
+        ``thinking`` 见 :func:`_apply_thinking` —— 开启后模型会先思考再回答。
+
+        注意: 这里**只返回正文**。要拿思考内容请用 :meth:`chat_with_thinking`。
+        """
+        result = await self.chat_with_thinking(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            role=role,
+            thinking=thinking,
+        )
+        return result.content
+
+    async def chat_with_thinking(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
+        role: Optional[str] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+    ) -> ChatResult:
+        """普通对话, 返回正文 **+ 思考过程**。
+
+        这是 :meth:`chat` 的完整版 —— 需要看模型「怎么想的」时用它。
+        """
         role_name = role or "chat"
         targets = self.resolve(role_name, model=model)
         if not targets:
@@ -521,24 +646,42 @@ class LLMClient:
             payload["tools"] = tools
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
+        _apply_thinking(payload, thinking, head.provider)
         t0 = time.time()
         data, used = await self._post("/chat/completions", payload, targets, role_name)
         elapsed_ms = int((time.time() - t0) * 1000)
         try:
-            content = data["choices"][0]["message"].get("content") or ""
+            message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"响应格式异常: {exc}") from exc
+        content = str(message.get("content") or "")
         usage = data.get("usage") or {}
+        reasoning_text = str(message.get("reasoning_content") or "")
+        if not reasoning_text:
+            reasoning_text = str(message.get("reasoning") or "")
+        reasoning_tokens = int(
+            (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        )
         logger.info(
-            "[LLM] %dms provider=%s model=%s role=%s tokens=%s/%s",
+            "[LLM] %dms provider=%s model=%s role=%s tokens=%s/%s think=%d",
             elapsed_ms,
             used.provider,
             used.model,
             role_name,
             usage.get("prompt_tokens", "?"),
             usage.get("completion_tokens", "?"),
+            reasoning_tokens,
         )
-        return content
+        return ChatResult(
+            content=content,
+            thinking=reasoning_text,
+            reasoning_tokens=reasoning_tokens,
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+            provider=used.provider,
+            model=used.model,
+            elapsed_ms=elapsed_ms,
+        )
 
     async def tool_call(
         self,
@@ -583,9 +726,8 @@ class LLMClient:
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
         
-        # 添加 thinking 参数 (Agnes/DeepSeek 支持)
-        if thinking:
-            payload["thinking"] = thinking
+        # 添加 thinking 参数 (只对支持的 provider 发, 见 _apply_thinking)
+        _apply_thinking(payload, thinking, head.provider)
 
         t0 = time.time()
         data, used = await self._post("/chat/completions", payload, targets, role_name)
@@ -625,6 +767,15 @@ class LLMClient:
             )
 
         usage = data.get("usage") or {}
+        # 思考内容: OpenAI 兼容接口放在 message.reasoning_content
+        # (Agnes / DeepSeek 都是这个字段名)
+        thinking = str(message.get("reasoning_content") or "")
+        # 有些实现叫 reasoning, 兜底一起看
+        if not thinking:
+            thinking = str(message.get("reasoning") or "")
+        reasoning_tokens = int(
+            (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        )
         result = ToolCallResult(
             content=content,
             calls=calls,
@@ -633,9 +784,12 @@ class LLMClient:
             completion_tokens=int(usage.get("completion_tokens") or 0),
             provider=used.provider,
             model=used.model,
+            thinking=thinking,
+            reasoning_tokens=reasoning_tokens,
         )
         logger.info(
-            "[LLM] %dms provider=%s model=%s role=%s tools=%d calls=%d finish=%s tokens=%s/%s",
+            "[LLM] %dms provider=%s model=%s role=%s tools=%d calls=%d finish=%s "
+            "tokens=%s/%s think=%d",
             elapsed_ms,
             used.provider,
             used.model,
@@ -645,6 +799,7 @@ class LLMClient:
             finish_reason,
             result.prompt_tokens,
             result.completion_tokens,
+            reasoning_tokens,
         )
         return result
 
@@ -768,6 +923,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         max_rounds: int = 2,
         role: Optional[str] = None,
+        thinking: Optional[Dict[str, Any]] = None,
     ) -> ToolCallResult:
         """带 tools 的多轮调用。
 
@@ -779,6 +935,11 @@ class LLMClient:
         工具执行完用本地固定文案回复即可, 又快又稳定。
 
         `max_rounds` 是硬上限, 防模型反复调同一个工具形成死循环。
+
+        ``thinking``: 每一轮都开启思考 (见 :func:`_apply_thinking`)。
+        **多轮的思考内容会被累积**到结果的 ``thinking`` 字段里 —— 每一轮
+        模型都在「看到工具结果 -> 想清楚 -> 再决定」, 这些思考串起来才是
+        完整的推理链。只保留最后一轮会丢掉最有价值的前几轮思考。
         """
         result = await self.tool_call(
             messages,
@@ -788,6 +949,7 @@ class LLMClient:
             temperature=temperature,
             max_tokens=max_tokens,
             role=role,
+            thinking=thinking,
         )
 
         if not result.has_calls or max_rounds <= 1:
@@ -802,6 +964,12 @@ class LLMClient:
                 **({"tool_calls": _calls_to_raw(result.calls)} if result.calls else {}),
             }
         )
+
+        # 累积各轮的思考内容 (第一轮已经在 result 里了)
+        thinking_parts: List[str] = []
+        if result.thinking.strip():
+            thinking_parts.append(result.thinking.strip())
+        total_reasoning_tokens = result.reasoning_tokens
 
         for _ in range(max_rounds - 1):
             for call in result.calls:
@@ -825,11 +993,18 @@ class LLMClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 role=role,
+                thinking=thinking,
             )
+            if result.thinking.strip():
+                thinking_parts.append(result.thinking.strip())
+            total_reasoning_tokens += result.reasoning_tokens
             # 模型不再要工具了 -> 它的 content 就是最终回复
             if not result.has_calls:
                 break
 
+        # 把累积的思考写回结果
+        result.thinking = "\n\n---\n\n".join(thinking_parts)
+        result.reasoning_tokens = total_reasoning_tokens
         return result
 
 

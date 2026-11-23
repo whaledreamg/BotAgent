@@ -80,7 +80,11 @@ class VisionGraspSkill(Skill):
 - arm (可选): left / right，默认 right
 - approach_distance (可选): 预抓取点在物体上方的距离，默认 0.1m
 - duration (可选): 运动时长，默认取 configs/arm.yaml 的 grasp.duration (3 秒)
-- execute (可选): false 时只规划不动，默认 true
+
+## 动不动由谁决定
+**由机械臂服务决定, 不是这个 skill**。configs/arm.yaml 的 `arm.enabled`
+是「控制指令总闸」: 设为 false 时, arm_service 不向控制器下发任何控制
+指令, 只把算好的位置报出来 (move_to 返回 code="disabled")。
 
 ## 输出格式
 ```json
@@ -120,11 +124,6 @@ class VisionGraspSkill(Skill):
                         "type": "number",
                         "description": "运动时长（秒），不给则用配置默认值（3 秒）",
                     },
-                    "execute": {
-                        "type": "boolean",
-                        "description": "false 时只规划不移动",
-                        "default": True,
-                    },
                 },
                 "required": ["target"],
             },
@@ -140,7 +139,13 @@ class VisionGraspSkill(Skill):
         )
 
     async def execute(self, args: Dict[str, Any]) -> SkillResult:
-        """识别 -> 取离机器人最近的 -> 经门阀移动到预抓取点 -> 落盘追溯。"""
+        """识别 -> 取离机器人最近的 -> 请求移动到预抓取点 -> 落盘追溯。
+
+        **动不动由机械臂服务决定** —— 这个 skill 只管把位置算对,
+        然后调 ``move_to``; 机械臂服务那边有个「控制指令总闸」
+        (``configs/arm.yaml`` 的 ``arm.enabled``), 关着就只算位置、
+        不下发任何控制指令。
+        """
         started = time.time()
 
         valid, error_msg = await self.validate_args(args)
@@ -158,7 +163,6 @@ class VisionGraspSkill(Skill):
         approach_distance = float(args.get("approach_distance", 0.1))
         duration = args.get("duration")
         duration = float(duration) if duration not in (None, "") else None
-        do_execute = args.get("execute", True) not in (False, "false", "False", 0)
 
         if not target:
             return SkillResult(
@@ -173,7 +177,6 @@ class VisionGraspSkill(Skill):
             "target": target,
             "arm": side,
             "approach_distance": approach_distance,
-            "execute": do_execute,
         }
 
         try:
@@ -275,22 +278,11 @@ class VisionGraspSkill(Skill):
                 "candidates": len(candidates),
             }
 
-            # ---- 4. 只规划不动 ----
-            if not do_execute:
-                trace["outcome"] = "planned_only"
-                reply = (
-                    f"找到{target}，离机械臂 {chosen['distance_to_base']:.2f} 米。"
-                    f"预抓取点 {approach_pos[0]:.3f}, {approach_pos[1]:.3f}, "
-                    f"{approach_pos[2]:.3f}。"
-                )
-                self._write_trace(trace, started)
-                return SkillResult(
-                    ok=True, output=reply, reply=reply, speak=True,
-                    state_updates=state_updates, payload=payload,
-                    elapsed_ms=(time.time() - started) * 1000,
-                )
-
-            # ---- 5. 移动: 先到物体上方的预抓取点, 不直接去物体表面 ----
+            # ---- 4. 移动: 先到物体上方的预抓取点, 不直接去物体表面 ----
+            #
+            # **动不动由机械臂服务决定** (那边的控制指令总闸)。这里
+            # 无条件请求移动 —— 如果总闸关着, 服务会只算位置、不下发
+            # 指令, 返回 code="disabled"。
             move = await self.arm_client.move_to(
                 side, approach_pos[0], approach_pos[1], approach_pos[2],
                 duration=duration,
@@ -301,6 +293,24 @@ class VisionGraspSkill(Skill):
             payload["move"] = {
                 k: move.get(k) for k in ("ok", "code", "stage", "message", "error_m")
             }
+
+            # ---- 5. 总闸关着: 只算不动, 把算出来的位置报给用户 ----
+            if move.get("code") == "disabled":
+                trace["outcome"] = "planned_only"
+                reply = (
+                    f"找到{target}，离机械臂 {chosen['distance_to_base']:.2f} 米。"
+                    f"目标点 {target_pos[0]:.3f}, {target_pos[1]:.3f}, "
+                    f"{target_pos[2]:.3f}。"
+                    f"预抓取点 {approach_pos[0]:.3f}, {approach_pos[1]:.3f}, "
+                    f"{approach_pos[2]:.3f}。机械臂没有动。"
+                )
+                self._write_trace(trace, started)
+                return SkillResult(
+                    ok=True, output=reply, reply=reply, speak=True,
+                    state_updates=state_updates, payload=payload,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
             if not move.get("ok"):
                 msg = str(move.get("message") or "机械臂没有移动")
                 self._write_trace(trace, started)

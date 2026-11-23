@@ -53,6 +53,30 @@ llm:
   # 语音回复要短, 限制生成长度直接降低 TTFT 和 TTS 合成时间
   max_tokens: 256
 
+  # **聊天分支**的思考配置 (与 router.tool_calling.thinking 相互独立)
+  #
+  # 之前 thinking 只挂在 tool calling 上, 所以纯闲聊**永远不会思考**。
+  # 现在 chat 也能思考了, 但默认关闭 —— 思考会多花几百毫秒和几百 token,
+  # 简单闲聊 («你好»/«讲个笑话») 开它纯属浪费。
+  #
+  # 什么时候值得开: 需要模型「想清楚再答」的问题 (知识问答、方案对比、
+  # 多步推理)。这时候答案质量提升明显, 多花的延迟能接受。
+  #
+  # 实测 (Agnes agnes-2.5-flash):
+  #   关闭 -> 43 completion tokens, 无 reasoning_content
+  #   开启 -> 375 completion tokens (其中 341 是 reasoning), reasoning_content 有内容
+  #
+  # 注意: 只有 THINKING_CAPABLE_PROVIDERS (agnes/deepseek) 会带上这个参数,
+  # 其它 provider 发了也是白费 (见 llm.py 的 _apply_thinking)。
+  thinking:
+    enabled: false
+    # 思考预算。聊天场景不需要 tool calling 那么多 —— 8000 是给拆任务用的,
+    # 这里 4000 足够「想清楚一个问题再答」。
+    #
+    # 改成 true 即可给闲聊也开思考 (实测: reasoning_content 有内容,
+    # ~125 reasoning tokens, 延迟多几百毫秒)。
+    budget_tokens: 4000
+
 # 语义识别 / 意图分流
 router:
   mode: hybrid                 # rules | llm | hybrid
@@ -153,8 +177,10 @@ router:
 # 所以禁用 vision.grasp 就够了, 不用再单独写 grasp_object。
 skills:
   # 视觉抓取: 识别物体 + 控制机械臂移动过去
-  disabled:
-    - vision.grasp
+  #
+  # 已启用。**动不动由机械臂服务决定** —— 见 configs/arm.yaml 的
+  # `arm.enabled` (控制指令总闸): 关着就只算位置不动机械臂。
+  disabled: []
   disabled_tools: []
 
 # 各分支处理器 (新增分支 = 加一个 handlers/xxx.py + 这里一段)
@@ -181,6 +207,18 @@ handlers:
       vision_timeout: 15.0
       # 抓取移动调用的机械臂服务 (留空用 configs/actions.yaml 的 arm.base_url)
       arm_base_url: ""
+      # ---- 抓取: 只计算, 不真的动 ----
+      #
+      # **抓取动不动, 由机械臂服务决定** —— 见 configs/arm.yaml 的
+      # ``arm.enabled`` (控制指令总闸)。那里关着, arm_service 就不下发
+      # 任何控制指令, 抓取只算位置不动作。
+      #
+      # 本文件不再有抓取模式开关 —— 放在机械臂那边才管得住所有路径
+      # (抓取 skill / 动作库播放 / LLM tool calling)。
+      #
+      # 运行时也能改, 不用重启服务:
+      #   curl -X POST localhost:8800/v1/grasp_mode -d '{"dry_run": true}'
+      #   curl localhost:8800/v1/grasp_mode          # 看当前状态
       # ---- 天气 (Open-Meteo, 免 key) ----
       # **必须由用户说出城市名** —— 语音里「今天天气怎么样」很常见,
       # 但没说城市就查不了。IP 定位在移动网络/代理下经常偏几百公里,
@@ -212,11 +250,24 @@ session:
 
 # 语音助手的系统提示词 (chat 分支使用)
 # 长度直接决定 TTS 合成耗时 (CPU 上约 1 字 ≈ 0.19s 音频), 因此要严格限制。
+#
+# 「不超过 40 个字」是**目标**, 不是硬闸 —— 模型不总遵守。
+# 真正的兜底在 handlers/base.py 的 prepare_speak_text (MAX_SPEAK_CHARS)。
+#
+# 补充的两条很重要:
+# 1. 「不要用『首先/其次/1. 2.』这类结构」—— 语音里没有视觉锚点,
+#    列表结构听起来就是一堆散乱的信息, 而且会诱发 markdown。
+# 2. 「用户追问『然后呢』时, 继续讲**上一轮没讲完的部分**」——
+#    之前模型会把整段答案重讲一遍, 用户听着特别烦。
 system_prompt: |
   你是一个中文语音助手。用户通过语音与你对话,
   请用简洁、口语化的中文回答, **总长度不超过 40 个字**。
   通常只说一到两句话, 直接给答案, 不要铺垫和解释。
   不要使用 markdown 语法、列表或表情符号, 只输出要说出口的话。
+  不要用「首先」「其次」「1.」「2.」这类结构, 也不要把内容拆成带序号的条目,
+  就当成在跟人说话一样连着讲。
+  如果用户追问「然后呢」「继续」, 就接着上一轮**还没讲到的部分**继续说,
+  不要把已经讲过的内容重讲一遍。
 
 # 语义识别用的提示词 (router LLM 兜底时使用)
 # Phase 6：改进为轻量级分支级分类（只分 3 个分支，不是 100+ intent）

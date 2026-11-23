@@ -663,6 +663,11 @@ class Router:
 
         timeout = max(0.5, float(getattr(tc, "timeout", 5.0)))
         started = time.time()
+        # 思考参数 (与 _decide_by_tools_branch 保持一致)
+        thinking_param = None
+        tc_thinking = getattr(tc, "thinking", None)
+        if tc_thinking is not None and tc_thinking.enabled:
+            thinking_param = tc_thinking.to_payload()
         try:
             result = await asyncio.wait_for(
                 self.llm.tool_call(
@@ -672,6 +677,7 @@ class Router:
                     temperature=getattr(tc, "temperature", 0.0),
                     max_tokens=getattr(tc, "max_tokens", 256),
                     role="tool",
+                    thinking=thinking_param,
                 ),
                 timeout=timeout,
             )
@@ -721,7 +727,12 @@ class Router:
             {
                 "phase": "tool_calling",
                 "text": req.text,
+                # content = 模型在决定调不调工具时说的话
                 "content": (result.content or "").strip(),
+                # reasoning = 模型**真正的推理过程** (reasoning_content)
+                # 之前这个字段没被读取, 于是思考内容全丢了
+                "reasoning": (result.thinking or "").strip(),
+                "reasoning_tokens": result.reasoning_tokens,
                 "finish_reason": result.finish_reason,
                 "provider": result.provider,
                 "model": result.model,
@@ -870,6 +881,11 @@ class Router:
         """
         timeout = max(0.5, float(getattr(tc, "timeout", 5.0)))
         started = time.time()
+        # 思考参数 (与主路径保持一致)
+        thinking_param = None
+        tc_thinking = getattr(tc, "thinking", None)
+        if tc_thinking is not None and tc_thinking.enabled:
+            thinking_param = tc_thinking.to_payload()
         try:
             result = await asyncio.wait_for(
                 self.llm.tool_call(
@@ -879,6 +895,7 @@ class Router:
                     temperature=getattr(tc, "temperature", 0.0),
                     max_tokens=getattr(tc, "max_tokens", 256),
                     role="tool",
+                    thinking=thinking_param,
                 ),
                 timeout=timeout,
             )
@@ -1010,10 +1027,7 @@ class Router:
         # 准备 thinking 模式参数
         thinking_param = None
         if hasattr(tc, 'thinking') and tc.thinking and tc.thinking.enabled:
-            thinking_param = {
-                "type": "enabled",
-                "budget_tokens": tc.thinking.budget_tokens,
-            }
+            thinking_param = tc.thinking.to_payload()
         
         try:
             result = await asyncio.wait_for(

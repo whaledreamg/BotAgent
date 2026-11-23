@@ -259,3 +259,29 @@ class ArmClient:
             return resp.status_code == 200
         except Exception:
             return False
+
+    async def get_control_enabled(self) -> Dict[str, Any]:
+        """看机械臂的控制指令总闸状态。
+
+        ``{"enabled": false}`` = 只算不动, 不下发任何控制指令。
+        """
+        try:
+            resp = await self._client.get("/v1/control_enabled", timeout=6.0)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"查询控制总闸失败: {exc}") from exc
+
+    async def set_control_enabled(self, enabled: Optional[bool]) -> Dict[str, Any]:
+        """切换机械臂的控制指令总闸。
+
+        ``enabled=False`` -> 只算不动; ``None`` -> 回到配置默认值。
+        """
+        try:
+            resp = await self._client.post(
+                "/v1/control_enabled", json={"enabled": enabled}, timeout=6.0
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"设置控制总闸失败: {exc}") from exc

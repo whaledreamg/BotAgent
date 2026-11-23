@@ -39,6 +39,7 @@ logger = logging.getLogger("agent.tools")
 KIND_ACTION = "action"   #: 执行型, 只执行不朗读
 KIND_QUERY = "query"     #: 输出型, 结果要朗读
 
+
 #: 动作表: name -> 规格
 #:   kind      工具类别 (KIND_ACTION / KIND_QUERY)
 #:   patterns  匹配模式
@@ -783,9 +784,13 @@ class ToolHandler(Handler):
         return "ok", reply + "。"
 
     async def _execute_grasp_object(self, args: Dict[str, Any]) -> Tuple[str, str]:
-        """抓取: 识别最近的目标 -> 经安全门阀移动到预抓取点。
+        """抓取: 识别最近的目标 -> 请求移动到预抓取点。
 
         结果文案 (含失败原因) 直接念给用户。
+
+        **动不动由机械臂服务决定** (``configs/arm.yaml`` 的
+        ``arm.enabled`` 控制指令总闸) —— 这里无条件请求移动, 总闸关着
+        的话 arm_service 会只算位置、不下发指令。
         """
         from skill.builtin.vision_grasp import VisionGraspSkill
 
@@ -799,9 +804,10 @@ class ToolHandler(Handler):
             arm_client=self.arm_client,
         )
         skill_args: Dict[str, Any] = {"target": target}
-        for key in ("arm", "approach_distance", "duration", "execute"):
+        for key in ("arm", "approach_distance", "duration"):
             if args.get(key) not in (None, ""):
                 skill_args[key] = args[key]
+
         result = await skill.execute(skill_args)
         text = result.reply or result.error or result.output or "抓取没有完成"
         return ("ok" if result.ok else "failed"), text

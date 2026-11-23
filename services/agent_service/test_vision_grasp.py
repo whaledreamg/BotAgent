@@ -85,9 +85,18 @@ async def main():
     check(not res.ok and res.reply == "控制器处于手动模式，请切到自动模式", "原因原样念出")
     check(tr[0]["outcome"] == "rejected:ops_mode", "追溯记录写明拒绝原因")
 
-    print("只规划:")
-    res, _, arm, tr = await run([obj(0.5, 0, -0.3)], execute=False)
-    check(res.ok and not arm.moves and tr[0]["outcome"] == "planned_only", "execute=false 不动")
+    print("控制总闸关着 (只算不动):")
+    #
+    # 开关在**机械臂服务**那边 (configs/arm.yaml 的 arm.enabled), 表现是
+    # move_to 返回 code="disabled"。skill 这边无条件请求移动, 由服务决定。
+    disabled = FakeArm({
+        "ok": False, "code": "disabled", "stage": "gate",
+        "message": "机械臂控制已关闭，只计算了位置，机械臂没有动",
+    })
+    res, _, arm, tr = await run([obj(0.5, 0, -0.3)], arm=disabled)
+    check(len(arm.moves) == 1, "确实请求了移动 (由机械臂服务决定动不动)")
+    check(res.ok and tr[0]["outcome"] == "planned_only", "总闸关着 -> 只算不动")
+    check("目标点" in res.reply and "机械臂没有动" in res.reply, f"报出算好的位置: {res.reply}")
 
     print("时长透传:")
     _, _, arm, _ = await run([obj(0.5, 0, -0.3)], duration=5)
