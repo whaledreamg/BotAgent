@@ -98,6 +98,13 @@ class CartesianMock(MockRobotServer):
             db = {"commandPort": self.udp_port, "commandPortReady": True,
                   "sessions": [{"robot": self.arm_name, "state": "active", "error": "none",
                                 "analyticIkStage": stage, "analyticIkPositionDeviation": dev}]}
+        elif ty == "device/getSafetyParams":
+            # 关节软限位。
+            neg, pos = [-3.0] * 7, [3.0] * 7
+            db = {
+                "jointPositionLimitNegative": list(neg),
+                "jointPositionLimitPositive": list(pos),
+            }
         else:
             await super()._respond(ws, msg)
             return

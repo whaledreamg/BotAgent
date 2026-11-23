@@ -19,7 +19,7 @@ import logging
 import math
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from robot.cartesian import CartesianStreamer
 from robot.controller import Phase
@@ -130,8 +130,39 @@ class CartesianMover:
     ) -> Dict[str, Any]:
         """把某条臂的 TCP 移到世界系下的目标位姿。**阻塞到走完**。
 
-        a/b/c 不给就用配置里示教的抓取姿态。``speak=False`` 时失败不由服务端播报。
+        a/b/c 不给就用配置里示教的抓取姿态; 两者都没给就**保持当前
+        TCP 姿态**, 只挪位置 (见 ``configs/arm.yaml`` 的 ``grasp``)。
+
+        ``speak=False`` 时失败不由服务端播报。
+
+        **控制指令总闸** (``arm.enabled=false``): 只算不动 —— 返回
+        ``ok=false, code="disabled"`` 并附上算好的目标位姿, 一个控制指令
+        都不下发。
+
+        **下发之前会先做规划检查**, 任何一项不过就**一个指令都不发**:
+          - 目标离基座太远 (``out_of_reach``)
+          - 门阀不通过 (``safety``)
         """
+        # ---- 控制指令总闸 ----
+        #
+        # 这是机械臂的**最后一道**安全闸: 放在这里意味着不管上层怎么调
+        # (抓取 skill / 动作库 / LLM tool calling), 只要这个开关关着,
+        # 就不会有任何控制指令发到控制器。
+        #
+        # 位置照算照报 —— 用户要看的正是算出来的坐标对不对。
+        if not self._svc.control_enabled:
+            logger.warning("[移动] 控制指令总闸已关闭: 只算位置, 不下发指令")
+            return self._reject(
+                "disabled",
+                "机械臂控制已关闭，只计算了位置，机械臂没有动",
+                stage="gate",
+                speak=False,
+                extra={
+                    "target_world": {"x": float(x), "y": float(y), "z": float(z)},
+                    "planned_only": True,
+                },
+            )
+
         grasp = self._svc.arm_cfg.grasp
         dur = float(duration) if duration else float(grasp.duration)
         if not (MIN_DURATION <= dur <= MAX_DURATION):
@@ -203,10 +234,41 @@ class CartesianMover:
         tcp_world = pose_from_xyzabc(data["cartesian"])
 
         # ---- 4. 目标位姿 (世界系) 与臂展粗检 ----
-        taught = grasp.orientation.get(side, {"a": 0.0, "b": 0.0, "c": 0.0})
-        oa = float(taught["a"] if a is None else a)
-        ob = float(taught["b"] if b is None else b)
-        oc = float(taught["c"] if c is None else c)
+        #
+        # **姿态**: 优先用请求里给的 a/b/c; 没给就用配置里示教的;
+        # 两边都没有就**保持当前 TCP 姿态** (只挪位置)。
+        #
+        # 「保持当前姿态」是默认且推荐的做法 —— 末端位姿一变, 七个关节
+        # 全得跟着动, 很容易撞软限位被控制器停掉 (13101)。只挪位置
+        # 时关节角变化最小。
+        #
+        # **别拿 0,0,0 当占位**: 那是「姿态全零」不是「不指定」。
+        # 机械臂现在若是 (2.97, 0.74, -3.00), 硬转到全零要转 138 度,
+        # 必然把某个关节推出软限位。
+        taught = grasp.orientation.get(side) or {}
+        if a is not None or b is not None or c is not None:
+            oa = float(taught.get("a", 0.0) if a is None else a)
+            ob = float(taught.get("b", 0.0) if b is None else b)
+            oc = float(taught.get("c", 0.0) if c is None else c)
+            keep_orientation = False
+        elif taught:
+            oa = float(taught["a"])
+            ob = float(taught["b"])
+            oc = float(taught["c"])
+            keep_orientation = False
+        else:
+            # 保持当前 TCP 姿态: 把当前欧拉角当成示教值用。
+            cur = data["cartesian"]
+            oa = float(cur["a"])
+            ob = float(cur["b"])
+            oc = float(cur["c"])
+            keep_orientation = True
+            logger.info(
+                "[移动] %s 没示教抓取姿态 —— 保持当前 TCP 姿态 "
+                "(a=%.4f, b=%.4f, c=%.4f), 只挪位置",
+                name, oa, ob, oc,
+            )
+
         target_world: Pose = ((x, y, z), euler_to_quat(oa, ob, oc))
         target_base = world_to_base(
             base_pose[0], base_pose[1], target_world[0], target_world[1]
@@ -218,6 +280,7 @@ class CartesianMover:
             "side": side,
             "duration": duration,
             "target_world": {"x": x, "y": y, "z": z, "a": oa, "b": ob, "c": oc},
+            "keep_orientation": keep_orientation,
             "target_base": {
                 "x": target_base[0][0], "y": target_base[0][1], "z": target_base[0][2],
             },
@@ -452,8 +515,26 @@ class CartesianMover:
 
     @staticmethod
     def _translate_session_error(err: str) -> str:
+        """把控制器的会话错误翻成一句能听懂的话。
+
+        ``stoppedBySafety`` 是**笼统**的说法 —— 控制器只告诉我们
+        「被安全监控停掉了」, 没说是哪一项触发。笼统的话术会让用户
+        以为是急停没松, 或者以为要切什么模式, 其实往往只是
+        「关节撞软限位」或「末端太快」。
+
+        真正的原因要去控制器的告警里找 (``log/queryLog``), 常见两类:
+
+        - ``13101`` 关节位置超出软限位 —— 姿态转得太多, 某个关节被推出了限位
+        - ``13105`` 末端 (TCP) 过速 —— 轨迹太快
+
+        这里给一个**指向性**的提示, 让用户知道该往哪查, 而不是
+        笼统地说「安全保护」。
+        """
         if err == "stoppedBySafety":
-            return "机械臂触发了安全保护，已停止移动"
+            return (
+                "机械臂被控制器安全停掉了, 已停止移动。"
+                "通常是关节撞到软限位或末端过快, 请检查抓取姿态和运动速度"
+            )
         if err == "stoppedByNumericalIkFailure":
             return "目标点够不着，机械臂已停止"
         if err == "stoppedByStreamLoss":

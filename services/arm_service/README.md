@@ -70,7 +70,9 @@ services/arm_service/
 └── tools/
     ├── check_arm.py         # 协议级自检 (mock, 不需要真机)
     ├── check_arm_service.py # 端到端自检 (mock 控制器 + 真实服务)
-    └── check_safety.py      # 安全门阀自检 (不需要真机)
+    ├── check_safety.py      # 安全门阀自检 (不需要真机)
+    ├── check_control_gate.py # 控制指令总闸自检 (mock, 不需要真机)
+    └── check_move_to.py     # 抓取移动自检 (mock, 不需要真机)
 ```
 
 ## 配置
@@ -87,5 +89,57 @@ services/arm_service/
 | `arm.joint_limit.enable` | `true` | 关节级限幅, **协议缺省是关闭的, 不要关** |
 | `arm.action_dir` | `services/arm_service/data` | 动作库目录 |
 | `arm.exclude_files` | `[]` | 要跳过的文件名 (留空 —— 动作库都是单动作文件) |
+| `arm.enabled` | `true` | **控制指令总闸**。false = 只算不动, 一个控制指令都不下发 |
+| `arm.grasp.orientation` | `{}` | 示教的抓取姿态 (a/b/c, rad)。**留空 = 保持当前 TCP 姿态** |
 
-环境变量覆盖: `ARM_CONTROLLER_WS` / `ARM_SERVER_PORT` / `ARM_FREQUENCY` 等。
+环境变量覆盖: `ARM_CONTROLLER_WS` / `ARM_SERVER_PORT` / `ARM_FREQUENCY` /
+`ARM_ENABLED` 等。
+
+## 抓取移动 (`POST /v1/move_to`)
+
+视觉识别到物体后, 把 TCP 移到物体上方的预抓取点。
+
+### 抓取姿态: 留空 = 保持当前姿态
+
+`configs/arm.yaml` 的 `arm.grasp.orientation` 留空时, **保持当前 TCP 姿态**,
+只挪位置 —— 这是默认且推荐的做法。
+
+姿态一变, 七个关节全得跟着动, 很容易撞软限位被控制器停掉。
+
+**别填 `0,0,0` 当占位** —— 那是「姿态全零」不是「不指定」。机械臂当前姿态
+若是 `(2.97, 0.74, -3.00)`, 硬转到全零要转 **138 度**, 关节角大幅变化,
+必然把某个关节推出软限位 (报 `13101` 关节位置超出软限位)。
+
+要固定抓取姿态, 先手动摆好再抄值:
+
+```bash
+curl -s http://127.0.0.1:8802/v1/kinematics | python -m json.tool | grep -A 8 cartesian
+```
+
+### 下发前的规划检查
+
+任何一项不过, **一个控制指令都不发** (机械臂完全不动):
+
+| code | 含义 |
+|------|------|
+| `disabled` | 控制指令总闸关着 (`arm.enabled=false`) —— 只算位置 |
+| `out_of_reach` | 目标离基座超过 `arm.grasp.max_reach` |
+| `safety` | 安全门阀不通过 (急停 / 故障 / 手动模式 / 未使能) |
+
+### 排查「被安全停掉」
+
+`stoppedBySafety` 是控制器的笼统说法, 真正原因在控制器告警里:
+
+```bash
+# 查控制器告警 (13101 = 关节超软限位, 13105 = 末端过速)
+# 用 log/queryLog 接口, 或看机械臂本体的 HMI
+```
+
+两个常见原因:
+
+**关节撞到软限位** —— 控制器用的是**解析逆解** (`cartesianIkPath: analytic`),
+逆解会自己挑一组关节角。挑到贴限位的解时, 运动途中关节就被推过软限位。
+**先手动把臂收回安全姿态**再试。
+
+另外 `maxArmAngleDelta` 用的是控制器缺省的 `0.2`, 别调小 —— 它限的是每包
+臂型角的变化量, 控制器靠臂型角**让位**来躲开关节限位, 让位跟不上就会撞限位。
