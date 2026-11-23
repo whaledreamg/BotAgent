@@ -88,6 +88,7 @@ from calibration.capture import (  # noqa: E402
 )
 from calibration.handeye import PoseSample, solve_handeye  # noqa: E402
 from calibration.paths import config_path  # noqa: E402
+from paths import conda_env_python  # noqa: E402
 from calibration.session import (  # noqa: E402
     SessionData,
     load_session,
@@ -344,11 +345,12 @@ def capture_samples(
             except EOFError:
                 # stdin 没了 —— 大概率是 `conda run` 切断的。
                 # 别静默退出 (看起来像「相机/机械臂有问题」), 要说清楚。
+                env_python = conda_env_python("yolo") or "<conda 环境>/bin/python"
                 print(
                     "\n  **stdin 提前结束 (EOF)** —— 采样中断。\n"
                     "  如果你还没采够, 这是因为用了 `conda run` (它会切断 stdin)。\n"
                     "  改用: conda run --no-capture-output -n yolo python ...\n"
-                    "  或:   /home/gxh/miniconda3/envs/yolo/bin/python ...\n",
+                    f"  或:   {env_python} ...\n",
                     file=sys.stderr,
                 )
                 break

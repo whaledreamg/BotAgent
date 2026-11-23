@@ -134,9 +134,10 @@ def test_tracer_time_range():
 
 if __name__ == "__main__":
     import sys
+    from pathlib import Path
 
-    # 确保在正确的目录
-    sys.path.insert(0, "/home/gxh/workspace/project/Bot Agent/services/vision_service")
+    # 确保在正确的目录 (不写死绝对路径 —— 换机器就找不到模块了)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
     print("=" * 60)
     print("追溯系统测试")

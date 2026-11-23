@@ -23,6 +23,14 @@ EOF。于是脚本刚打印提示符就立刻退出, 一个样本都没采到 �
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+# 兼容「既作为包导入, 又被 tools/ 下的脚本把目录塞进 sys.path」两种用法
+try:
+    from paths import conda_env_python
+except ImportError:  # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from paths import conda_env_python
 
 
 def stdin_is_interactive() -> bool:
@@ -73,6 +81,18 @@ def require_interactive_stdin(tool_hint: str = "") -> bool:
 
     hint = tool_hint or "python <脚本> --capture"
     bar = "=" * 62
+
+    # 环境里的 python 路径 —— 不写死, 换机器/换用户名也不会失效
+    env_python = conda_env_python("yolo")
+    if env_python:
+        alt = f"    {env_python} {hint}"
+    else:
+        alt = (
+            "    <conda 环境>/bin/python " + hint
+            + "\n"
+            "    (用 paths.conda_env_python() 可以自动找到)"
+        )
+
     print(
         f"""
 {bar}
@@ -90,7 +110,7 @@ def require_interactive_stdin(tool_hint: str = "") -> bool:
     conda run --no-capture-output -n yolo {hint}
 
     # 2. 直接用环境里的 python, 不套 conda run
-    /home/gxh/miniconda3/envs/yolo/bin/python {hint}
+{alt}
 
   (需要先 cd services/vision_service)
 {bar}

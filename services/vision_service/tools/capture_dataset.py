@@ -22,7 +22,7 @@ Orbbec 是 USB 独占设备 —— 视觉服务在跑的时候, 别的进程开�
 
     # 指定输出目录 + 每张间隔 1 秒 (采慢一点, 场景变化更丰富)
     conda run -n yolo python tools/capture_dataset.py \
-        --out /home/gxh/workspace/project/datasets/myobjects --count 300 --interval 1.0
+        --out ../../datasets/myobjects --count 300 --interval 1.0
 
     # **手动模式** —— 每张需按 Enter 触发，中间可调整场景 (推荐用这个!)
     conda run -n yolo python tools/capture_dataset.py --count 100 --manual
@@ -61,9 +61,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from camera import CameraError, OrbbecCamera  # noqa: E402
 from config import load_config  # noqa: E402
+from paths import resolve_data_dir  # noqa: E402
 
-#: 默认数据集根目录 (放项目外 —— 数据集不该进 git)
-DEFAULT_OUT = Path("/home/gxh/workspace/project/datasets/myobjects")
+#: 默认数据集根目录 (仓库内 datasets/ —— 数据集本身不该进 git,
+#: 目录结构进, 图片不进)
+DEFAULT_OUT = resolve_data_dir() / "myobjects"
 
 #: 粗略的距离档位 (米) —— 用来统计覆盖度
 DISTANCE_BUCKETS = (0.4, 0.8, 1.2, 2.0)

@@ -236,9 +236,13 @@ services/tts_service/output/
 
 # ---- YOLO 训练相关 ----
 #
-# 数据集不入库 (体积大, 且通常是现场采的) —— 默认在项目外的
-# /home/gxh/workspace/project/datasets/ 下, 这条是兜底。
-datasets/
+# 数据集不入库 (体积大, 且通常是现场采的) —— 默认在项目内的
+# datasets/ 下 (目录结构进, 图片不进), 这条是兜底。
+#
+# 注意: datasets/README.md 要入库 (说明这个目录干嘛用的),
+# 所以下面用 `datasets/*` + 反向规则, 而不是直接忽略整个目录。
+datasets/*
+!datasets/README.md
 *.jpg
 *.jpeg
 *.png
@@ -249,3 +253,20 @@ datasets/
 *.pt
 *.onnx
 runs/
+
+# ---- 视觉服务的外部资源 (大文件, 不入库) ----
+#
+# models/  datasets/  sdk/ 里的东西都是「机器本地」的:
+#   - 模型权重几十 MB
+#   - 数据集几百 MB
+#   - SDK 编译产物几百 MB
+#
+# 仓库里只保留目录结构和 README, 实际文件由 paths.py 在运行时按
+# 「@相对仓库根 -> 环境变量 -> 约定目录」的顺序去找。
+# 详见 services/vision_service/paths.py
+models/*
+!models/README.md
+datasets/*
+!datasets/README.md
+sdk/*
+!sdk/README.md

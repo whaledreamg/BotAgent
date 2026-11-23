@@ -60,6 +60,111 @@ camera:
 
 Orbbec 相机需要带 USB 后端的 `pyorbbecsdk`（源码编译时加 `-DOB_BUILD_USB_PAL=ON`）。
 
+---
+
+## Orbbec 3D 相机专用排查
+
+Orbbec 是 **USB 独占**设备, 报错信息又很不直观, 下面按**报错原文**查。
+
+### A. `Invalid index value for argument "index"`
+
+**这个报错跟「索引越界」没关系** —— 是 `pyorbbecsdk` 的 `DeviceList`
+迭代器有个 off-by-one: `for dev in devices` 第一轮正常、第二轮就抛。
+
+```python
+# 错的
+for dev in devices: ...
+
+# 对的
+for i in range(len(devices)):
+    dev = devices[i]
+```
+
+或者直接用 SDK 提供的 `devices.get_device_by_serial_number(sn)`。
+
+`camera.py` 现在统一走后者。
+
+### B. `usbEnumerator openUsbDevice failed!` / `uvc_open failed -6`
+
+**相机被别的进程占着**。最常见的是 GNOME 的 `gvfsd-gphoto2`
+(自动挂载相机的守护进程), 它会在背后悄悄占着 USB 设备节点。
+
+```bash
+pkill -f gvfsd-gphoto2
+
+# 查是谁占着
+fuser -v /dev/bus/usb/001/*
+```
+
+### C. `Usb pal is not exist, please check the build config that you have enabled BUILD_USB_PAL`
+
+pip 装的 `pyorbbecsdk` 自带的 `libOrbbecSDK.so` **没开 USB PAL**。
+必须用源码编译 (`-DOB_BUILD_USB_PAL=ON`) 的那份, 见
+[sdk/README.md](../sdk/README.md)。
+
+```bash
+# 确认编译产物里确实有
+nm -C sdk/orbbec/lib/libOrbbecSDK.so.2.10.6 | grep LinuxUsbPal
+```
+
+### D. `No matched profile found for: {type: Color, format: RGB, width: ..., height: ..., fps: ...}`
+
+相机不支持这个分辨率/帧率组合。查这台相机到底支持哪些:
+
+```bash
+python -c "
+import pyorbbecsdk as ob
+d = ob.Context().query_devices()
+s = d[0].get_sensor(ob.OBSensorType.COLOR_SENSOR)
+l = s.get_stream_profile_list()
+for i in range(l.get_count()):
+    p = l.get_stream_profile_by_index(i)
+    print(p.get_width(), 'x', p.get_height(), '@', p.get_fps(), p.get_format())
+"
+```
+
+> **坑**: 同一个分辨率不同格式的支持情况不一样。Gemini 336L 的
+> `1280x800` 只支持 **MJPG** (而且只有 8fps), `640x400` 才支持原生 RGB。
+
+### E. `没有找到 Orbbec 相机 (但 USB 层能看到设备)`
+
+内核认到了但 SDK 枚举不到 —— 依次查:
+
+1. 相机被占 (见 B)
+2. SDK 没开 USB PAL (见 C)
+3. 相机刚插上还没就绪 —— 拔插一次
+
+### F. `没有找到 Orbbec 相机 (USB 层也看不到设备)`
+
+**物理连接问题** —— 线松了 / USB 口供电不足 / 相机掉电了。
+
+```bash
+lsusb | grep 2bc5     # 应该能看到 Orbbec Gemini 336L
+```
+
+### G. 标定内参跟当前流对不上
+
+```
+标定内参 1280x800 与当前彩色流 640x480 宽高比不符, 不用它
+```
+
+内参是跟着分辨率走的, 但**宽高比必须一致**才能按比例缩放复用。
+`640x480` (1.33) 和 `1280x800` (1.6) 比例不同, 缩放会引入形变,
+所以只能用 SDK 标称内参。
+
+想要用上标定精度, 就把彩色流设成**同样 1.6 比例**的分辨率:
+
+```yaml
+camera:
+  width: 640      # 640x400 = 1.6, 与 1280x800 同比例
+  height: 400
+  fps: 30
+```
+
+代码会自动把标定内参缩放到 640x400 (`fx 605.78 -> 302.89`)。
+
+---
+
 ## 验证
 
 ```bash

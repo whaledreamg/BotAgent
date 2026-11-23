@@ -12,17 +12,18 @@
 接口:
     GET  /health             服务、相机、模型状态
     GET  /v1/status          最近一次检测摘要
-    POST /v1/detect          触发一次检测
+    POST /v1/detect          触发一次检测 (结果会广播给 WS 订阅者)
     GET  /v1/objects         最近一次检测结果 (缓存)
     GET  /v1/objects/{name}  按类别名查目标
     GET  /v1/summary         按类别聚合的摘要
-    WS   /ws                 持续推送检测结果
+    WS   /ws                 **被动**订阅检测结果 (发 {"action":"detect"} 触发)
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -44,6 +45,7 @@ from models import (  # noqa: E402
     HealthResponse,
     StatusResponse,
 )
+from paths import sdk_search_paths  # noqa: E402
 from service import VisionService  # noqa: E402
 
 logging.basicConfig(
@@ -51,6 +53,43 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("vision.main")
+
+
+def _setup_sdk_library_path() -> None:
+    """把 Orbbec SDK 的编译产物加进 ``LD_LIBRARY_PATH``。
+
+    **为什么必须做**: pip 装的 ``pyorbbecsdk`` 自带的 ``libOrbbecSDK.so``
+    是**没开 USB PAL** 编译的 —— 枚举设备时直接抛
+    ``Usb pal is not exist`` / 返回 0 个设备, 相机永远连不上。
+
+    本机从源码编译的那份 (OB_BUILD_USB_PAL=ON) 才能认 Orbbec 相机。
+    这里自动去找, 找到了就挂到 ``LD_LIBRARY_PATH`` 前面 ——
+    ``DT_RUNPATH`` 的优先级低于 ``LD_LIBRARY_PATH``, 所以这样能覆盖掉
+    pip 自带的那份。
+
+    必须在 ``import pyorbbecsdk`` **之前**调用 —— 动态链接器在加载扩展
+    模块时就决定用哪个 ``libOrbbecSDK.so``, 之后再改环境变量没用。
+    """
+    paths = sdk_search_paths()
+    if not paths:
+        logger.warning(
+            "没找到带 USB PAL 的 Orbbec SDK —— 相机可能枚举不到。"
+            "把 SDK 编译产物放到 sdk/ 下, 或设 VISION_SDK_DIR 指过去"
+        )
+        return
+
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in existing.split(":") if p]
+    # 新的排前面 —— 优先级高于 pip 自带的那份
+    for p in reversed(paths):
+        if p in parts:
+            parts.remove(p)
+        parts.insert(0, p)
+    os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+    logger.info("Orbbec SDK 库路径: %s", ", ".join(paths))
+
+
+_setup_sdk_library_path()
 
 service: Optional[VisionService] = None
 
@@ -338,49 +377,91 @@ async def traces_image(filename: str):
 
 @app.websocket("/ws")
 async def ws_stream(websocket: WebSocket) -> None:
-    """持续推送检测结果。
+    """**被动**订阅检测结果 —— 推不推、推几次由客户端决定。
 
-    客户端连上后, 服务按固定间隔检测并推送; 客户端断开就停。
+    之前的实现是「连上就自己每秒拍一次」, 那本质上是**服务端轮询**:
+    没人看也在拍, 相机和 GPU 一直在转, 界面上还一闪一闪的。
+
+    现在的分工:
+        - 客户端 (监控端) 发 ``{"action": "detect"}`` -> 服务端拍一次
+        - 拍完把结果**广播**给所有订阅者 (包括发起方)
+        - 也可以发 ``{"action": "detect", "classes": [...], "conf": 0.3}``
+          带参数识别
+
+    所以这个连接本身**不再产生任何检测** —— 纯订阅通道。
     """
     await websocket.accept()
     svc = _svc()
-    interval = 1.0
 
-    async def push_loop() -> None:
+    # 每个连接一个队列 —— 广播时投递到这里, 避免一个慢客户端
+    # 拖住其他人。
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def on_detected(message: Dict[str, Any]) -> None:
+        """广播回调 —— **跑在工作线程里** (推理是 ``to_thread`` 跑的)。
+
+        所以不能直接 ``queue.put_nowait`` —— asyncio.Queue 不是线程
+        安全的, 在别的线程里投递**不会唤醒**等待的协程, 消息会卡住。
+        必须用 ``call_soon_threadsafe`` 回到事件循环里再投递。
+        """
+        loop.call_soon_threadsafe(queue.put_nowait, message)
+
+    svc.subscribe(on_detected)
+
+    async def pump() -> None:
+        """把队列里的消息推给客户端。"""
         while True:
+            message = await queue.get()
+            await websocket.send_json(message)
+
+    pump_task = asyncio.create_task(pump())
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+
+            # ---- "stop" -> 断开 ----
+            if raw.strip() == "stop":
+                break
+
+            # ---- JSON 命令 ----
             try:
-                result = await asyncio.to_thread(svc.detect)
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(msg, dict):
+                continue
+
+            action = str(msg.get("action", "")).strip().lower()
+            if action != "detect":
+                # 别的动作不认识 -> 明确回一句, 别静默吞掉
                 await websocket.send_json(
-                    {
-                        "type": "detection",
-                        "objects": result["objects"],
-                        "latency_ms": result["latency_ms"],
-                        "frame": result["frame"],
-                    }
+                    {"type": "error",
+                     "message": f"未知动作: {action or '(空)'}"}
+                )
+                continue
+
+            # ---- 触发一次检测 ----
+            try:
+                await asyncio.to_thread(
+                    svc.detect,
+                    classes=msg.get("classes"),
+                    conf=msg.get("conf"),
+                    pose=bool(msg.get("pose", False)),
+                    frame=str(msg.get("frame", "camera")),
                 )
             except (CameraError, DetectorError) as exc:
                 await websocket.send_json({"type": "error", "message": str(exc)})
             except Exception as exc:  # pragma: no cover
                 await websocket.send_json({"type": "error", "message": str(exc)})
-            await asyncio.sleep(interval)
-
-    task = asyncio.create_task(push_loop())
-    try:
-        while True:
-            # 客户端可以发消息来改间隔
-            msg = await websocket.receive_text()
-            if msg == "stop":
-                break
-            try:
-                interval = max(0.2, float(msg))
-            except ValueError:
-                pass
     except WebSocketDisconnect:
         pass
     finally:
-        task.cancel()
+        svc.unsubscribe(on_detected)
+        pump_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await task
+            await pump_task
 
 
 @app.exception_handler(Exception)

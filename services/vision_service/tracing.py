@@ -219,6 +219,62 @@ class DetectionTracer:
             logger.warning("保存图像失败 (%s): %s", label, exc)
             return None
 
+    def save_annotated(
+        self,
+        image: np.ndarray,
+        objects: List[Dict[str, Any]],
+        session: str,
+    ) -> Optional[str]:
+        """保存一张**画了所有框**的整图。
+
+        监控端要展示的就是这个 —— 一张图, 上面画着这次识别到的
+        所有物体的框, 下面再列一份「识别到了哪些」。
+
+        跟 ``record()`` 存的「每个物体一张单独框的图」是两回事:
+        那个是追溯用的 (每个物体能单独看), 这个是给人看的总览。
+
+        Args:
+            image: 彩色图像 (BGR)
+            objects: 本次检测到的物体列表 (含 label/confidence/bbox/pose)
+            session: 追溯会话名 (文件夹名)
+
+        Returns:
+            相对 trace_root 的路径; 失败时返回 None
+        """
+        if image is None or not getattr(image, "size", 0):
+            return None
+        try:
+            session_dir = self.sessions_dir / session
+            session_dir.mkdir(parents=True, exist_ok=True)
+
+            img_copy = image.copy()
+            for obj in objects:
+                bbox = obj.get("bbox") or {}
+                try:
+                    box = (
+                        float(bbox.get("x1", 0)), float(bbox.get("y1", 0)),
+                        float(bbox.get("x2", 0)), float(bbox.get("y2", 0)),
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                self._draw_box(
+                    img_copy, box,
+                    str(obj.get("label", "obj")),
+                    float(obj.get("confidence", 0.0)),
+                    obj.get("pose"),
+                )
+
+            filename = "_annotated.jpg"
+            filepath = session_dir / filename
+            cv2.imwrite(str(filepath), img_copy)
+            with self._lock:
+                self._image_count += 1
+            logger.debug("已保存标注总览图: %s/%s", session, filename)
+            return str(Path(session) / filename)
+        except Exception as exc:
+            logger.warning("保存标注总览图失败: %s", exc)
+            return None
+
     #: 不同类别配不同颜色, 免得满屏都是绿框看不出区别
     _BOX_COLORS = (
         (0, 255, 0),    # 绿

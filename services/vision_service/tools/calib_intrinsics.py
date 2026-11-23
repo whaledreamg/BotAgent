@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from calibration.board import BoardSpec  # noqa: E402
 from calibration.intrinsics import calibrate  # noqa: E402
 from calibration.paths import config_path  # noqa: E402
+from paths import conda_env_python  # noqa: E402
 
 
 def load_spec(path: Optional[Path] = None) -> BoardSpec:
@@ -106,11 +107,12 @@ def capture_images(
                 key = input("> ")
             except EOFError:
                 # stdin 没了 —— 大概率是 `conda run` 切断的。
+                env_python = conda_env_python("yolo") or "<conda 环境>/bin/python"
                 print(
                     "\n  **stdin 提前结束 (EOF)** —— 采集中断。\n"
                     "  如果你还没采够, 这是因为用了 `conda run` (它会切断 stdin)。\n"
                     "  改用: conda run --no-capture-output -n yolo python ...\n"
-                    "  或:   /home/gxh/miniconda3/envs/yolo/bin/python ...\n",
+                    f"  或:   {env_python} ...\n",
                     file=sys.stderr,
                 )
                 break

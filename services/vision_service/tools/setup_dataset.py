@@ -16,7 +16,7 @@
 ## 用法
 
     # 建目录 + 生成 data.yaml
-    conda run -n yolo python tools/setup_dataset.py --out /home/gxh/workspace/project/datasets/myobjects --names 杯子 瓶子 螺丝
+    conda run -n yolo python tools/setup_dataset.py --out ../../datasets/myobjects --names 杯子 瓶子 螺丝
 
     # 只体检, 不改任何东西
     conda run -n yolo python tools/setup_dataset.py --out <目录> --check

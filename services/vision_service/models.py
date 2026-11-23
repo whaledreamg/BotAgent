@@ -51,6 +51,8 @@ class Keypoint(BaseModel):
 class Object(BaseModel):
     """一个被识别出来的物体。"""
 
+    #: 本次检测中的物体序号 (从 1 开始) —— 监控端拿它当「标记号」
+    index: int = 0
     label: str
     #: 中文类名 (播报用)。没有对应中文时与 label 相同。
     label_zh: str = ""
@@ -58,6 +60,12 @@ class Object(BaseModel):
     bbox: BBox
     pose: Optional[Pose3D] = None
     keypoints: Optional[List[Keypoint]] = None
+    #: 追溯记录的唯一 ID (如 ``1732000000000_0001``)
+    record_id: str = ""
+    #: 带框图片的相对路径 (如 ``20261123_110830_123/cup_01.jpg``)
+    image_filename: str = ""
+    #: 识别时刻 (ISO 8601, 如 ``2026-11-23T17:10:03.123456``)
+    timestamp: str = ""
 
 
 class DetectRequest(BaseModel):
@@ -85,6 +93,10 @@ class DetectResponse(BaseModel):
     frame: str = "camera"
     #: 请求的坐标系 (可能因为外参没配好而没拿到)
     requested_frame: str = "camera"
+    #: 追溯会话名 —— 本次拍到的所有物体的图都在这个文件夹里
+    session: str = ""
+    #: 画了所有检测框的整图 (相对 trace_root) —— 监控端拉这张显示
+    annotated_image: str = ""
 
 
 class ObjectSummary(BaseModel):
@@ -130,6 +142,8 @@ class StatusResponse(BaseModel):
     errors: List[str] = Field(default_factory=list)
     #: 外参 provider 的自述
     provider: Dict[str, Any] = Field(default_factory=dict)
+    #: 资源 (模型权重 / SDK 编译产物) 在哪 —— 换机器起不来时先看这里
+    resources: Dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(StatusResponse):

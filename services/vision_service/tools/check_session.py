@@ -521,9 +521,21 @@ def check_stdin_detection() -> None:
         "print('INTERACTIVE' if stdin_is_interactive() else 'EOF')"
     ) % str(Path(__file__).resolve().parents[1])
 
-    conda = shutil.which("conda") or "/home/gxh/miniconda3/bin/conda"
-    if not Path(conda).exists():
-        check("找得到 conda", False, conda)
+    # conda 的位置不写死 —— 换机器/换用户名时 shutil.which 找不到,
+    # 再退回常见安装位置。
+    conda = shutil.which("conda") or ""
+    if not conda:
+        home = Path.home()
+        for candidate in (
+            home / "miniconda3" / "bin" / "conda",
+            home / "anaconda3" / "bin" / "conda",
+            home / "miniforge3" / "bin" / "conda",
+        ):
+            if candidate.exists():
+                conda = str(candidate)
+                break
+    if not conda or not Path(conda).exists():
+        check("找得到 conda", False, conda or "(没找到)")
         return
 
     try:

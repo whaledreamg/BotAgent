@@ -86,6 +86,34 @@ flowchart TD
 
 ## 3. 环境准备 (重要)
 
+### 3.0 资源放哪 (模型权重 / SDK / 数据集)
+
+以前这些全靠 yaml 里写绝对路径 (`/home/whale/workspace/data/model/...`),
+换机器就得改一堆配置。现在统一走
+[`services/vision_service/paths.py`](../services/vision_service/paths.py) 解析:
+
+| 资源 | 仓库内位置 | 环境变量 |
+|---|---|---|
+| 模型权重 | `models/` | `VISION_MODEL_DIR` / `VISION_WEIGHTS` |
+| 数据集 | `datasets/` | `VISION_DATA_DIR` |
+| SDK 编译产物 | `sdk/orbbec/lib` | `VISION_SDK_DIR` / `VISION_SDK_LIB_DIR` |
+
+配置里用 **`@` 前缀表示相对仓库根**:
+
+```yaml
+detector:
+  weights: '@models/yolo/yolo26n.pt'
+training:
+  data: '@datasets/myobjects/data.yaml'
+```
+
+绝对路径依然有效, 但不再是唯一写法。目录本身的说明见
+[`models/README.md`](../models/README.md)、
+[`datasets/README.md`](../datasets/README.md)、
+[`sdk/README.md`](../sdk/README.md)。
+
+> 目录结构进 git, 实际的大文件不进 (见 `.gitignore`)。
+
 ### 3.1 必须从源码编译 SDK (USB 后端)
 
 pip 装的 `pyorbbecsdk` wheel **没有编译 USB PAL**, 直接用会报:
@@ -99,28 +127,46 @@ Usb pal is not exist, please check the build config that you have enabled BUILD_
 解决: 从源码编译, 打开 USB/Net PAL:
 
 ```bash
-cd /home/gxh/workspace/project/OrbbecSDK_v2
+cd /path/to/OrbbecSDK_v2
 mkdir -p build && cd build
 cmake .. -DOB_BUILD_USB_PAL=ON -DOB_BUILD_NET_PAL=ON
 make -j$(nproc)
 ```
 
-运行时让 Python binding 加载我们编出来的 `libOrbbecSDK.so.2`:
+确认 USB PAL 真的编进去了:
 
 ```bash
-export LD_LIBRARY_PATH=/home/gxh/workspace/project/OrbbecSDK_v2/build/linux_x86_64/lib:$LD_LIBRARY_PATH
+nm -C build/linux_x86_64/lib/libOrbbecSDK.so.2.10.6 | grep LinuxUsbPal
 ```
 
-`scripts/start_vision.sh` 里已经带上了这行。
+有输出就对了。
+
+把编译产物接进仓库 (软链接最省事):
+
+```bash
+mkdir -p sdk/orbbec
+ln -sfn /path/to/OrbbecSDK_v2/build/linux_x86_64/lib sdk/orbbec/lib
+```
+
+视觉服务启动时会自动把它挂到 `LD_LIBRARY_PATH` **最前面**
+(`DT_RUNPATH` 优先级低于 `LD_LIBRARY_PATH`, 所以能覆盖掉 pip 自带的那份),
+`scripts/start_vision.sh` 里也是同样的一套逻辑。
 
 ### 3.2 udev 规则
 
 ```bash
-sudo cp /home/gxh/workspace/project/OrbbecSDK_v2/scripts/env_setup/99-obsensor-libusb.rules /etc/udev/rules.d/
+sudo cp /path/to/OrbbecSDK_v2/scripts/env_setup/99-obsensor-libusb.rules /etc/udev/rules.d/
 sudo udevadm trigger && sudo udevadm settle
 ```
 
 规则里已含 Gemini 336L 的 `0807` 条目。装完 `ctx.query_devices()` 应能看到 1 个设备。
+
+> **GNOME 会自动抢相机** —— `gvfsd-gphoto2` 这个守护进程会占着相机的
+> USB 设备节点, 导致 SDK 报 `usbEnumerator openUsbDevice failed!`。
+> 遇到就:
+> ```bash
+> pkill -f gvfsd-gphoto2
+> ```
 
 ### 3.3 Python 依赖
 
@@ -381,13 +427,41 @@ SDK 给的是**标称内参**, 实测差 1~2% (1.5 m 处就是 15 mm)。标定�
 |---|---|---|
 | GET | `/health` | 相机连接状态、模型、GPU/CPU、坐标系、标定状态 |
 | GET | `/v1/status` | 最近一次检测摘要 + 聚合 summary |
-| POST | `/v1/detect` | 触发一次检测, 返回全部目标 |
+| POST | `/v1/detect` | 触发一次检测, 返回全部目标 (**结果会广播给 WS 订阅者**) |
 | GET | `/v1/objects` | 取最近一次检测结果 (缓存) |
 | GET | `/v1/objects/{name}` | 按类别名取目标 (Agent 用这个) |
 | GET | `/v1/summary` | 按类别聚合的摘要 |
 | GET | `/v1/frames` | 一次给出所有坐标系下的同一个点 (调试标定用) |
 | GET | `/v1/calibration` | 标定状态 (内参标没标 / 外参配没配 / 有没有坑) |
-| WS | `/ws` | 持续推送检测结果 (发数字改间隔, `stop` 断开) |
+| WS | `/ws` | **被动**订阅检测结果 (发 `{"action":"detect"}` 触发, `stop` 断开) |
+
+### WS /ws —— 按需识别, 不轮询
+
+**这个连接本身不产生任何检测。** 之前是「连上就自己每秒拍一次」, 那本质上是
+服务端轮询: 没人看也在拍, 相机和 GPU 一直转, 监控端界面上还一闪一闪的。
+
+现在的分工:
+
+```
+客户端                          服务端
+  |-- {"action":"detect"} ----->|  拍一帧, 推理, 解算
+  |<-- {"type":"detection"} ----|  广播给所有订阅者
+```
+
+也可以带参数:
+
+```json
+{"action": "detect", "classes": ["cup", "bottle"], "conf": 0.3, "frame": "world"}
+```
+
+`POST /v1/detect` 触发的检测**也会广播** —— 所以监控端点「识别一次」
+走 HTTP, 结果照样从 WS 回来, 所有订阅者看到同一帧。
+
+> **实现坑**: 广播发生在工作线程里 (推理是 `asyncio.to_thread` 跑的),
+> 而 `asyncio.Queue` **不是线程安全的** —— 在别的线程里 `put_nowait`
+> 不会唤醒等待的协程, 消息会卡住。必须用
+> `loop.call_soon_threadsafe(queue.put_nowait, msg)` 回到事件循环里投递。
+> 服务端用的是回调式的订阅 (`subscribe(callback)`) 就是为了这个。
 
 ### GET /v1/calibration
 

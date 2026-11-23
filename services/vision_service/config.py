@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,10 +21,41 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
+from paths import resolve_path as _resolve_path
+
+logger = logging.getLogger("vision.config")
+
 
 #: 项目根目录 (Bot Agent/)
 ROOT = Path(__file__).resolve().parents[2]
 VISION_CONFIG_PATH = ROOT / "configs" / "vision.yaml"
+
+
+def _resolve_asset(raw: str, kind: str = "model", must_exist: bool = True) -> str:
+    """把配置里的资源路径解析成真实路径。
+
+    ``must_exist=False`` 时, 文件不存在也照样给出解析后的绝对路径 ——
+    训练输出目录 (``@datasets/runs``) 本来就要等训练时才生成。
+
+    解析不出来就**保留原样** —— 让下游报「文件不存在」这种带原始路径的
+    错, 比这里悄悄换成空字符串好排查得多。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return text
+    resolved = _resolve_path(text, kind=kind, must_exist=must_exist)
+    if resolved is not None:
+        if must_exist and not resolved.exists():
+            logger.warning(
+                "资源不存在: %s (解析成 %s)", text, resolved
+            )
+        return str(resolved)
+    logger.warning(
+        "资源路径解析不到, 保留原样: %s (kind=%s) —— "
+        "可以用 @ 前缀表示相对仓库根, 或设 VISION_%s_DIR 指到实际目录",
+        text, kind.upper(), kind.upper(),
+    )
+    return text
 
 
 DEFAULTS: Dict[str, Any] = {
@@ -368,11 +400,13 @@ def load_config(path: Optional[Path] = None) -> Config:
 
     d = v.get("detector", {})
     detector = DetectorConfig(
-        weights=os.environ.get(
-            "VISION_WEIGHTS", str(d.get("weights", "") or "")
+        weights=_resolve_asset(
+            os.environ.get("VISION_WEIGHTS", str(d.get("weights", "") or "")),
+            kind="model",
         ),
-        pose_weights=os.environ.get(
-            "VISION_POSE_WEIGHTS", str(d.get("pose_weights", "") or "")
+        pose_weights=_resolve_asset(
+            os.environ.get("VISION_POSE_WEIGHTS", str(d.get("pose_weights", "") or "")),
+            kind="model",
         ),
         conf=float(d.get("conf", 0.35)),
         find_conf=float(d.get("find_conf", 0.15)),
@@ -401,14 +435,20 @@ def load_config(path: Optional[Path] = None) -> Config:
 
     tr = v.get("training", {})
     training = TrainingConfig(
-        data=str(tr.get("data", "") or ""),
-        base_weights=str(tr.get("base_weights", "") or ""),
+        # data.yaml 必须真的存在 —— 训练前就该发现路径写错了
+        data=_resolve_asset(str(tr.get("data", "") or ""), kind="data"),
+        base_weights=_resolve_asset(
+            str(tr.get("base_weights", "") or ""), kind="model"
+        ),
         epochs=int(tr.get("epochs", 100)),
         imgsz=int(tr.get("imgsz", 640)),
         batch=int(tr.get("batch", 16)),
         patience=int(tr.get("patience", 30)),
         device=str(tr.get("device", "0") or "0"),
-        project=str(tr.get("project", "") or ""),
+        # 输出目录等训练时才生成, 所以不要求存在
+        project=_resolve_asset(
+            str(tr.get("project", "") or ""), kind="data", must_exist=False
+        ),
         name=str(tr.get("name", "myobjects") or "myobjects"),
         hsv_h=float(tr.get("hsv_h", 0.01)),
         hsv_s=float(tr.get("hsv_s", 0.4)),
