@@ -20,8 +20,8 @@ sounddevice==0.5.6
 # 换机器后 ASR 服务启动即 ModuleNotFoundError。
 vosk==0.3.45
 
-# --- 重采样 (resample_wav.py 的 Python 后端) ---
-# 代码里是 try/except ImportError 包着的, 缺了会走 ffmpeg 后端;
+# --- 重采样 (resample_wav.py 的 Python 后端) + 麦克风高通滤波 ---
+# 代码里是 try/except ImportError 包着的, 缺了会走 ffmpeg 后端 / 关闭滤波;
 # 但装上更省事, 避免依赖系统 ffmpeg。
 scipy==1.10.0
 soundfile==0.8.1

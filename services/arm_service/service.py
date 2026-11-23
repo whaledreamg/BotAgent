@@ -168,6 +168,8 @@ class ArmService:
             timeout=cfg.notifier.timeout,
             enabled=cfg.notifier.enabled and cfg.safety.speak_on_reject,
             server_play=cfg.notifier.server_play,
+            backend=cfg.notifier.backend,
+            device=cfg.notifier.device,
         )
 
     # ------------------------------------------------------------ 生命周期

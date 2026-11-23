@@ -49,6 +49,13 @@ DEFAULTS: Dict[str, Any] = {
         # 等安静的最长等待(秒)。沉降期结束后最多再等这么久确认房间安静,
         # 超时强制恢复 (免得房间一直吵导致机器人变聋)。
         "echo_quiet_timeout": 2.0,
+        # 高通滤波截止频率 (Hz)。0 = 关闭。
+        # 空调隆隆声/电源 50Hz 哼声这类低频噪声会抬高静默时的 RMS 电平,
+        # 让 VAD 门限跟着抬高。80Hz 的 4 阶高通把 50Hz 压掉 16dB,
+        # 200Hz 以上几乎无损。
+        "highpass_hz": 80.0,
+        # 高通阶数 (默认 4 = 两个二阶节)
+        "highpass_order": 4,
     },
     "agent": {
         "base_url": "http://127.0.0.1:8800",
@@ -61,6 +68,13 @@ DEFAULTS: Dict[str, Any] = {
         "voice": "Default",
         "speed": 5,
         "sample_rate": 24000,
+        # 播放后端。留空 = 自动选路 (PulseAudio -> ALSA -> sounddevice)。
+        # 换机器后没声音基本都源于此: 24000Hz 的 PCM 遇上只支持 48000Hz 的
+        # 声卡, 直接开流会报 Invalid sample rate。自动选路会自动重采样。
+        # 可选值: auto / pulse / alsa / sounddevice
+        "backend": "",
+        # 播放设备。留空 = 自动挑 (优先板载模拟输出 = 接喇叭的那个口)。
+        "device": "",
         "timeout": 120,
     },
     "server": {"host": "127.0.0.1", "port": 8801},
@@ -103,6 +117,16 @@ class ASRConfig:
     #: 等安静的最长等待 (秒)。沉降期结束后, 最多再等这么久来确认
     #: 房间真的安静下来; 超时就强制恢复 (免得房间一直吵导致机器人变聋)。
     echo_quiet_timeout: float = 2.0
+    #: 麦克风输入的**高通滤波**截止频率 (Hz)。0 = 关闭。
+    #:
+    #: 空调隆隆声、电源 50Hz 哼声这类低频噪声会把静默时的 RMS 电平拉高,
+    #: 让 VAD 门限跟着抬高, 说话声更容易被判成噪声。80Hz 的 4 阶高通把
+    #: 50Hz 压掉 16dB, 而 200Hz 以上几乎无损 (人声内容基本不损失)。
+    #:
+    #: 滤波在**音频入队前**应用, 所以 VAD 与识别看到的是同一份信号。
+    highpass_hz: float = 80.0
+    #: 高通滤波阶数。默认 4 (两个二阶节)。越大低频衰减越狠, 越容易有相位失真。
+    highpass_order: int = 4
 
     @property
     def wake_word_list(self) -> list:
@@ -142,6 +166,17 @@ class TTSConfig:
     #: 保音高变速倍率。0 = 用服务端默认值。
     rate: float = 0.0
     sample_rate: int = 24000
+    #: 播放后端。留空 = 自动选路 (PulseAudio -> ALSA -> sounddevice)。
+    #:
+    #: ⚠️ 换机器后「合成成功但没声音」基本都是这个的原因: ChatTTS 的 PCM
+    #:    是 24000Hz, 而声卡原生采样率因机器而异 (有的只吃 48000Hz)。
+    #:    自动选路会用 PulseAudio / plughw 做重采样, 任何机器都能出声。
+    #:
+    #: 可选值: auto / pulse / alsa / sounddevice
+    backend: str = ""
+    #: 播放设备。留空 = 自动挑 (优先板载模拟输出, 也就是接喇叭的那个口)。
+    #: 只对 alsa 后端有意义 (形如 "plughw:1,0")。
+    device: str = ""
     timeout: float = 120.0
 
 
@@ -218,6 +253,18 @@ def load_config(path: Path = PIPELINE_CONFIG_PATH) -> Config:
                 a.get("echo_quiet_timeout", 2.0),
             )
         ),
+        highpass_hz=float(
+            os.environ.get(
+                "ASR_HIGHPASS_HZ",
+                a.get("highpass_hz", 80.0),
+            )
+        ),
+        highpass_order=int(
+            os.environ.get(
+                "ASR_HIGHPASS_ORDER",
+                a.get("highpass_order", 4),
+            )
+        ),
     )
 
     ag = merged.get("agent", {})
@@ -236,6 +283,8 @@ def load_config(path: Path = PIPELINE_CONFIG_PATH) -> Config:
         speed=int(t.get("speed", 5)),
         rate=float(t.get("rate", 0.0)),
         sample_rate=int(t.get("sample_rate", 24000)),
+        backend=os.environ.get("TTS_BACKEND", str(t.get("backend", "") or "")),
+        device=os.environ.get("TTS_DEVICE", str(t.get("device", "") or "")),
         timeout=float(t.get("timeout", 120)),
     )
 

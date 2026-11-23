@@ -54,6 +54,24 @@ asr:
   # 超时就强制恢复 —— 免得房间一直吵导致机器人变聋。
   echo_quiet_timeout: 2.0
 
+  # 麦克风输入的高通滤波 (Hz)。0 = 关闭。
+  #
+  # 为什么要滤: 空调隆隆声、电源 50Hz 哼声这类**低频**噪声会把静默时的
+  # RMS 电平拉高 —— 能量集中在低频, 但 RMS 把所有频段算在一起。噪声底
+  # 一高, VAD 门限 (噪声底 + 10dB) 就跟着抬高, 说话声更容易被判成噪声,
+  # 表现为「听不清」「经常不响应」。
+  #
+  # 80Hz 的 4 阶高通把 50Hz 压掉 16dB、30Hz 压掉 34dB, 而 200Hz 以上
+  # 衰减 < 0.01dB —— 人声内容基本无损。
+  #
+  # 滤波在**音频入队前**应用, 所以 VAD 的电平判断与识别器看到的是
+  # 同一份信号, 不会出现「门限按未滤波电平算、识别按滤波信号做」的不一致。
+  #
+  # 调大: 噪声更低但人声发闷。调小: 人声更自然但低频噪声更多。
+  highpass_hz: 80.0
+  # 高通阶数 (默认 4 = 两个二阶节)。越大低频衰减越狠, 越容易有相位失真。
+  highpass_order: 4
+
 agent:
   base_url: http://127.0.0.1:8800
   # 分流接口
@@ -65,13 +83,32 @@ tts:
   ws_url: ws://127.0.0.1:8000/ws
   # 音色名。留空 = 用 TTS 服务端的默认音色 (configs/tts.yaml 的 defaults.voice)。
   # 服务端支持的音色可以用这个查: curl -s http://127.0.0.1:8000/health
-  voice: ""
+  #
+  # 可选值: Default / Timbre1~Timbre9 (configs/tts.yaml 里预定义的 10 个音色)。
+  #
+  # ⚠️ 换机器 / CPU↔GPU 回退时音色会变 —— ChatTTS 的采样器 CPU/GPU 用
+  #    不同的随机数流, 同一个 seed 出来的声音不一样。要跨机器一致,
+  #    得用 configs/tts.yaml 的 ref_audio 克隆方式。
+  voice: "Default"
   # 语速 token (0~9)。受 ChatTTS 的 [speed_N] 限制, 实际变化不大。
   speed: 5
   # 保音高变速倍率。0 = 用服务端默认值。>1 更快, <1 更慢。范围 0.5~2.0。
   rate: 0.0
   # 播放采样率, 与 ChatTTS 服务端一致
   sample_rate: 24000
+  # 播放后端。留空 = 自动选路 (PulseAudio -> ALSA -> sounddevice)。
+  #
+  # ⚠️ 换机器后「语音合成成功但完全没声音」基本都是这个原因:
+  #    ChatTTS 的 PCM 是 24000Hz, 而声卡原生采样率是硬件相关的
+  #    (实测有的机器只吃 48000Hz)。按 24000 直接开硬件流会报
+  #    Invalid sample rate, 于是只合成不播放。
+  #    自动选路会让 PulseAudio / plughw 做重采样, 任何机器都能出声。
+  #
+  # 可选值: auto / pulse / alsa / sounddevice
+  backend: ""
+  # 播放设备。留空 = 自动挑 (优先板载模拟输出, 也就是接喇叭的那个口)。
+  # 只对 alsa 后端有意义 (形如 "plughw:1,0")。
+  device: ""
   # 收到 TTS "done" 事件后的最长等待秒数
   timeout: 120
 

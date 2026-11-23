@@ -15,12 +15,24 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import struct
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
 
 from config import TTSConfig
+
+#: 共享的播放后端 (services/common/audio_output.py)。
+#: 只用标准库, 不依赖 numpy/sounddevice —— arm_service 的 conda 环境里
+#: 没有 numpy, 这个模块要能在任何环境下 import 成功。
+_SERVICES_DIR = Path(__file__).resolve().parents[1]
+if str(_SERVICES_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVICES_DIR))
+
+from common.audio_output import AudioOutput, open_output  # noqa: E402
 
 logger = logging.getLogger("tts_client")
 
@@ -79,7 +91,7 @@ class TTSClient:
 
     def __init__(self, cfg: TTSConfig) -> None:
         self.cfg = cfg
-        self._speaker = None
+        self._speaker: Optional[AudioOutput] = None
         self._speaker_failed = False
 
     # ------------------------------------------------------------ 播放器
@@ -89,31 +101,43 @@ class TTSClient:
 
         每次合成单独开/关, 避免复用已 stop 的流导致下一轮写入失败。
         没有可用输出设备时返回 None (只消费不播放), 并记住失败状态不再重试。
+
+        **为什么不用 sounddevice 直接开硬件流**: ChatTTS 的 PCM 是 24000Hz,
+        而声卡支持的采样率是硬件相关的 (实测有的机器只吃 48000Hz)。
+        直接按 24000 开流会报 ``Invalid sample rate``, 表现为「合成成功但
+        完全没声音」。这里改用 :mod:`common.audio_output` 的自动选路:
+        PulseAudio -> ALSA(plughw 重采样) -> sounddevice(兜底)。
         """
         if self._speaker_failed:
             return None
         try:
-            import sounddevice as sd
-
-            stream = sd.RawOutputStream(
-                samplerate=self.cfg.sample_rate,
+            stream = open_output(
+                sample_rate=self.cfg.sample_rate,
                 channels=1,
-                dtype="int16",
-                blocksize=0,
+                backend=self.cfg.backend,
+                device=self.cfg.device,
+                stream_name="botagent-tts",
             )
-            stream.start()
-            self._speaker = stream
-            logger.info("[TTS] 扬声器已打开 (%dHz)", self.cfg.sample_rate)
-            return stream
         except Exception as exc:
             self._speaker_failed = True
             logger.warning("[TTS] 无可用输出设备, 只合成不播放: %s", exc)
             return None
+        if stream is None:
+            self._speaker_failed = True
+            logger.warning("[TTS] 无可用输出设备, 只合成不播放")
+            return None
+        self._speaker = stream
+        logger.info(
+            "[TTS] 扬声器已打开 (%dHz, 后端=%s, 设备=%s)",
+            self.cfg.sample_rate,
+            stream.backend,
+            stream.device or "-",
+        )
+        return stream
 
     def _close_speaker(self) -> None:
         if self._speaker is not None:
             try:
-                self._speaker.stop()
                 self._speaker.close()
             except Exception:
                 pass

@@ -86,8 +86,13 @@ arm:
     sample_rate: 24000
     timeout: 30.0
     # true = 由 TTS 服务端自己播 (arm_service 环境没有 sounddevice 时必须用这个)
-    # false = arm_service 本地用 sounddevice 播
+    # false = arm_service 本地播
     server_play: true
+    # 本地播放后端。留空 = 自动选路 (PulseAudio -> ALSA -> sounddevice)。
+    # 可选值: auto / pulse / alsa / sounddevice
+    backend: ""
+    # 本地播放设备。留空 = 自动挑 (优先板载模拟输出 = 接喇叭的那个口)
+    device: ""
 
 server:
   host: 0.0.0.0

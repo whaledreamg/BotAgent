@@ -398,7 +398,9 @@ class VoiceASR(wakeup_asr.WakeupASR):
         block_sec = step / 2 / wakeup_asr.SAMPLE_RATE
         t0 = time.time()
         for i in range(0, len(raw), step):
-            chunk = raw[i:i + step]
+            # 回放不走麦克风回调, 要手动滤波 —— 保证回放测试测的是
+            # **滤波后**的链路, 与实时运行一致。
+            chunk = self.filter.process(raw[i:i + step])
             ts = t0 + i / 2 / wakeup_asr.SAMPLE_RATE
             self.ring.append((ts, chunk))
             self.update_noise_floor(rms_db(chunk))
@@ -509,6 +511,11 @@ def parse_args(argv=None):
     p.add_argument("--echo-quiet-timeout", type=float, default=None,
                    help="等安静的最长等待秒数: 沉降期后最多再等这么久确认"
                         "房间安静, 超时强制恢复 (默认取 configs/pipeline.yaml)")
+    p.add_argument("--highpass-hz", type=float, default=None,
+                   help="高通滤波截止频率(Hz), 0=关闭 "
+                        "(默认取 configs/pipeline.yaml)")
+    p.add_argument("--highpass-order", type=int, default=None,
+                   help="高通滤波阶数 (默认取 configs/pipeline.yaml)")
     p.add_argument("--host", default=None, help="健康检查监听地址")
     p.add_argument("--port", type=int, default=None, help="健康检查监听端口")
     return p.parse_args(argv)
@@ -558,6 +565,17 @@ def build_wakeup_args(args, cfg):
             args.echo_quiet_timeout
             if args.echo_quiet_timeout is not None
             else cfg.asr.echo_quiet_timeout
+        ),
+        # 高通滤波: 截止频率(Hz) 与阶数。0 = 关闭。
+        highpass_hz=(
+            args.highpass_hz
+            if args.highpass_hz is not None
+            else cfg.asr.highpass_hz
+        ),
+        highpass_order=(
+            args.highpass_order
+            if args.highpass_order is not None
+            else cfg.asr.highpass_order
         ),
     )
     return ns

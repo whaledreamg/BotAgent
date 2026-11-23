@@ -88,6 +88,10 @@ DEFAULTS: Dict[str, Any] = {
             "timeout": 30.0,
             # 由 TTS 服务端自己播 (true) 还是 arm_service 本地播 (false)
             "server_play": True,
+            # 本地播放后端。留空 = 自动选路 (PulseAudio -> ALSA -> sounddevice)
+            "backend": "",
+            # 本地播放设备。留空 = 自动挑 (优先板载模拟输出 = 接喇叭的那个口)
+            "device": "",
         },
     },
     "server": {"host": "0.0.0.0", "port": 8802},
@@ -206,9 +210,14 @@ class NotifierConfig:
     speed: int = 5
     sample_rate: int = 24000
     timeout: float = 30.0
-    #: 由 TTS 服务端自己播 (True) 还是本地 sounddevice 播 (False)。
+    #: 由 TTS 服务端自己播 (True) 还是本地播 (False)。
     #: arm_service 的 conda 环境通常没有 sounddevice, 所以默认走服务端播。
     server_play: bool = True
+    #: 本地播放后端。留空 = 自动选路 (PulseAudio -> ALSA -> sounddevice)。
+    #: 可选值: auto / pulse / alsa / sounddevice
+    backend: str = ""
+    #: 本地播放设备。留空 = 自动挑 (优先板载模拟输出 = 接喇叭的那个口)。
+    device: str = ""
 
 
 @dataclass
@@ -300,6 +309,8 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         sample_rate=int(nf.get("sample_rate", 24000)),
         timeout=float(nf.get("timeout", 30.0)),
         server_play=bool(nf.get("server_play", True)),
+        backend=os.environ.get("ARM_TTS_BACKEND", str(nf.get("backend", "") or "")),
+        device=os.environ.get("ARM_TTS_DEVICE", str(nf.get("device", "") or "")),
     )
 
     return Config(arm=arm, safety=safety, notifier=notifier, server=server)

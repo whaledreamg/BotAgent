@@ -15,9 +15,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import struct
+import sys
 import time
+from pathlib import Path
 from typing import Dict, Optional
+
+#: 共享的播放后端 (services/common/audio_output.py)。只用标准库。
+_SERVICES_DIR = Path(__file__).resolve().parents[1]
+if str(_SERVICES_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVICES_DIR))
+
+from common.audio_output import AudioOutput, open_output  # noqa: E402
 
 logger = logging.getLogger("arm.tts")
 
@@ -72,6 +82,8 @@ class ArmNotifier:
         timeout: float = 30.0,
         enabled: bool = True,
         server_play: bool = True,
+        backend: str = "",
+        device: str = "",
     ) -> None:
         self.ws_url = ws_url
         self.voice = voice
@@ -80,28 +92,45 @@ class ArmNotifier:
         self.timeout = timeout
         self.enabled = enabled
         self.server_play = server_play
+        self.backend = backend
+        self.device = device
         self._speaker_failed = False
 
     # ------------------------------------------------------------ 播放器
 
     def _open_speaker(self):
+        """打开播放输出。
+
+        走 :mod:`common.audio_output` 的自动选路 (PulseAudio -> ALSA ->
+        sounddevice)。不用 sounddevice 直接开硬件流是因为 ChatTTS 的 PCM
+        是 24000Hz, 声卡原生采样率因机器而异 —— 直接开会报
+        ``Invalid sample rate``, 表现就是「没声音」。
+        """
         if self._speaker_failed:
             return None
         try:
-            import sounddevice as sd
-
-            stream = sd.RawOutputStream(
-                samplerate=self.sample_rate,
+            stream = open_output(
+                sample_rate=self.sample_rate,
                 channels=1,
-                dtype="int16",
-                blocksize=0,
+                backend=self.backend,
+                device=self.device,
+                stream_name="botagent-arm-tts",
             )
-            stream.start()
-            return stream
         except Exception as exc:
             self._speaker_failed = True
             logger.warning("[播报] 无可用输出设备, 只合成不播放: %s", exc)
             return None
+        if stream is None:
+            self._speaker_failed = True
+            logger.warning("[播报] 无可用输出设备, 只合成不播放")
+            return None
+        logger.info(
+            "[播报] 扬声器已打开 (%dHz, 后端=%s, 设备=%s)",
+            self.sample_rate,
+            stream.backend,
+            stream.device or "-",
+        )
+        return stream
 
     # ------------------------------------------------------------ 播报
 
@@ -172,7 +201,6 @@ class ArmNotifier:
         finally:
             if speaker is not None:
                 try:
-                    speaker.stop()
                     speaker.close()
                 except Exception:
                     pass

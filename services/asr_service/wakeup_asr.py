@@ -25,6 +25,11 @@ import numpy as np
 import sounddevice as sd
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
+# 保证能从任意目录启动 (audio_filter 在本目录)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import audio_filter
+
 SetLogLevel(-1)  # 关闭 vosk 自己的日志输出
 
 SAMPLE_RATE = 16000
@@ -266,6 +271,21 @@ class WakeupASR:
         self.echo_reject_until: float = 0.0
         self.echo_quiet_at: float = 0.0
 
+        #: 麦克风输入的**高通滤波**。
+        #:
+        #: 为什么要滤: 空调隆隆声、电源 50Hz 哼声这类低频噪声会把静默时的
+        #: RMS 电平拉高, 让 VAD 门限跟着抬高, 说话声更容易被判成噪声。
+        #: 4 阶 80Hz 高通把 50Hz 压掉 16dB, 而 200Hz 以上几乎无损。
+        #:
+        #: 滤波器在**入队前**应用, 所以 VAD 与识别看到的是同一份信号。
+        self.filter = audio_filter.build_filter(
+            cutoff_hz=float(getattr(args, "highpass_hz", 0.0) or 0.0),
+            sample_rate=SAMPLE_RATE,
+            order=int(getattr(args, "highpass_order", 4) or 4),
+            channels=1,
+        )
+        print(f"[滤波] {self.filter.description}")
+
     # ------------------------------------------------------------- 设备
 
     def open_stream(self):
@@ -280,7 +300,10 @@ class WakeupASR:
         if status:
             print(f"[状态] {status}", file=sys.stderr)
         try:
-            self.audio_q.put_nowait(bytes(indata))
+            # **入队前滤波** —— 这样 VAD 的电平判断、唤醒词识别、正式识别
+            # 看到的都是同一份滤波后的信号。滤掉的是低频噪声 (空调隆隆声、
+            # 电源哼声), 人声内容基本无损。
+            self.audio_q.put_nowait(self.filter.process(bytes(indata)))
         except queue.Full:
             pass
 
@@ -581,7 +604,9 @@ class WakeupASR:
         step = BLOCK_SIZE * 2
         t0 = time.time()
         for i in range(0, len(raw), step):
-            chunk = raw[i:i + step]
+            # 回放不走麦克风回调, 所以要在这里手动滤波 ——
+            # 保证回放测试测的是**滤波后**的链路。
+            chunk = self.filter.process(raw[i:i + step])
             ts = t0 + i / 2 / SAMPLE_RATE
             self.ring.append((ts, chunk))
             self.update_noise_floor(rms_db(chunk))
@@ -608,6 +633,10 @@ def parse_args(argv=None):
                    help="静音多少秒后结束录音, 默认 1.2")
     p.add_argument("--vad-threshold", type=float, default=-45.0,
                    help="语音活动检测最低电平(dB), 默认 -45")
+    p.add_argument("--highpass-hz", type=float, default=80.0,
+                   help="高通滤波截止频率(Hz), 0=关闭, 默认 80")
+    p.add_argument("--highpass-order", type=int, default=4,
+                   help="高通滤波阶数, 默认 4")
     p.add_argument("--replay", default=None,
                    help="用 16kHz wav 文件回放测试, 不使用麦克风")
     p.add_argument("--no-save", dest="save", action="store_false",
