@@ -15,6 +15,8 @@
     GET  /v1/status     当前播放状态
     GET  /v1/safety     跑一次安全门阀检查 (不动作)
     GET  /v1/kinematics 运动学快照 (TCP 世界系位姿, 手眼标定用)
+    GET  /v1/control_enabled  看控制指令总闸状态
+    POST /v1/control_enabled  切换控制指令总闸 (false = 只算不动)
     WS   /ws            阶段与进度推送
 """
 
@@ -33,6 +35,7 @@ if now_dir not in sys.path:
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
+from pydantic import BaseModel  # noqa: E402
 
 from config import load_config  # noqa: E402
 from library import ActionNotFound  # noqa: E402
@@ -144,6 +147,46 @@ async def move_to(req: MoveToRequest) -> Dict[str, Any]:
 @app.post("/v1/stop", response_model=StopResponse)
 async def stop() -> Dict[str, Any]:
     return _svc().stop()
+
+
+class ControlEnabledRequest(BaseModel):
+    """控制指令总闸的运行时设置。"""
+
+    #: true = 允许下发控制指令; false = 只算不动; None = 回到配置默认值
+    enabled: Optional[bool] = None
+
+
+@app.get("/v1/control_enabled")
+async def get_control_enabled() -> Dict[str, Any]:
+    """看当前的控制指令总闸状态。"""
+    svc = _svc()
+    return {
+        "enabled": svc.control_enabled,
+        "mode": "control" if svc.control_enabled else "plan_only",
+        "description": (
+            "会下发控制指令，机械臂会动"
+            if svc.control_enabled
+            else "不下发任何控制指令，只计算位置"
+        ),
+    }
+
+
+@app.post("/v1/control_enabled")
+async def set_control_enabled(req: ControlEnabledRequest) -> Dict[str, Any]:
+    """切换控制指令总闸 (运行时生效, 不用重启服务)。
+
+    # 只算不动
+    curl -X POST localhost:8802/v1/control_enabled -d '{"enabled": false}'
+
+    # 回到配置默认值
+    curl -X POST localhost:8802/v1/control_enabled -d '{"enabled": null}'
+    """
+    svc = _svc()
+    svc.set_control_enabled(req.enabled)
+    return {
+        "enabled": svc.control_enabled,
+        "mode": "control" if svc.control_enabled else "plan_only",
+    }
 
 
 @app.get("/v1/status", response_model=StatusResponse)

@@ -74,6 +74,14 @@ class ArmService:
         self.cfg = cfg
         self.arm_cfg = cfg.arm
 
+        # 控制指令总闸的**运行时**覆盖。
+        #
+        # None = 没被显式设置过 -> 用配置里的值 (configs/arm.yaml 的
+        # ``arm.enabled``)。运行时可以改 (POST /v1/control_enabled),
+        # 不用重启服务 —— 调试抓取时特别方便: 先关掉把位置算准,
+        # 再打开让机械臂真的过去。
+        self._control_override: Optional[bool] = None
+
         self.library = ActionLibrary(
             self.arm_cfg.action_path,
             exclude_files=self.arm_cfg.exclude_files,
@@ -638,6 +646,14 @@ class ArmService:
         if not names:
             raise ActionNotFound("动作名为空")
 
+        # ---- 控制指令总闸 ----
+        #
+        # 与 mover.move_to 同一条闸: 关着就一个控制指令都不下发。
+        # 动作库播放也是**会动**的操作, 不能绕过。
+        if not self.control_enabled:
+            logger.warning("[服务] 控制指令总闸已关闭: 拒绝播放 %s", ", ".join(names))
+            raise ControllerError("机械臂控制已关闭，机械臂没有动")
+
         # 全部动作先查一遍 —— 有不存在的就别开始了, 免得播到一半才发现
         units = [self.library.get(name) for name in names]
         total_duration = sum(u.duration for u in units)
@@ -1175,7 +1191,40 @@ class ArmService:
             "phase": self._controller.phase,
             "streaming": self._controller.streaming,
             "safety_enabled": self.cfg.safety.enabled,
+            # 控制指令总闸: false 时不下发任何控制指令 (只算不动)
+            "control_enabled": bool(self.control_enabled),
         }
+
+    # ------------------------------------------------------------ 控制总闸
+
+    @property
+    def control_enabled(self) -> bool:
+        """当前是否允许下发控制指令。
+
+        运行时覆盖优先于配置 (``configs/arm.yaml`` 的 ``arm.enabled``);
+        没覆盖过时用配置值。
+
+        **false = 只算不动** —— 抓取的位置照算照报, 但一个控制指令都不发。
+        """
+        if self._control_override is not None:
+            return bool(self._control_override)
+        return bool(self.arm_cfg.enabled)
+
+    def set_control_enabled(self, value: Optional[bool]) -> bool:
+        """设置控制指令总闸。``None`` = 回到配置里的默认值。
+
+        Returns: 生效后的状态。
+        """
+        if value is None:
+            self._control_override = None
+            logger.info("[服务] 控制指令总闸回到配置默认值")
+        else:
+            self._control_override = bool(value)
+            logger.info(
+                "[服务] 控制指令总闸切到 %s",
+                "开启 (会动)" if value else "关闭 (只算不动)",
+            )
+        return self.control_enabled
 
     # ------------------------------------------------------------ 运动学
 

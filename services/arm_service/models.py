@@ -125,9 +125,9 @@ class MoveToResponse(BaseModel):
     model_config = {"extra": "allow"}
 
     ok: bool
-    #: ok / safety / out_of_reach / unreachable / not_arrived / enter_failed ...
+    #: ok / safety / out_of_reach / unreachable / not_arrived / enter_failed / disabled ...
     code: str = ""
-    #: 停在哪一步: safety / plan / enter / move / done
+    #: 停在哪一步: gate / safety / plan / enter / move / done
     stage: str = ""
     #: 可以直接念给用户听的一句话
     message: str = ""
@@ -190,3 +190,5 @@ class HealthResponse(BaseModel):
     phase: str
     streaming: bool
     safety_enabled: bool = True
+    #: 控制指令总闸: false = 不下发任何控制指令 (只算不动)
+    control_enabled: bool = True

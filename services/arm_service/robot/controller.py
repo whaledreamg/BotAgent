@@ -284,13 +284,24 @@ class ArmController:
             "jointLimit": dict(self._joint_limit),
         }
 
-    def cartesian_control_config(self, max_arm_angle_delta: float = 0.05) -> Dict[str, Any]:
+    def cartesian_control_config(self, max_arm_angle_delta: float = 0.2) -> Dict[str, Any]:
         """末端空间入控的 config 段 (``cartesianIkPath: analytic``)。
 
         与关节流的区别:
         - 本会话额外接受末端包 (``controlSpace: 1``), 由控制器逆解
         - 不加后滤波: 末端轨迹本身是 S 曲线, 再叠 2Hz 低通只会让终点多滞后
         - 关节限幅照样打开, 它仍是本会话唯一的关节级保护
+
+        **``maxArmAngleDelta`` 取控制器缺省的 0.2, 别调小。**
+
+        这个参数限的是「每包臂型角最多挪多少」。控制器在目标位安全
+        余量不足 (低于 0.15) 时靠臂型角**让位**来躲开关节限位 ——
+        让位速度就是这个参数。
+
+        之前设成 0.05 (只有缺省的 1/4), 结果是让位跟不上, 关节被
+        推过软限位, 控制器直接安全停机 (13101 关节位置超出软限位)。
+        实测臂型角离零位远 (``analyticIkArmAngle = -1.4``) 时尤其明显:
+        控制器要一边让位一边把臂型角拉回零位, 0.05 根本不够用。
         """
         cfg = self._control_config()
         cfg["cartesianIkPath"] = "analytic"

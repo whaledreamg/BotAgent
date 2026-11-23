@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,8 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
+logger = logging.getLogger("arm.config")
+
 
 #: 项目根目录 (Bot Agent/)
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +32,9 @@ DEFAULT_ACTION_DIR = Path(__file__).resolve().parent / "data"
 
 DEFAULTS: Dict[str, Any] = {
     "arm": {
+        # **控制指令总闸**。false = 不下发任何控制指令, 只算不动。
+        # 详见 configs/arm.yaml 的说明。
+        "enabled": True,
         # 机器人控制器的 WebSocket 控制面 (默认按 ActionPlanner 的机械臂地址)
         "controller_ws": "ws://192.168.100.16:9000",
         # 控制器实时指令面 (UDP), 端口以控制器 getStatus 回读为准
@@ -132,17 +138,23 @@ class GraspConfig:
     duration: float = 3.0
     #: 工作空间粗检: 目标到臂基座的最大距离 (米)
     max_reach: float = 1.2
-    #: 各臂示教的抓取姿态 a/b/c (rad), key 为 left / right
-    orientation: Dict[str, Dict[str, float]] = field(
-        default_factory=lambda: {
-            "left": {"a": 0.0, "b": 0.0, "c": 0.0},
-            "right": {"a": 0.0, "b": 0.0, "c": 0.0},
-        }
-    )
+    #: 各臂示教的抓取姿态 a/b/c (rad), key 为 left / right。
+    #:
+    #: **空 dict = 不指定姿态** —— 移动时保持当前 TCP 姿态, 只改位置。
+    #: 这是默认且推荐的做法: 姿态不变则关节角变化最小, 撞软限位的
+    #: 风险最低。
+    #:
+    #: 填了三个值 = 强制转到那个姿态, 须先示教 (见 configs/arm.yaml)。
+    orientation: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
 class ArmConfig:
+    #: **控制指令总闸**。false = 不下发任何控制指令 (只算不动)。
+    #:
+    #: 这是机械臂的**最后一道**安全闸 —— 无论上层走哪条路 (抓取 skill /
+    #: 动作库播放 / 笛卡尔移动), 这里关着就不会向控制器发控制指令。
+    enabled: bool = True
     #: 机器人控制器的 WebSocket 控制面地址
     controller_ws: str = "ws://192.168.100.16:9000"
     #: 控制器实时指令面 (UDP) 端口
@@ -245,15 +257,52 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
     gr = a.get("grasp") or {}
 
     def _abc(side: str) -> Dict[str, float]:
+        """读一条示教姿态。
+
+        **留空 = 不指定姿态** (返回空 dict) —— 移动时保持当前 TCP 姿态,
+        只改位置。这是默认且推荐的做法。
+
+        为什么不默认填 ``0,0,0``: 那是「姿态全零」而非「不指定」。
+        机械臂当前姿态若是 (2.97, 0.74, -3.00), 硬转到全零要转 138 度,
+        关节角大幅变化, 很容易撞软限位被控制器停掉。
+
+        **三个值要么都给, 要么都不给** —— 给一半会变成「一半用示教值、
+        一半用全零」, 那是用户没想要的姿态。
+        """
         raw = gr.get(side) or {}
-        return {k: float(raw.get(k, 0.0) or 0.0) for k in ("a", "b", "c")}
+        if not isinstance(raw, dict):
+            return {}
+        keys = ("a", "b", "c")
+        present = [k for k in keys if raw.get(k) is not None]
+        if not present:
+            return {}
+        if len(present) != len(keys):
+            logger.warning(
+                "grasp.%s 姿态只给了 %s, 缺的值没法猜 —— 整条按「不指定」处理",
+                side, "/".join(present),
+            )
+            return {}
+        try:
+            return {k: float(raw[k]) for k in keys}
+        except (TypeError, ValueError):
+            logger.warning("grasp.%s 姿态不是数字 —— 整条按「不指定」处理", side)
+            return {}
 
     grasp = GraspConfig(
         duration=float(gr.get("duration", 3.0)),
         max_reach=float(gr.get("max_reach", 1.2)),
         orientation={"left": _abc("left"), "right": _abc("right")},
     )
+    # 控制指令总闸: 环境变量优先 (ARM_ENABLED), 否则用 yaml。
+    # 空字符串当作「没设置」 -> 用 yaml 的值。
+    env_enabled = os.environ.get("ARM_ENABLED")
+    if env_enabled is None or env_enabled.strip() == "":
+        enabled = bool(a.get("enabled", True))
+    else:
+        enabled = env_enabled.strip().lower() not in ("0", "false", "no", "off")
+
     arm = ArmConfig(
+        enabled=enabled,
         controller_ws=os.environ.get(
             "ARM_CONTROLLER_WS", a.get("controller_ws", "ws://192.168.100.16:9000")
         ),
