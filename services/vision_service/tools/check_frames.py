@@ -255,6 +255,75 @@ def main() -> int:
           out is not None and abs(out[0] - 0.1) < 1e-6
           and abs(out[2] - (1.8 + 0.2 + 1.0)) < 1e-6, str(out))
 
+    print("\n[8] 回归: 坐标变换不能做两次")
+    #
+    # 历史 bug: 缓存里的 pose 可能已经是 world 系了, 而 _reframe 里
+    # 「先转回相机系」用的是 transform_point(xyz, "camera") —— 那个
+    # 对 camera 是**恒等** (不是真的求逆)。于是已经变换过的坐标又被
+    # 走了一遍正向变换, 手眼矩阵被应用了两次, 位置差出一米多。
+    #
+    # 这里直接构造「缓存里已经是 world 系」的对象, 看 _reframe 会不会
+    # 再变换一次。
+    cam_pt = (0.10, -0.20, 0.80)
+    world_pt = svc.transform_point(cam_pt, "world")
+    check("先算出 world 坐标", world_pt is not None, str(world_pt))
+
+    cached = [{
+        "label": "bottle",
+        "pose": {"x": world_pt[0], "y": world_pt[1], "z": world_pt[2],
+                 "frame": "world"},
+    }]
+    # 要成 world
+    out_same = svc._reframe([dict(cached[0])], "world")
+    check("已是 world 时原样返回 (不变两次)",
+          abs(out_same[0]["pose"]["x"] - world_pt[0]) < 1e-9
+          and abs(out_same[0]["pose"]["y"] - world_pt[1]) < 1e-9
+          and abs(out_same[0]["pose"]["z"] - world_pt[2]) < 1e-9,
+          f"{out_same[0]['pose']} vs {world_pt}")
+
+    # 要成 left_base: 走真正的「world -> left_base」
+    #
+    # 注意不能用 svc.transform_point(world_pt, "left_base") 当期望值 ——
+    # 那个函数只接受**相机系**的输入, 拿世界系坐标喂进去算的是
+    # 「假装这个点在相机系」, 语义不对。
+    # 正确期望 = inv(T_world_left) @ world_pt (左臂基座只沿 y 平移 0.4m)
+    out_lb = svc._reframe([dict(cached[0])], "left_base")
+    exp_lb = invert_transform(T_WORLD_LEFT) @ np.array(
+        [world_pt[0], world_pt[1], world_pt[2], 1.0])
+    check("world -> left_base 正确",
+          out_lb[0]["pose"]["frame"] == "left_base"
+          and abs(out_lb[0]["pose"]["x"] - exp_lb[0]) < 1e-6
+          and abs(out_lb[0]["pose"]["y"] - exp_lb[1]) < 1e-6
+          and abs(out_lb[0]["pose"]["z"] - exp_lb[2]) < 1e-6,
+          f"{out_lb[0]['pose']} vs {exp_lb[:3]}")
+
+    # 反过来: 相机系 -> world 也要对
+    cam_cached = [{
+        "label": "bottle",
+        "pose": {"x": cam_pt[0], "y": cam_pt[1], "z": cam_pt[2],
+                 "frame": "camera"},
+    }]
+    out_w = svc._reframe([dict(cam_cached[0])], "world")
+    check("camera -> world 正确",
+          abs(out_w[0]["pose"]["x"] - world_pt[0]) < 1e-9
+          and abs(out_w[0]["pose"]["y"] - world_pt[1]) < 1e-9
+          and abs(out_w[0]["pose"]["z"] - world_pt[2]) < 1e-9,
+          f"{out_w[0]['pose']} vs {world_pt}")
+
+    # 往返: world -> camera 应该回到原始相机系坐标
+    back_cam = svc._reframe([dict(cached[0])], "camera")
+    check("world -> camera 回到原点",
+          back_cam[0]["pose"]["frame"] == "camera"
+          and abs(back_cam[0]["pose"]["x"] - cam_pt[0]) < 1e-6
+          and abs(back_cam[0]["pose"]["y"] - cam_pt[1]) < 1e-6
+          and abs(back_cam[0]["pose"]["z"] - cam_pt[2]) < 1e-6,
+          f"{back_cam[0]['pose']} vs {cam_pt}")
+
+    # 往返: camera -> camera 恒等
+    rt = svc._reframe(cam_cached, "camera")
+    check("camera -> camera 恒等",
+          abs(rt[0]["pose"]["x"] - cam_pt[0]) < 1e-9, str(rt[0]["pose"]))
+
     srv.shutdown()
 
     print()

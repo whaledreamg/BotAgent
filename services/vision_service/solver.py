@@ -423,6 +423,23 @@ class PoseSolver:
             return "camera"
         return getattr(provider, "frame", "camera")
 
+    def extrinsic_matrix(self) -> Optional[np.ndarray]:
+        """拿「相机系 -> 目标系」的 4x4 矩阵。拿不到返回 None。
+
+        需要**完整矩阵** (不能只拿一个点的变换结果) —— 换算两个非相机系
+        之间时要对它求逆。
+        """
+        provider = self._provider()
+        if provider is None:
+            return None
+        try:
+            m = provider.get()
+        except Exception:
+            return None
+        if m is None:
+            return None
+        return np.asarray(m, dtype=np.float64)
+
     def _provider(self):
         """拿外参 provider —— 优先用显式注入的, 其次用配置构造的。"""
         if self._extrinsic_provider is not None:

@@ -15,8 +15,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -26,6 +27,7 @@ from detector import Detection, Detector, DetectorError
 from solver import PoseSolver, Target3D
 from tracing import DetectionTracer
 import class_names
+import paths as resources
 
 logger = logging.getLogger("vision.service")
 
@@ -100,6 +102,54 @@ class VisionService:
         # 追溯系统
         trace_dir = Path(getattr(cfg, "trace_dir", "traces"))
         self._tracer = DetectionTracer(trace_dir)
+
+        # ---- WebSocket 订阅者 ----
+        #
+        #: 每次检测完成后, 把结果推给所有订阅者 (监控端)。
+        #:
+        #: **为什么不是「连上就自己循环检测」** —— 那是轮询式的: 服务
+        #: 每秒拍一次, 没人看也在拍。监控端改成「按一下识别一次」之后,
+        #: 拍多少张由**客户端**说了算, 服务只负责把结果广播出去。
+        #:
+        #: 订阅者存的是**回调**而不是队列 —— 因为广播发生在工作线程里
+        #: (``asyncio.to_thread`` 跑推理), 而 ``asyncio.Queue`` 是**线程
+        #: 不安全**的: 在别的线程里 ``put_nowait`` 不会唤醒事件循环,
+        #: 等待的协程会一直睡着。回调里由调用方用
+        #: ``loop.call_soon_threadsafe`` 投递回事件循环。
+        self._subscribers: List[Callable[[Dict[str, Any]], None]] = []
+        self._sub_lock = threading.Lock()
+
+    # ------------------------------------------------------------ 订阅者
+
+    def subscribe(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """注册一个订阅者 (回调)。
+
+        Args:
+            callback: 收到消息时调用的函数。**必须**自己保证线程安全
+                (比如在事件循环里用 ``call_soon_threadsafe``)。
+        """
+        with self._sub_lock:
+            if callback not in self._subscribers:
+                self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """注销一个订阅者。"""
+        with self._sub_lock:
+            if callback in self._subscribers:
+                self._subscribers.remove(callback)
+
+    def _broadcast(self, message: Dict[str, Any]) -> None:
+        """把一条消息推给所有订阅者。
+
+        从工作线程调用 —— 订阅者自己负责把消息安全地送回事件循环。
+        """
+        with self._sub_lock:
+            targets = list(self._subscribers)
+        for callback in targets:
+            try:
+                callback(message)
+            except Exception:  # pragma: no cover - 推送失败不该影响识别
+                logger.debug("推送检测结果失败", exc_info=True)
 
     # ------------------------------------------------------------ 动态外参
 
@@ -346,10 +396,16 @@ class VisionService:
                 depth_to_color=capture.depth_to_color,
             )
             pose3d = self._pose_dict(target, frame)
+            #: 本次检测中的物体序号 (从 1 开始) —— 监控端拿它当「标记号」。
+            obj_index = len(objects) + 1
+            #: 本次识别发生的时刻 (ISO 8601) —— 监控端列表要显示时间戳。
+            detected_at = datetime.now().isoformat()
             obj: Dict[str, Any] = {
+                "index": obj_index,
                 "label": det.label,
                 "label_zh": class_names.to_zh(det.label),
                 "confidence": round(float(det.confidence), 4),
+                "timestamp": detected_at,
                 "bbox": {
                     "x1": round(det.bbox[0], 1),
                     "y1": round(det.bbox[1], 1),
@@ -367,11 +423,10 @@ class VisionService:
                     }
                     for k in det.keypoints
                 ]
-            objects.append(obj)
 
             # 追溯记录: 每个物体一张图, 各画各的框, 放在同一文件夹里
             try:
-                self._tracer.record(
+                rec = self._tracer.record(
                     label=det.label,
                     confidence=float(det.confidence),
                     bbox=det.bbox,
@@ -380,10 +435,33 @@ class VisionService:
                     frame=frame,
                     extra={"keypoints_count": len(det.keypoints) if det.keypoints else 0},
                     session=session,
-                    index=len(objects),
+                    index=obj_index,
                 )
+                # **把追溯记录的标识带进结果里**。
+                #
+                # record_id 是这次识别的唯一编号, image_filename 是那张
+                # 带框图片的相对路径 —— 监控端靠它们显示「图像标记号」,
+                # 也能据此去 /v1/traces/image/ 拉图看大图。
+                if rec is not None:
+                    obj["record_id"] = rec.record_id
+                    obj["image_filename"] = rec.image_filename
             except Exception as exc:
                 logger.debug("记录识别追溯失败: %s", exc)
+
+            objects.append(obj)
+
+        # ---- 标注总览图 (一张画了所有框的整图) ----
+        #
+        # 监控端要展示的就是这张 —— 缩放显示在界面上, 下面列识别到
+        # 了哪些物体。不画这张图的话, 客户端只能一个物体一张图地拼,
+        # 拼出来还是「一帧一个框」, 不好看。
+        annotated = None
+        try:
+            annotated = self._tracer.save_annotated(
+                capture.color, objects, session,
+            )
+        except Exception as exc:
+            logger.debug("保存标注总览图失败: %s", exc)
 
         elapsed = int((time.time() - started) * 1000)
 
@@ -399,13 +477,34 @@ class VisionService:
             self._last_ms = elapsed
             self._timestamp_us = int(time.time() * 1_000_000)
 
-        return {
+        result = {
             "objects": objects,
             "latency_ms": elapsed,
             "timestamp_us": self._timestamp_us,
             "frame": actual_frame,
             "requested_frame": frame,
+            # 追溯会话名 —— 本次拍到的所有物体的图都在这个文件夹里。
+            "session": session,
+            # 画了所有框的整图 (相对 trace_root) —— 监控端拉这张显示。
+            "annotated_image": annotated or "",
         }
+
+        # ---- 广播给订阅者 (监控端) ----
+        #
+        # 谁触发的那次检测 (HTTP 或 WS) 不重要 —— 结果一样推给所有人。
+        # 监控端收到就显示标注图 + 识别到的物体列表。
+        self._broadcast(
+            {
+                "type": "detection",
+                "objects": objects,
+                "latency_ms": elapsed,
+                "frame": actual_frame,
+                "session": session,
+                "annotated_image": annotated or "",
+            }
+        )
+
+        return result
 
     def _actual_frame_of(self, objects: List[Dict[str, Any]]) -> str:
         """从结果里反推「实际坐标系」—— 所有目标一致才算一致。"""
@@ -616,24 +715,36 @@ class VisionService:
     ) -> List[Dict[str, Any]]:
         """把缓存结果换到请求的坐标系。
 
-        **缓存里的坐标是相机系** (detect 时按请求的系存过, 这里再转一次
-        是幂等的 —— 换到相机系再换回来结果一样)。
+        **缓存里的坐标不一定是相机系** —— ``detect(frame=...)`` 会按
+        请求的系把 ``pose`` 存进去。所以这里必须知道每个物体当前在
+        哪个系, 才能换过去。
+
+        **不能用「先转回相机系再转过去」** —— ``transform_point`` 只能
+        做「相机系 -> 目标系」的正向变换, 传 ``"camera"`` 给它是**恒等**
+        (不是真的求逆)。拿已经变换过的坐标再走一遍正向变换, 手眼矩阵
+        就被**应用了两次**, 结果完全错掉::
+
+            相机系      = (-0.0734,  0.1211,  0.6610)
+            变换一次    = ( 0.4676,  0.0123, -0.3944)   <- 正确
+            变换两次    = (-0.2532, -0.5353,  0.3794)   <- 错的, 差 1.2 米
+
+        所以正确做法是**直接从一个已知系换到另一个已知系**: 拿当前
+        系对应的 4x4, 求逆得到「目标系 -> 当前系」的逆变换, 复合起来。
         """
         want = _normalize_frame(frame)
-        if want == "camera":
-            return objects
         out = []
         for obj in objects:
             pose = obj.get("pose") or {}
             xyz = (pose.get("x", 0.0), pose.get("y", 0.0), pose.get("z", 0.0))
-            # 缓存里的 pose 可能已经在别的系里了 —— 先转回相机系
             src_frame = _normalize_frame(str(pose.get("frame", "camera")))
-            if src_frame != "camera":
-                back = self.transform_point(xyz, "camera")
-                if back is not None:
-                    xyz = back
-            converted = self.transform_point(xyz, want)
+
             new_pose = dict(pose)
+            if src_frame == want:
+                # 已经在目标系了, 原样返回 (别再转一遍!)
+                out.append({**obj, "pose": new_pose})
+                continue
+
+            converted = self._convert_between(xyz, src_frame, want)
             if converted is not None:
                 new_pose.update(
                     {"x": converted[0], "y": converted[1], "z": converted[2],
@@ -641,10 +752,66 @@ class VisionService:
                 )
             else:
                 new_pose["frame"] = "camera"
-            new_obj = dict(obj)
-            new_obj["pose"] = new_pose
-            out.append(new_obj)
+            out.append({**obj, "pose": new_pose})
         return out
+
+    def _convert_between(
+        self,
+        xyz: Sequence[float],
+        src_frame: str,
+        dst_frame: str,
+    ) -> Optional[Tuple[float, float, float]]:
+        """把点从 ``src_frame`` 换到 ``dst_frame`` (两个都不是相机系也行)。
+
+        走「同一个 4x4 的正逆复合」:
+
+            T_dst_src = T_dst_cam · T_cam_src
+
+        两个系各拿一次 4x4 (相机系 -> 目标系), 中间用求逆抵消。
+        拿不到就返回 None —— 调用方据此退回相机系, **不假装**.
+        """
+        src = self._transform_matrix(src_frame)
+        dst = self._transform_matrix(dst_frame)
+        if src is None or dst is None:
+            return None
+        try:
+            m = dst @ np.linalg.inv(src)
+            p = np.array([float(xyz[0]), float(xyz[1]), float(xyz[2]), 1.0])
+            out = m @ p
+            return (float(out[0]), float(out[1]), float(out[2]))
+        except Exception as exc:
+            logger.debug("坐标变换失败 (%s -> %s): %s", src_frame, dst_frame, exc)
+            return None
+
+    def _transform_matrix(self, frame: str) -> Optional[np.ndarray]:
+        """拿「相机系 -> frame」的 4x4 矩阵。拿不到返回 None。
+
+        两条路:
+        - **动态 provider** (``RigidExtrinsicProvider``): 能换到任意系
+          (world / left_base / right_base / arm_base), 用 ``with_frame``
+          拿对应目标系的矩阵。
+        - **静态 provider**: 只认它自己的目标系, 拿它的完整矩阵。
+        """
+        want = _normalize_frame(frame)
+        if want == "camera":
+            return np.eye(4, dtype=np.float64)
+
+        provider = self._dynamic_provider
+        if provider is not None and hasattr(provider, "with_frame"):
+            try:
+                m = provider.with_frame(want).get()
+            except Exception as exc:
+                logger.debug("取外参矩阵失败 (%s): %s", want, exc)
+                m = None
+            if m is not None:
+                return np.asarray(m, dtype=np.float64)
+
+        # 静态 provider: 只认它自己的目标系
+        if self.solver.extrinsic_frame() == want:
+            m = self.solver.extrinsic_matrix()
+            if m is not None:
+                return np.asarray(m, dtype=np.float64)
+        return None
 
     def summarize(
         self, objects: Optional[List[Dict[str, Any]]] = None
@@ -732,6 +899,8 @@ class VisionService:
             "last_object_count": last_count,
             "errors": errors[-10:],
             "provider": provider_info,
+            # 资源 (模型/SDK) 在哪 —— 排查「换机器就起不来」时先看这里
+            "resources": resources.describe(),
         }
 
 

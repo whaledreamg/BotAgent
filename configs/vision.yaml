@@ -19,8 +19,22 @@ vision:
   camera:
     camera_brand: orbbec
     camera_type: head
-    #serial_number: CPCBC53000H5
-    serial_number: CPB9463000RS
+    # 本机插着的相机: Orbbec Gemini 336L, SN=CPCBC53000H5
+    #
+    # 留空 = 用枚举到的第一个设备 (换机器/换相机时最省事, 推荐这样)。
+    # 填了序列号 = 只认这一台 —— 多相机时用来区分, 但换机器要记得改。
+    serial_number: CPCBC53000H5
+    # 彩色流分辨率。
+    #
+    # **保持 0 = 用 SDK 默认 (1280x800)**。
+    #
+    # 别为了「省点带宽」改成 640x400 —— 位置精度会明显掉:
+    #   - 标定内参 fx=605.78 是在 1280x800 上标的, 1 像素对应 1.65mm;
+    #     降到 640x400 后 1 像素对应 3.30mm, 物体框偏 5 像素位置就差 1.6cm
+    #   - 手眼标定 (configs/handeye.json) 也是在 1280x800 下做的
+    #   - 对齐模式会从 SW_MODE 变成 HW_MODE, 深度/彩色的对应关系也变了
+    #
+    # 要换分辨率, 必须连着重新标内参 + 重新标手眼。
     width: 0
     height: 0
     fps: 0
@@ -34,7 +48,17 @@ vision:
       width: 1280
       height: 800
   detector:
-    weights: /home/gxh/workspace/data/model/yolo/yolo26n.pt
+    # ---- 权重路径怎么写 ----
+    #
+    # @ 前缀 = 相对**仓库根** (BotAgent/)。仓库里放了就在仓库里找,
+    # 换机器不用改配置。
+    #
+    # 也可以写绝对路径, 或者设环境变量指到仓库外 (大文件不建议进 git):
+    #   export VISION_MODEL_DIR=/data/models
+    #   export VISION_WEIGHTS=/data/models/yolo26n.pt
+    #
+    # 留空 = 让 ultralytics 自己按名字下载。
+    weights: '@models/yolo/yolo26n.pt'
     pose_weights: ''
     conf: 0.15
     find_conf: 0.15
@@ -54,14 +78,18 @@ vision:
     frames: 5
     output_dir: logs
   training:
-    data: /home/gxh/workspace/project/datasets/myobjects/data.yaml
-    base_weights: /home/gxh/workspace/project/ultralytics/yolo26n.pt
+    # 数据集描述文件 (ultralytics 的 data.yaml)
+    # @ = 相对仓库根; 也可以写绝对路径或用 VISION_DATA_DIR 指到仓库外。
+    data: '@datasets/myobjects/data.yaml'
+    # 迁移学习的起点权重 (或 .yaml 表示从零训)
+    base_weights: '@models/yolo/yolo26n.pt'
     epochs: 100
     imgsz: 640
     batch: 16
     patience: 30
     device: '0'
-    project: /home/gxh/workspace/project/runs
+    # 训练输出目录
+    project: '@datasets/runs'
     name: myobjects
     hsv_h: 0.01
     hsv_s: 0.4

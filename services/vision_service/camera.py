@@ -171,6 +171,12 @@ class OrbbecCamera(CameraAdapter):
                 time.sleep(self._enum_retry_delay)
 
         if last_error is not None:
+            # 「被别的进程占着」要单独报 —— 它的修复方法跟「没插相机」
+            # 完全不一样, 混在一起报会让人白折腾。
+            if self._is_device_busy(last_error):
+                raise CameraError(
+                    f"枚举相机失败 (设备被占用): {last_error}\n{self._busy_message()}"
+                )
             raise CameraError(f"枚举相机失败: {last_error}")
         return ctx, []
 
@@ -197,19 +203,93 @@ class OrbbecCamera(CameraAdapter):
                 continue
         return False
 
+    @staticmethod
+    def _all_serials(devices: Any) -> list:
+        """列出所有设备的序列号 (给「序列号写错了」的报错用)。"""
+        out = []
+        try:
+            for i in range(len(devices)):
+                info = devices[i].get_device_info()
+                serial = _info_serial(info)
+                if serial:
+                    out.append(serial)
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _device_by_serial(devices: Any, want_serial: str) -> Any:
+        """按序列号找设备。
+
+        先用 SDK 自带的 ``get_device_by_serial_number()`` —— 它比我们自己
+        遍历要靠谱 (也避开了 DeviceList 迭代器的坑)。找不到再退回遍历。
+        """
+        try:
+            dev = devices.get_device_by_serial_number(want_serial)
+            if dev is not None:
+                return dev
+        except Exception:
+            pass
+        try:
+            for i in range(len(devices)):
+                info = devices[i].get_device_info()
+                if _info_serial(info) == want_serial:
+                    return devices[i]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _is_device_busy(exc: Exception) -> bool:
+        """这个异常是不是「相机被别的进程占着」。
+
+        SDK 的报错信息很不直观:
+
+        - ``usbEnumerator openUsbDevice failed!`` —— 设备打不开 (被占)
+        - ``uvc_open failed -6`` —— 另一个老说法, 也是被占
+
+        这两种都指向同一个根因: Orbbec 是 USB **独占**设备, 而 GNOME 的
+        ``gvfsd-gphoto2`` (自动挂载相机的守护进程) 经常在背后悄悄占着它。
+
+        识别出来就能给出「杀掉它」的具体命令, 而不是让人对着
+        ``openUsbDevice failed`` 猜。
+        """
+        text = str(exc or "").lower()
+        markers = (
+            "openusbdevice failed",
+            "uvc_open failed",
+            "device is busy",
+            "resource busy",
+        )
+        return any(m in text for m in markers)
+
+    def _busy_message(self) -> str:
+        """「相机被占着」的排查指引。"""
+        return (
+            "相机打不开 —— **被别的进程占着** (Orbbec 是 USB 独占设备)。\n"
+            "  最常见的是 GNOME 的 gvfsd-gphoto2 (自动挂载相机的守护进程):\n"
+            "    pkill -f gvfsd-gphoto2\n"
+            "  视觉服务/标定脚本也占着的话:\n"
+            "    ./scripts/stop_all.sh\n"
+            "  查是谁占着:\n"
+            "    fuser -v /dev/bus/usb/001/*"
+        )
+
     def _no_device_message(self) -> str:
         """构造"枚举不到相机"的诊断信息。"""
         if self._usb_seen():
-            # 内核认到了, 但 SDK 枚举不到
             return (
                 "没有找到 Orbbec 相机 (但 USB 层能看到设备)。\n"
                 "  可能是:\n"
-                "    1. 相机被别的进程占着 —— Orbbec 是 USB **独占**设备,\n"
-                "       视觉服务/标定脚本还开着它。停掉再试:\n"
+                "    1. 相机被别的进程占着 —— Orbbec 是 USB **独占**设备。\n"
+                "       最常见的是 GNOME 的 gvfsd-gphoto2 (自动挂载相机):\n"
+                "         pkill -f gvfsd-gphoto2\n"
+                "       视觉服务/标定脚本也占着的话:\n"
                 "         ./scripts/stop_all.sh\n"
                 "    2. SDK 构建没有 USB 后端 —— 日志里会报\n"
                 "       'Usb pal is not exist', 需要用源码编译\n"
                 "       (OB_BUILD_USB_PAL=ON) 或换用支持 USB 的构建。\n"
+                "       见 sdk/README.md\n"
                 "    3. 相机刚插上还没就绪 —— 拔插一次再试。"
             )
 
@@ -253,6 +333,10 @@ class OrbbecCamera(CameraAdapter):
         except CameraError:
             raise
         except Exception as exc:
+            if self._is_device_busy(exc):
+                raise CameraError(
+                    f"打开相机失败 (设备被占用): {exc}\n{self._busy_message()}"
+                ) from exc
             raise CameraError(f"打开相机失败: {exc}") from exc
 
     def _open_device(self, ob: Any) -> None:
@@ -265,18 +349,28 @@ class OrbbecCamera(CameraAdapter):
             raise CameraError(self._no_device_message())
 
         # ---- 选设备 ----
+        #
+        # **不能直接 `for dev in devices`** —— pyorbbecsdk 的 DeviceList
+        # 迭代器有个 off-by-one: 第一轮正常, 第二轮就抛
+        # ``OBError: Invalid index value for argument "index"``。
+        # 只有一个相机时, 这个异常会在「已经拿到设备」之后才炸, 报错信息
+        # 完全指不到真因 (看起来像 SDK 坏了)。
+        #
+        # 所以统一用 `range(len())` + `devices[i]` 取, 或者走
+        # `get_device_by_serial_number()` —— 后者还能顺便把「序列号写错」
+        # 和「相机没插」两种情况分开。
         device = None
         want_serial = str(getattr(self.cfg, "serial_number", "") or "")
         if want_serial:
-            for dev in devices:
-                info = dev.get_device_info()
-                if _info_serial(info) == want_serial:
-                    device = dev
-                    break
+            device = self._device_by_serial(devices, want_serial)
             if device is None:
                 raise CameraError(
                     f"找不到序列号为 {want_serial} 的相机 "
-                    f"(共 {len(devices)} 个设备)"
+                    f"(共 {len(devices)} 个设备)。\n"
+                    f"  本机实际插着的相机序列号: "
+                    f"{', '.join(self._all_serials(devices)) or '(一个都没有)'}\n"
+                    f"  改 configs/vision.yaml 的 camera.serial_number, "
+                    f"或者留空让它用第一个。"
                 )
         else:
             device = devices[0]
@@ -368,6 +462,23 @@ class OrbbecCamera(CameraAdapter):
                 pipeline = None
 
         if pipeline is None:
+            # 「分辨率/帧率组合相机不支持」是最常见的原因, 而且报错信息
+            # 里已经把请求的参数带出来了 —— 直接把**支持哪些**列出来,
+            # 省得用户一个个试。
+            if "No matched profile" in str(last_error or ""):
+                raise CameraError(
+                    f"启动数据流失败: {last_error}\n"
+                    f"  相机不支持这个分辨率/帧率组合 "
+                    f"({width}x{height}@{fps})。\n"
+                    f"  查这台相机支持哪些组合:\n"
+                    f"    python -c \"import pyorbbecsdk as ob; "
+                    f"d=ob.Context().query_devices(); "
+                    f"s=d[0].get_sensor(ob.OBSensorType.COLOR_SENSOR); "
+                    f"l=s.get_stream_profile_list(); "
+                    f"print([str(l.get_stream_profile_by_index(i)) "
+                    f"for i in range(l.get_count())])\"\n"
+                    f"  改 configs/vision.yaml 的 camera.width/height/fps。"
+                ) from last_error
             raise CameraError(
                 f"启动数据流失败: {last_error}"
             ) from last_error
@@ -439,13 +550,22 @@ class OrbbecCamera(CameraAdapter):
         height = int(cal.get("height", 0) or self._intrinsics.height)
 
         # 分辨率对不上就不能用 —— 内参是跟着分辨率走的
+        #
+        # **别改成「按比例缩放」**: 缩放在数学上没错, 但标定内参和手眼
+        # 外参都是**在特定分辨率下标出来的**, 换分辨率后检测框的像素精度
+        # 也变了 (1 像素代表的实际距离翻倍), 位置精度会明显下降。
+        #
+        # 正确做法: 保持相机跑在标定时的分辨率 (configs/vision.yaml 里
+        # width/height 留 0 = 用 SDK 默认的 1280x800)。要换分辨率, 连着
+        # 重新标内参 + 重新标手眼。
         if (
             self._intrinsics.width
             and width
             and (width != self._intrinsics.width or height != self._intrinsics.height)
         ):
             logger.warning(
-                "标定内参的分辨率 %dx%d 与当前彩色流 %dx%d 不符, 不用它",
+                "标定内参的分辨率 %dx%d 与当前彩色流 %dx%d 不符, 不用它 "
+                "(要换分辨率请重新标内参 + 重新标手眼)",
                 width, height, self._intrinsics.width, self._intrinsics.height,
             )
             return
@@ -567,6 +687,7 @@ class OrbbecCamera(CameraAdapter):
                 if arr.size >= w * h:
                     depth_raw = arr[: w * h].reshape(h, w)
             depth_intr = self._read_intrinsics(depth_frame, None)
+
         self._depth_intrinsics = depth_intr
 
         # 深度 scale: 每帧都可能变 (不同模式下 scale 不同)
