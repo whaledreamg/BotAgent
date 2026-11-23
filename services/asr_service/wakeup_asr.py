@@ -236,6 +236,14 @@ class WakeupASR:
         self.gen_rec = KaldiRecognizer(self.model, SAMPLE_RATE)
 
         self.state = "IDLE"  # IDLE / RECORDING
+        #: **录音状态变化**的回调 (可选)。
+        #:
+        #: 调用时机: 开始录音 / 停止录音。回调收到 ``"RECORDING"`` 或
+        #: ``"WAITING"`` —— 监控端靠它区分「还没触发唤醒词」和
+        #: 「正在识别」, 画三态动画。
+        #:
+        #: 回调异常会被吞掉 —— 它只是个通知, 不该影响识别主流程。
+        self.on_recording_state_change = None
         self.audio_q = queue.Queue()
         self.ring = collections.deque(maxlen=64)  # (ts, bytes), 约 16s
         self.rec_chunks = []
@@ -360,8 +368,23 @@ class WakeupASR:
 
     # ------------------------------------------------------------ 录音
 
+    def _notify_recording_state(self, state: str) -> None:
+        """通知外部「录音状态变了」。
+
+        Args:
+            state: ``"RECORDING"`` (正在录音) 或 ``"WAITING"`` (等待唤醒词)。
+        """
+        cb = getattr(self, "on_recording_state_change", None)
+        if cb is None:
+            return
+        try:
+            cb(state)
+        except Exception as exc:  # pragma: no cover - 回调不该影响识别
+            print(f"[录音状态] 回调异常: {exc}")
+
     def start_recording(self, ts, wake):
         self.state = "RECORDING"
+        self._notify_recording_state("RECORDING")
         self.rec_chunks = []
         self.rec_start_ts = ts
         self.last_voice_ts = ts
@@ -449,6 +472,9 @@ class WakeupASR:
         if self.state != "RECORDING":
             return
         self.state = "IDLE"
+        # 录音结束 —— 回到「等待唤醒词」。
+        # (识别完成的标记由 Pipeline 那边负责, 这里只管录音状态)
+        self._notify_recording_state("WAITING")
         try:
             res = json.loads(self.asr_rec.FinalResult())
             text = res.get("text", "").strip()

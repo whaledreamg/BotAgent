@@ -34,6 +34,22 @@ class State(str, Enum):
     SAY = "SAY"
 
 
+class RecState(str, Enum):
+    """**录音**阶段的状态 (跟 Pipeline 的 State 分开)。
+
+    ``Pipeline.State`` 描述的是「这一轮处理到哪一步了」, 从识别完成
+    才开始变动 —— 在它眼里, 等待唤醒词和正在录音都是 IDLE, 没法区分。
+
+    监控端要画「语音识别三态动画」(等唤醒 / 识别中 / 识别完成),
+    靠的就是这个枚举。
+    """
+
+    #: 等待唤醒词 (没在录音)
+    WAITING = "WAITING"
+    #: 正在录音 (已唤醒, 用户在说话)
+    RECORDING = "RECORDING"
+
+
 @dataclass
 class LastTurn:
     """最近一轮的完整记录, 供 /state 查询。"""
@@ -59,6 +75,16 @@ class Pipeline:
         self.agent = AgentClient(cfg.agent, session_id=cfg.asr.session_id)
         self.tts = TTSClient(cfg.tts)
         self.state = State.IDLE
+        #: **录音**阶段的状态 (等待唤醒词 / 正在录音)。
+        #:
+        #: 由 ASR 侧 (VoiceASR) 在 start_recording / stop_recording 时
+        #: 通过 ``set_rec_state()`` 推进 —— 监控端靠它画三态动画。
+        self.rec_state = RecState.WAITING
+        #: 最近一次「识别完成」的标记: ``{"text": ..., "at": ...}``。
+        #:
+        #: 识别完成的**瞬间**就写进来 (不等 Agent 跑完), 监控端能
+        #: 第一时间知道「这一轮识别完了」。新一轮开始时清空。
+        self.rec_result: Optional[Dict[str, Any]] = None
         self.last = LastTurn()
         self.errors: List[str] = []
         self.turn_count = 0
@@ -98,6 +124,43 @@ class Pipeline:
         with self._lock:
             self.state = state
         logger.info("[状态] -> %s", state.value)
+
+    def set_rec_state(self, state) -> None:
+        """更新**录音**阶段的状态 (等待唤醒词 / 正在录音)。
+
+        由 ASR 侧在真正开始/停止录音时调用 —— 监控端靠它区分
+        「还没触发唤醒词」和「正在识别」。
+
+        Args:
+            state: ``RecState`` 成员或它的字符串值。
+        """
+        try:
+            new_state = RecState(state)
+        except ValueError:
+            logger.warning("[录音状态] 未知取值, 忽略: %r", state)
+            return
+
+        with self._lock:
+            if self.rec_state == new_state:
+                return
+            self.rec_state = new_state
+        logger.info("[录音状态] -> %s", new_state.value)
+
+    def mark_rec_result(self, text: str) -> None:
+        """标记「这一轮识别完成了」。
+
+        识别完成的**瞬间**就记下来 —— 不等 Agent 分流、不等 TTS 播完。
+        监控端据此显示「识别完成」动画。
+
+        同时把录音状态退回「等待唤醒词」—— 识别已经结束了。
+        """
+        with self._lock:
+            self.rec_result = {
+                "text": text,
+                "at": time.time(),
+                "turn": self.turn_count,
+            }
+            self.rec_state = RecState.WAITING
 
     def _notify_turn_complete(self) -> None:
         """通知外部「这一轮彻底结束了」。
@@ -145,10 +208,19 @@ class Pipeline:
             last = self.last
             errors = list(self.errors)
             turns = self.turn_count
+            rec_state = self.rec_state.value
+            rec_result = dict(self.rec_result) if self.rec_result else None
         return {
             "status": "ok",
             "state": state,
             "turns": turns,
+            # ---- 录音阶段 (监控端画三态动画用) ----
+            #:
+            #: "WAITING" = 还没触发唤醒词; "RECORDING" = 正在识别。
+            "rec_state": rec_state,
+            #: 最近一次「识别完成」的标记: {"text", "at", "turn"}。
+            #: 识别完成的那一瞬间就写进来了 —— 不等 Agent/TTS。
+            "rec_result": rec_result,
             "wake_words": self.cfg.asr.wake_words,
             "asr_model": self.cfg.asr.model_path or "(自动查找)",
             "agent_url": self.cfg.agent.dispatch_url,
@@ -206,6 +278,9 @@ class Pipeline:
             # 中间那几秒的 THINK 阶段监控端是空的。
             self.last.text = text
             self.last.at = time.time()
+        # 「识别完成」这一刻 —— 立刻标记, 不等 Agent 分流。
+        # (新的一轮会把 rec_result 覆盖掉, 上一轮的完成动画不会重播)
+        self.mark_rec_result(text)
         worker = threading.Thread(
             target=self._run_turn,
             args=(text, record_ms),

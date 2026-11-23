@@ -233,6 +233,7 @@ class VoiceASR(wakeup_asr.WakeupASR):
         否则会被识别成用户说的话。
         """
         self.state = "RECORDING"
+        self._notify_recording_state("RECORDING")
         self.rec_chunks = []
         self.rec_start_ts = ts
         self.last_voice_ts = ts
@@ -608,6 +609,10 @@ def main(argv=None):
     pipeline.on_before_speak = app.arm_echo_guard
     # 播报**之后**把守卫延伸到沉降期 (余音还没散)
     pipeline.on_after_speak = app.finalize_echo_guard
+    # 录音状态变化 -> 推进 Pipeline 的 rec_state。
+    #
+    # 监控端靠它区分「还没触发唤醒词」和「正在识别」, 画三态动画。
+    app.on_recording_state_change = pipeline.set_rec_state
 
     if app.continuous_timeout:
         print(
