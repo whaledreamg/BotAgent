@@ -79,15 +79,27 @@ class VisionClient:
             raise VisionError(f"视觉服务健康检查失败: {exc}") from exc
 
     async def find(
-        self, name: str, frame: str = "camera"
+        self, name: str, frame: str = "camera", fresh: bool = False
     ) -> Dict[str, Any]:
         """按类别名查物体。
 
         返回 {"found": bool, "count": int, "objects": [...]}。
+
+        Args:
+            name:   类名 (中英文都行)
+            frame:  坐标系
+            fresh:  **强制视觉服务重新拍一张**, 不走它自己的缓存。
+
+                抓取这种「物体在哪」的动作必须用 fresh —— 视觉服务
+                默认会返回上一次检测的缓存, 物体挪动了它也不知道,
+                报出来的还是老坐标。
         """
+        params: Dict[str, Any] = {"frame": frame}
+        if fresh:
+            params["fresh"] = "true"
         try:
             resp = await self._client.get(
-                f"/v1/objects/{name}", params={"frame": frame}
+                f"/v1/objects/{name}", params=params
             )
             resp.raise_for_status()
             return resp.json()

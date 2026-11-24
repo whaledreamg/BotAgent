@@ -22,6 +22,90 @@ logger = logging.getLogger("skill.vision_grasp")
 GRASP_TRACE_PATH = Path(__file__).resolve().parents[2] / "logs" / "grasp_trace.jsonl"
 
 
+class _FlowConfig:
+    """抓取流程的 5 步配置。
+
+    值来自 ``configs/arm.yaml`` 的 ``arm.grasp.flow``。skill 启动时从
+    机械臂服务拉一次 (``GET /v1/flow``) —— 那边才有权威的配置。
+
+    这里带一套**兜底默认值**, 拉不到配置也能跑。
+    """
+
+    __slots__ = (
+        "ready_action", "safe_action", "above_distance",
+        "grasp_offset_x", "grasp_offset_y", "grasp_offset_z",
+        "close_action", "open_action",
+        "above_duration", "grasp_duration",
+    )
+
+    def __init__(self, **kw: Any) -> None:
+        self.ready_action: str = kw.get("ready_action", "准备点")
+        self.safe_action: str = kw.get("safe_action", "安全点")
+        self.above_distance: float = float(kw.get("above_distance", 0.10))
+        self.grasp_offset_x: float = float(kw.get("grasp_offset_x", 0.0))
+        self.grasp_offset_y: float = float(kw.get("grasp_offset_y", 0.0))
+        self.grasp_offset_z: float = float(kw.get("grasp_offset_z", 0.0))
+        self.close_action: str = kw.get("close_action", "闭合夹爪")
+        self.open_action: str = kw.get("open_action", "张开夹爪")
+        self.above_duration: float = float(kw.get("above_duration", 3.0))
+        self.grasp_duration: float = float(kw.get("grasp_duration", 2.0))
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "_FlowConfig":
+        return cls(**{k: v for k, v in (data or {}).items() if k in cls.__slots__})
+
+
+class StepResult:
+    """抓取流程里**一步**的结果。
+
+    5 步流程的每一步都返回这个 —— 编排代码只看 ``ok`` 和 ``code``,
+    不关心具体细节, 细节都在 ``detail`` 里 (进追溯记录)。
+
+    Attributes:
+        ok:      这步成功了吗
+        code:    机器可读的原因 ("ok" / "not_found" / "disabled" / ...)
+        message: 能直接念给用户听的话
+        detail:  进追溯记录的结构化细节
+    """
+
+    __slots__ = ("ok", "code", "message", "detail", "name")
+
+    def __init__(
+        self,
+        ok: bool,
+        code: str = "",
+        message: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+        name: str = "",
+    ) -> None:
+        self.ok = ok
+        self.code = code
+        self.message = message
+        self.detail = detail or {}
+        #: 这一步的名字 (ready / detect / above / grasp / safe)
+        self.name = name
+
+    @classmethod
+    def success(cls, message: str = "", name: str = "", **detail: Any) -> "StepResult":
+        return cls(True, "ok", message, detail, name)
+
+    @classmethod
+    def failure(
+        cls, code: str, message: str, name: str = "", **detail: Any
+    ) -> "StepResult":
+        return cls(False, code, message, detail, name)
+
+    def to_trace(self) -> Dict[str, Any]:
+        """转成追溯记录里的一行。"""
+        out = {"ok": self.ok, "code": self.code}
+        if self.name:
+            out["name"] = self.name
+        out.update(self.detail)
+        if self.message:
+            out["message"] = self.message
+        return out
+
+
 class VisionGraspSkill(Skill):
     """物体抓取 Skill。"""
 
@@ -37,6 +121,16 @@ class VisionGraspSkill(Skill):
         self.vision_client = vision_client
         self.arm_client = arm_client
         self.trace_path = Path(trace_path) if trace_path else GRASP_TRACE_PATH
+        #: 这次用哪条臂 —— ``_step_detect`` 要靠它挑臂基座
+        self._side = "right"
+        #: 抓取流程配置 (5 步), 由 ``_flow_config()`` 拉取后填
+        #:
+        #: **必须是 None 而不是 _FlowConfig()** —— ``_flow_config()`` 用
+        #: 「self._flow is not None」判断「已经拉过了」, 如果这里预填了
+        #: 默认值, 那个判断永远成立, ``GET /v1/flow`` 就**永远不会被调用**
+        #: —— configs/arm.yaml 里的 above_distance / grasp_offset /
+        #: ready_action 全部被静默忽略, 机械臂一直用代码里写死的默认值。
+        self._flow: Optional[_FlowConfig] = None
 
     @staticmethod
     def spec() -> SkillSpec:
@@ -44,12 +138,12 @@ class VisionGraspSkill(Skill):
         return SkillSpec(
             id="vision.grasp",
             name="物体抓取",
-            description="识别指定物体, 选离机器人最近的一个, 经安全门阀后控制机械臂移动到它上方的预抓取点。",
+            description="按 5 步抓取: 回准备点 -> 拍照识别 -> 移到上方点 -> 移到抓取点并闭合夹爪 -> 回安全点。",
             category="vision",
             tags=["manipulation", "planning"],
             kind="action",
             speak=True,
-            timeout_ms=45000,
+            timeout_ms=90000,
             source="builtin",
             # Phase 1 新增：动态路由信息
             branch="tool",
@@ -62,24 +156,34 @@ class VisionGraspSkill(Skill):
             ],
             # Phase 1 新增：完整 Skill 定义
             definition={
-                "boundary": "识别并移动到预抓取点，不闭合夹爪；移动必经 arm_service 的安全门阀；依赖手眼标定精度",
+                "boundary": "5 步抓取流程 (准备点→拍照→上方点→抓取点→安全点)；移动必经 arm_service 的安全门阀；依赖手眼标定精度",
                 "detector_class": "VisionGraspDetector",
                 "post_processors": ["pose_formatter", "approach_calculator"],
                 "documentation": """
-# vision.grasp - 物体抓取规划
+# vision.grasp - 物体抓取 (5 步流程)
+
+## 流程
+```
+1. 回准备点      播动作库的「准备点」, 保证拍照视角一致
+2. 拍照识别      视觉服务 fresh=True (强制重新拍, 不走缓存)
+3. 移到上方点    目标正上方 above_distance 米
+4. 移到抓取点    目标 + 配置的偏移, 然后闭合夹爪
+5. 回安全点      播动作库的「安全点」
+```
+
+各步的动作名/距离/时长都在 `configs/arm.yaml` 的 `arm.grasp.flow` 里。
 
 ## 职责边界
 - ✓ 识别指定物体 (世界系)
 - ✓ 多个同类物体时取离机器人最近的一个
-- ✓ 套上示教的固定抓取姿态, 经安全门阀与臂展检查后移动到预抓取点
-- ✗ 不闭合夹爪
+- ✓ 5 步顺序执行, 每一步失败都有安全收尾
 - ✗ 不处理碰撞检测
 
 ## 输入参数
 - target (必需): 要抓取的物体名，如「杯子」
 - arm (可选): left / right，默认 right
-- approach_distance (可选): 预抓取点在物体上方的距离，默认 0.1m
-- duration (可选): 运动时长，默认取 configs/arm.yaml 的 grasp.duration (3 秒)
+- approach_distance (可选): 上方点在物体上方的距离，默认取配置的 0.1m
+- duration (可选): 运动时长，不给则用配置默认值
 
 ## 动不动由谁决定
 **由机械臂服务决定, 不是这个 skill**。configs/arm.yaml 的 `arm.enabled`
@@ -92,13 +196,21 @@ class VisionGraspSkill(Skill):
     "found": true,
     "target_pose": {"x": 0.5, "y": 0.2, "z": 0.8, "qx": 0, "qy": 0, "qz": 0, "qw": 1},
     "approach_pose": {"x": 0.5, "y": 0.2, "z": 0.9},
-    "confidence": 0.95
+    "grasp_pose": {"x": 0.5, "y": 0.2, "z": 0.8},
+    "confidence": 0.95,
+    "steps": [{"ok": true, "code": "ok"}, {"ok": true, "code": "ok"}]
 }
 ```
 
+## 失败收尾
+- 第 1 步失败 -> 直接返回, 不拍照
+- 第 2 步失败 (没找到) -> 返回, 不回准备点 (已经在准备点了)
+- 第 3/4 步失败 -> **先回安全点**再报失败, 否则手停在半空
+- 第 5 步失败 -> 抓取已成功, 如实说「抓到了但回安全点失败」
+
 ## 使用示例
-- "抓杯子" → 计算杯子的抓取位姿
-- "帮我拿水瓶" → 计算瓶子的位置和抓取方向
+- "抓杯子" → 走完 5 步
+- "帮我拿水瓶" → 走完 5 步
 """
             },
             # 注: requires_state 用于多轮编排，此处不强制要求（可选）
@@ -132,19 +244,27 @@ class VisionGraspSkill(Skill):
                 "properties": {
                     "found": {"type": "boolean", "description": "是否找到目标"},
                     "target_pose": {"type": "object", "description": "目标位置"},
-                    "approach_pose": {"type": "object", "description": "预抓取位置"},
+                    "approach_pose": {"type": "object", "description": "上方点位置"},
+                    "grasp_pose": {"type": "object", "description": "抓取点位置"},
                     "confidence": {"type": "number", "description": "识别置信度"},
+                    "steps": {
+                        "type": "array",
+                        "description": "5 步流程每一步的结果",
+                    },
                 },
             },
         )
 
     async def execute(self, args: Dict[str, Any]) -> SkillResult:
-        """识别 -> 取离机器人最近的 -> 请求移动到预抓取点 -> 落盘追溯。
+        """按 5 步跑完一次抓取: 回准备点 -> 拍照 -> 上方点 -> 抓取点 -> 安全点。
 
         **动不动由机械臂服务决定** —— 这个 skill 只管把位置算对,
-        然后调 ``move_to``; 机械臂服务那边有个「控制指令总闸」
+        然后调 ``move_to``/``play``; 机械臂服务那边有个「控制指令总闸」
         (``configs/arm.yaml`` 的 ``arm.enabled``), 关着就只算位置、
         不下发任何控制指令。
+
+        **总闸关着的时候 5 步全走完** (只是不动) —— 用户要看的正是
+        每一步算出来的位置, 中途就停掉等于什么都看不到。
         """
         started = time.time()
 
@@ -171,13 +291,26 @@ class VisionGraspSkill(Skill):
                 elapsed_ms=(time.time() - started) * 1000,
             )
 
+        #: 这次用哪条臂 —— 第 2 步挑基座要用
+        self._side = side
+        flow = await self._flow_config()
+        self._flow = flow
+
         # 追溯记录: 每一步都往里填, 无论成功失败最后都落盘
         trace: Dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "target": target,
             "arm": side,
             "approach_distance": approach_distance,
+            "steps": [],
         }
+        #: 每一步的结果, 按顺序
+        steps: List[StepResult] = []
+
+        def record(step: StepResult) -> StepResult:
+            steps.append(step)
+            trace["steps"].append(step.to_trace())
+            return step
 
         try:
             if not self.vision_client:
@@ -185,134 +318,87 @@ class VisionGraspSkill(Skill):
             if not self.arm_client:
                 return self._fail("机械臂服务客户端未配置", trace, started)
 
-            # ---- 1. 视觉: 一律请求世界系 ----
+            # ================= 第 1 步: 回准备点 =================
             #
-            # 离机器人多远、机械臂要去哪, 都在同一个世界系里算。
-            result = await self.vision_client.find(target, frame="world")
-            logger.info("[抓取] 视觉查询 target=%r frame=world 返回: %s", target, result)
-            objects = result.get("objects") or []
-            if not result.get("found") or not objects:
-                trace["outcome"] = "not_found"
-                return self._fail(
-                    f"没有找到{target}，请调整物体或相机位置。", trace, started
-                )
+            # 拍照前把手臂摆到固定姿态 —— 这样每次拍的视角一致, 标定
+            # 才对得上。动作名留空 = 跳过这一步。
+            ready = await self._step_ready(flow)
+            record(ready)
+            if not ready.ok and ready.code != "disabled":
+                trace["outcome"] = f"failed:{ready.code}"
+                return self._fail(ready.message, trace, started)
 
-            # ---- 2. 机器人位置: 臂基座在世界系下的位置 ----
-            kin = await self.arm_client.kinematics(refresh=True)
-            arm_name, arm_data = self._pick_arm(kin.get("arms") or {}, side)
-            base = (arm_data or {}).get("base_frame")
-            if not base:
-                return self._fail(
-                    "拿不到机械臂基座位置，无法判断哪个物体最近。", trace, started
-                )
-            base_pos = (float(base["x"]), float(base["y"]), float(base["z"]))
-            trace["robot_arm"] = arm_name
-            trace["robot_base_world"] = base_pos
+            # ================= 第 2 步: 拍照识别 =================
+            detect = await self._step_detect(target)
+            record(detect)
+            if not detect.ok:
+                # outcome 用 detect 的 code 本身 (not_found / no_valid_candidate),
+                # 这样事后看追溯一眼就知道是「没找到」还是「测不准」
+                trace["outcome"] = detect.code
+                # 没找到 -> 就在准备点待着, 不用回安全点 (准备点本身就是安全的)
+                return self._fail(detect.message, trace, started)
 
-            # ---- 3. 候选: 深度可信 + 确实是世界系, 按到基座的距离排序 ----
-            candidates: List[Dict[str, Any]] = []
-            skipped = 0
-            for obj in objects:
-                pose = obj.get("pose") or {}
-                if not pose.get("depth_valid", True) or pose.get("frame") != "world":
-                    skipped += 1
-                    continue
-                pos = (float(pose["x"]), float(pose["y"]), float(pose["z"]))
-                candidates.append(
-                    {
-                        "position": pos,
-                        "distance_to_base": self._dist(pos, base_pos),
-                        "confidence": float(obj.get("confidence", 0)),
-                        "label": obj.get("label_zh") or obj.get("label") or target,
-                    }
-                )
-            candidates.sort(key=lambda c: c["distance_to_base"])
-            trace["candidates"] = candidates
-            trace["skipped_invalid"] = skipped
-            for i, c in enumerate(candidates):
-                logger.info(
-                    "抓取候选 #%d %s pos=(%.4f, %.4f, %.4f) 距基座 %.3fm conf=%.2f",
-                    i, c["label"], *c["position"], c["distance_to_base"], c["confidence"],
-                )
-
-            if not candidates:
-                trace["outcome"] = "no_valid_candidate"
-                reason = (
-                    f"看到了{target}，但测不准距离，不能抓。"
-                    if skipped else
-                    f"{target}的位置没能换算到世界坐标系，请检查手眼标定。"
-                )
-                return self._fail(reason, trace, started)
-
+            objects = detect.detail.get("objects") or []
+            candidates = detect.detail.get("candidates") or []
             chosen = candidates[0]
             target_pos = chosen["position"]
-            approach_pos = self._compute_approach_point(
-                target_pos, approach_distance, "world"
+            arm_name = detect.detail.get("arm_name", "")
+
+            # 候选也进追溯 —— 出问题时得知道「当时看到了几个、为什么选这个」
+            trace["candidates"] = candidates
+            trace["skipped_invalid"] = detect.detail.get("skipped", 0)
+
+            # 上方点: 目标正上方 above_distance 米
+            above_pos = self._compute_approach_point(
+                target_pos, flow.above_distance, "world"
             )
-            trace["chosen_index"] = 0
+            # 抓取点: 目标 + 配置的偏移
+            grasp_pos = (
+                target_pos[0] + flow.grasp_offset_x,
+                target_pos[1] + flow.grasp_offset_y,
+                target_pos[2] + flow.grasp_offset_z,
+            )
+            trace["robot_arm"] = arm_name
             trace["target_pose"] = target_pos
-            trace["approach_pose"] = approach_pos
-            logger.info(
-                "抓取规划 target=%s arm=%s 共%d个候选, 选最近 距基座 %.3fm "
-                "target_pose=(%.4f, %.4f, %.4f) approach_pose=(%.4f, %.4f, %.4f)",
-                target, arm_name, len(candidates), chosen["distance_to_base"],
-                *target_pos, *approach_pos,
-            )
+            trace["above_pose"] = above_pos
+            trace["grasp_pose"] = grasp_pos
 
             state_updates = {
                 "grasp_target": {
                     "name": target,
                     "frame": "world",
                     "target_pose": target_pos,
-                    "approach_pose": approach_pos,
+                    "approach_pose": above_pos,
+                    "grasp_pose": grasp_pos,
                     "confidence": chosen["confidence"],
                     "timestamp_ms": int(time.time() * 1000),
                 }
             }
-            payload = {
+            payload: Dict[str, Any] = {
                 "target": target,
                 "target_pose": target_pos,
-                "approach_pose": approach_pos,
+                "approach_pose": above_pos,
+                "grasp_pose": grasp_pos,
                 "frame": "world",
                 "confidence": chosen["confidence"],
                 "candidates": len(candidates),
+                "steps": [s.to_trace() for s in steps],
             }
 
-            # ---- 4. 移动: 先到物体上方的预抓取点, 不直接去物体表面 ----
-            #
-            # **动不动由机械臂服务决定** (那边的控制指令总闸)。这里
-            # 无条件请求移动 —— 如果总闸关着, 服务会只算位置、不下发
-            # 指令, 返回 code="disabled"。
-            move = await self.arm_client.move_to(
-                side, approach_pos[0], approach_pos[1], approach_pos[2],
-                duration=duration,
+            # ================= 第 3 步: 移到上方点 =================
+            # ``duration`` 显式给了就用它 (用户可能想要更慢/更快)
+            above_dur = duration if duration is not None else flow.above_duration
+            above = await self._step_move(
+                side, above_pos, above_dur, "上方点", name="above"
             )
-            trace["move"] = move
-            trace["outcome"] = "moved" if move.get("ok") else f"rejected:{move.get('code')}"
-
-            payload["move"] = {
-                k: move.get(k) for k in ("ok", "code", "stage", "message", "error_m")
-            }
-
-            # ---- 5. 总闸关着: 只算不动, 把算出来的位置报给用户 ----
-            if move.get("code") == "disabled":
-                trace["outcome"] = "planned_only"
-                reply = (
-                    f"找到{target}，离机械臂 {chosen['distance_to_base']:.2f} 米。"
-                    f"目标点 {target_pos[0]:.3f}, {target_pos[1]:.3f}, "
-                    f"{target_pos[2]:.3f}。"
-                    f"预抓取点 {approach_pos[0]:.3f}, {approach_pos[1]:.3f}, "
-                    f"{approach_pos[2]:.3f}。机械臂没有动。"
-                )
-                self._write_trace(trace, started)
-                return SkillResult(
-                    ok=True, output=reply, reply=reply, speak=True,
-                    state_updates=state_updates, payload=payload,
-                    elapsed_ms=(time.time() - started) * 1000,
-                )
-
-            if not move.get("ok"):
-                msg = str(move.get("message") or "机械臂没有移动")
+            record(above)
+            if not above.ok and above.code != "disabled":
+                # 手停在半空 -> **必须先回安全点**, 再报失败
+                trace["outcome"] = f"failed:{above.code}"
+                safe = await self._step_safe(flow)
+                record(safe)
+                payload["steps"] = [s.to_trace() for s in steps]
+                msg = f"{above.message}。{self._describe_pose(target_pos, '目标点')}"
                 self._write_trace(trace, started)
                 return SkillResult(
                     ok=False, output=msg, error=msg, reply=msg, speak=True,
@@ -320,7 +406,95 @@ class VisionGraspSkill(Skill):
                     elapsed_ms=(time.time() - started) * 1000,
                 )
 
-            reply = f"已移动到{target}上方，离目标{move.get('error_m', 0) * 100:.1f}厘米。"
+            # ================= 第 4 步: 移到抓取点 + 闭夹爪 =================
+            grasp = await self._step_move(
+                side, grasp_pos, flow.grasp_duration, "抓取点", name="grasp"
+            )
+            if grasp.ok:
+                # 夹爪闭合 —— **第 4 步的后半**, 记在同一个 step 里
+                # (5 步流程里夹爪不是单独一步)
+                close = await self._step_close(flow)
+                grasp.detail["close"] = close.to_trace()
+                grasp.detail["close_ok"] = close.ok
+                grasp.detail["close_action"] = close.detail.get("action", "")
+                close = close  # 播报要用
+            else:
+                close = StepResult.failure(grasp.code, grasp.message, name="close")
+            record(grasp)
+
+            if not grasp.ok and grasp.code != "disabled":
+                trace["outcome"] = f"failed:{grasp.code}"
+                safe = await self._step_safe(flow)
+                record(safe)
+                payload["steps"] = [s.to_trace() for s in steps]
+                msg = f"{grasp.message}。{self._describe_pose(target_pos, '目标点')}"
+                self._write_trace(trace, started)
+                return SkillResult(
+                    ok=False, output=msg, error=msg, reply=msg, speak=True,
+                    state_updates=state_updates, payload=payload,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            # ================= 第 5 步: 回安全点 =================
+            safe = await self._step_safe(flow)
+            record(safe)
+            payload["steps"] = [s.to_trace() for s in steps]
+
+            # ---- 组播报 ----
+            only_planned = above.code == "disabled" or grasp.code == "disabled"
+            parts: List[str] = []
+            if ready.detail.get("action"):
+                parts.append(
+                    f"准备点已就位" if only_planned else "已回准备点"
+                )
+            parts.append(
+                f"识别到{target}，置信度 {chosen['confidence'] * 100:.0f}%"
+            )
+            # 目标点也播 —— 用户要看的正是「它算出来在哪」
+            parts.append(self._describe_pose(target_pos, "目标点"))
+            if above.detail.get("pose"):
+                parts.append(
+                    f"{self._describe_pose(above_pos, '上方点')}"
+                    + ("，已到达" if not only_planned else "")
+                )
+            if grasp.detail.get("pose"):
+                parts.append(
+                    f"{self._describe_pose(grasp_pos, '抓取点')}"
+                    + ("，已到达" if not only_planned else "")
+                )
+            if grasp.detail.get("close_action"):
+                parts.append(
+                    "夹爪已闭合" if not only_planned else "夹爪将闭合"
+                )
+            if safe.detail.get("action"):
+                parts.append("已回安全点" if not only_planned else "将回安全点")
+
+            if only_planned:
+                parts.append("机械臂没有动")
+                trace["outcome"] = "planned_only"
+                reply = "。".join(parts) + "。"
+                self._write_trace(trace, started)
+                return SkillResult(
+                    ok=True, output=reply, reply=reply, speak=True,
+                    state_updates=state_updates, payload=payload,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            # 第 5 步失败: 抓取已经成功了, 但没回到安全点 —— 如实说清楚
+            if not safe.ok:
+                trace["outcome"] = f"grasp_ok_safe_failed:{safe.code}"
+                reply = (
+                    "。".join(parts[:-1]) + f"。{safe.message}"
+                )
+                self._write_trace(trace, started)
+                return SkillResult(
+                    ok=False, output=reply, error=reply, reply=reply, speak=True,
+                    state_updates=state_updates, payload=payload,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            trace["outcome"] = "grasp_ok"
+            reply = "。".join(parts) + "。"
             self._write_trace(trace, started)
             return SkillResult(
                 ok=True, output=reply, reply=reply, speak=True,
@@ -334,7 +508,223 @@ class VisionGraspSkill(Skill):
             trace["exception"] = repr(e)
             return self._fail(self._get_error_reason(str(e)), trace, started)
 
+    # ------------------------------------------------------------ 5 个步骤
+
+    async def _flow_config(self) -> Any:
+        """拿抓取流程配置。
+
+        优先从机械臂服务拿 (``GET /v1/flow``) —— 那边才有权威的配置
+        (``configs/arm.yaml`` 的 ``arm.grasp.flow``)。拿不到就用本地
+        兜底, 保证流程还能跑。
+
+        **缓存一次**: 拉到的配置存进 ``self._flow``, 后续步骤直接复用。
+        """
+        if self._flow is not None:
+            return self._flow
+        try:
+            data = await self.arm_client.flow_config()
+            if data:
+                self._flow = _FlowConfig.from_dict(data)
+                logger.info(
+                    "[抓取] 流程配置来自 arm_service: ready=%s safe=%s "
+                    "above=%s offset=(%s, %s, %s)",
+                    self._flow.ready_action, self._flow.safe_action,
+                    self._flow.above_distance, self._flow.grasp_offset_x,
+                    self._flow.grasp_offset_y, self._flow.grasp_offset_z,
+                )
+                return self._flow
+        except Exception as exc:
+            logger.warning("[抓取] 拿流程配置失败, 用默认值: %s", exc)
+        self._flow = _FlowConfig()
+        return self._flow
+
+    async def _step_ready(self, flow: Any) -> StepResult:
+        """第 1 步: 回准备点。"""
+        action = flow.ready_action
+        if not action:
+            return StepResult.success("跳过准备点", name="ready", action="")
+        return await self._play_step(action, "回准备点", name="ready")
+
+    async def _play_step(self, action: str, what: str, name: str = "") -> StepResult:
+        """播一个动作并等它播完。
+
+        **总闸关着时不算失败** —— 服务会拒绝播放 (HTTP 409 「机械臂控制
+        已关闭」), 这跟「动作播失败」是两回事: 前者是「只算不动」, 后者
+        是「真出问题了」。总闸关着时流程要**继续往下走**, 让用户看到
+        完整的位置序列。
+        """
+        try:
+            result = await self.arm_client.play_and_wait(action)
+        except Exception as exc:
+            if self._is_disabled_error(exc):
+                return StepResult(
+                    True, "disabled", f"{what}（只算不动）",
+                    {"code_disabled": True, "action": action}, name,
+                )
+            return StepResult.failure(
+                "play_failed", f"{what}失败: {exc}", name, action=action
+            )
+        if not result.get("finished", True):
+            return StepResult.failure(
+                "play_failed",
+                str(result.get("error") or f"{what}失败"),
+                name, action=action,
+            )
+        return StepResult.success(f"已{what}", name, action=action)
+
+    @staticmethod
+    def _is_disabled_error(exc: Exception) -> bool:
+        """判断这个异常是不是「控制指令总闸关着」。
+
+        机械臂服务在总闸关着时抛 ``ControllerError("机械臂控制已关闭…")``,
+        agent 客户端把它包成 ``ArmError``, HTTP 层是 409。
+        """
+        text = str(exc)
+        return ("控制已关闭" in text) or ("没有动" in text and "关闭" in text)
+
+    async def _step_detect(self, target: str) -> StepResult:
+        """第 2 步: 拍照识别。
+
+        **fresh=True 是必须的** —— 视觉服务默认返回上一次检测的缓存,
+        物体被挪动了它也不知道。不加这个参数的话, 连续抓同一个物体
+        会拿到**一模一样的坐标和置信度** (连 conf 都一样, 那显然不是
+        两次真实推理的结果)。
+        """
+        result = await self.vision_client.find(
+            target, frame="world", fresh=True
+        )
+        logger.info("[抓取] 视觉查询 target=%r frame=world fresh=True 返回: %s",
+                    target, result)
+        objects = result.get("objects") or []
+        if not result.get("found") or not objects:
+            return StepResult.failure(
+                "not_found", f"没有找到{target}，请调整物体或相机位置。",
+                name="detect",
+            )
+
+        # ---- 机器人位置: 臂基座在世界系下的位置 ----
+        kin = await self.arm_client.kinematics(refresh=True)
+        arm_name, arm_data = self._pick_arm(kin.get("arms") or {}, self._side)
+        base = (arm_data or {}).get("base_frame")
+        if not base:
+            return StepResult.failure(
+                "no_base", "拿不到机械臂基座位置，无法判断哪个物体最近。",
+                name="detect",
+            )
+        base_pos = (float(base["x"]), float(base["y"]), float(base["z"]))
+
+        # ---- 候选: 深度可信 + 确实是世界系, 按到基座的距离排序 ----
+        candidates: List[Dict[str, Any]] = []
+        skipped = 0
+        for obj in objects:
+            pose = obj.get("pose") or {}
+            if not pose.get("depth_valid", True) or pose.get("frame") != "world":
+                skipped += 1
+                continue
+            pos = (float(pose["x"]), float(pose["y"]), float(pose["z"]))
+            candidates.append(
+                {
+                    "position": pos,
+                    "distance_to_base": self._dist(pos, base_pos),
+                    "confidence": float(obj.get("confidence", 0)),
+                    "label": obj.get("label_zh") or obj.get("label") or target,
+                }
+            )
+        candidates.sort(key=lambda c: c["distance_to_base"])
+
+        for i, c in enumerate(candidates):
+            logger.info(
+                "抓取候选 #%d %s pos=(%.4f, %.4f, %.4f) 距基座 %.3fm conf=%.2f",
+                i, c["label"], *c["position"], c["distance_to_base"], c["confidence"],
+            )
+
+        if not candidates:
+            reason = (
+                f"看到了{target}，但测不准距离，不能抓。"
+                if skipped else
+                f"{target}的位置没能换算到世界坐标系，请检查手眼标定。"
+            )
+            return StepResult.failure(
+                "no_valid_candidate", reason, name="detect"
+            )
+
+        return StepResult.success(
+            f"识别到{target}", name="detect",
+            objects=objects,
+            candidates=candidates,
+            arm_name=arm_name,
+            base_pos=base_pos,
+            skipped=skipped,
+        )
+
+    async def _step_move(
+        self,
+        side: str,
+        pos: Tuple[float, float, float],
+        duration: float,
+        label: str,
+        name: str = "",
+    ) -> StepResult:
+        """第 3/4 步: 移到某个点。
+
+        **动不动由机械臂服务决定** (那边的控制指令总闸)。这里无条件
+        请求移动 —— 如果总闸关着, 服务会只算位置、不下发指令, 返回
+        code="disabled"。
+        """
+        move = await self.arm_client.move_to(
+            side, pos[0], pos[1], pos[2], duration=duration,
+        )
+        if move.get("code") == "disabled":
+            # 总闸关着 —— **不是失败**, 是「算好了但没动」。
+            # code 保持 "disabled", 编排代码靠它区分「真失败」和「只算不动」。
+            return StepResult(
+                True, "disabled", f"{label}已计算",
+                {"code_disabled": True, "pose": list(pos), "move": move}, name,
+            )
+        if not move.get("ok"):
+            return StepResult.failure(
+                str(move.get("code") or "move_failed"),
+                str(move.get("message") or f"移到{label}失败"),
+                name, pose=list(pos), move=move,
+            )
+        return StepResult.success(
+            f"已到{label}", name, pose=list(pos), move=move
+        )
+
+    async def _step_close(self, flow: Any) -> StepResult:
+        """第 4 步的后半: 闭合夹爪。"""
+        action = flow.close_action
+        if not action:
+            return StepResult.success("跳过夹爪", name="close", action="")
+        return await self._play_step(action, "闭合夹爪", name="close")
+
+    async def _step_safe(self, flow: Any) -> StepResult:
+        """第 5 步: 回安全点。"""
+        action = flow.safe_action
+        if not action:
+            return StepResult.success("跳过安全点", name="safe", action="")
+        return await self._play_step(action, "回安全点", name="safe")
+
     # ------------------------------------------------------------ 辅助
+
+    @staticmethod
+    def _describe_pose(
+        pos: Tuple[float, float, float], label: str
+    ) -> str:
+        """把一个位姿念成一句人话。
+
+        播报用 —— 机械臂到底要去哪, 得让人听得出来。
+
+        坐标是世界系 (米)。念成「X 零点五八, Y 零点零三, Z 负零点三六」
+        这种比念数字好懂一点, 尤其 Z 常常是负的 (物体在基座下方)。
+
+        Args:
+            pos:   (x, y, z)
+            label: 这句话的开头, 如「目标点」
+        """
+        return (
+            f"{label} X {pos[0]:.2f}, Y {pos[1]:.2f}, Z {pos[2]:.2f}"
+        )
 
     def _fail(self, message: str, trace: Dict[str, Any], started: float) -> SkillResult:
         """失败收尾: 落盘追溯并返回要念出来的原因。"""

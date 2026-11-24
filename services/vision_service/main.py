@@ -14,7 +14,7 @@
     GET  /v1/status          最近一次检测摘要
     POST /v1/detect          触发一次检测 (结果会广播给 WS 订阅者)
     GET  /v1/objects         最近一次检测结果 (缓存)
-    GET  /v1/objects/{name}  按类别名查目标
+    GET  /v1/objects/{name}  按类别名查目标 (?fresh=true 强制重新拍)
     GET  /v1/summary         按类别聚合的摘要
     WS   /ws                 **被动**订阅检测结果 (发 {"action":"detect"} 触发)
 """
@@ -205,7 +205,8 @@ async def objects() -> Dict[str, Any]:
 
 
 @app.get("/v1/objects/{name}")
-async def find_object(name: str, frame: str = "camera") -> Dict[str, Any]:
+async def find_object(name: str, frame: str = "camera",
+                      fresh: bool = False) -> Dict[str, Any]:
     """按类别名查目标。
 
     `name` 可以是 YOLO 的英文类名 ("cup"), 也可以是中文 ("杯子")。
@@ -219,10 +220,12 @@ async def find_object(name: str, frame: str = "camera") -> Dict[str, Any]:
 
     变换不了时会退回相机系并如实标注 —— **不假装是基座坐标**。
 
+    `fresh=true` 时**强制重新拍一张**, 不走缓存。
+
     缓存里没有时会现场跑一次检测 —— 服务刚起时缓存是空的。
     """
     svc = _svc()
-    hits = await asyncio.to_thread(svc.find, name, frame)
+    hits = await asyncio.to_thread(svc.find, name, frame, fresh)
     return {
         "name": name,
         "found": bool(hits),

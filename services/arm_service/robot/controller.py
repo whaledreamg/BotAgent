@@ -62,6 +62,7 @@ class ArmController:
         lead_in_ms: int = 700,
         joint_limit: Optional[Dict[str, Any]] = None,
         idle_stop_ms: int = 1000,
+        hand_enabled: bool = False,
         on_phase: Optional[Callable[[str, str], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -75,7 +76,14 @@ class ArmController:
         self._on_phase = on_phase
         self._on_error = on_error
 
-        self._streamer = JointStreamer(port=command_port, frequency=frequency)
+        # hand_enabled 默认 false —— 控制器认不认报文里的手部字段还没在
+        # 真机上验证过 (tools/probe_hand.py)。没验证就发, 万一格式不对,
+        # 控制器会整包丢弃 (invalidDatagram) —— 那时连手臂都不动了。
+        self._streamer = JointStreamer(
+            port=command_port,
+            frequency=frequency,
+            hand_enabled=hand_enabled,
+        )
         self._streamer.set_idle_stop_ms(idle_stop_ms)
 
         self._lock = threading.RLock()
@@ -226,9 +234,15 @@ class ArmController:
         return True
 
     def request_actual_joints(self) -> None:
-        """主动拉一次状态, 补齐实测关节角。"""
+        """主动拉一次状态, 补齐实测关节角。
+
+        **走 meta 关联** —— 和 service 层用同一个机制, 否则应答里
+        没有 name 字段时分不清是哪条臂的 (见 connection.send_command)。
+        """
         for name in self.active_arms():
-            self._conn.get_robot_status(name)
+            self._conn.send_command(
+                "robot/status", {"name": name}, meta={"arm": name}
+            )
 
     # ------------------------------------------------------------ 使能
 
@@ -284,6 +298,20 @@ class ArmController:
             "jointLimit": dict(self._joint_limit),
         }
 
+    def joint_control_config(self) -> Dict[str, Any]:
+        """关节流入控的 config 段 (``cartesianIkPath: none``)。
+
+        **控制器全程不做末端逆解** —— 只接受关节包 (``controlSpace: 0``),
+        关节角由客户端 (本仓库 ``robot/kinematics.py``, pinocchio) 自己解。
+
+        与 ``cartesian_control_config`` 的区别:
+        - ``cartesianIkPath="none"`` —— 不接受末端包;
+        - **保留后滤波** (2Hz 低通): 关节目标是客户端插值出来的, 逐点下发
+          时会有台阶, 低通能让运动更平顺;
+        - 关节限幅打开 —— 它仍是本会话唯一的关节级保护。
+        """
+        return self._control_config()
+
     def cartesian_control_config(self, max_arm_angle_delta: float = 0.2) -> Dict[str, Any]:
         """末端空间入控的 config 段 (``cartesianIkPath: analytic``)。
 
@@ -316,6 +344,16 @@ class ArmController:
     @property
     def streamer_frequency(self) -> int:
         return self._streamer.frequency
+
+    @property
+    def joint_streamer(self) -> JointStreamer:
+        """本控制器的关节流发送器 (关节空间, ``controlSpace: 0``)。
+
+        **笛卡尔末端流** (``controlSpace: 1``) 用的是另一个发送器
+        (:class:`robot.cartesian.CartesianStreamer`), 两者不能混发 ——
+        空间切换会让「上一目标」基准失效 (API 说明 21.9)。
+        """
+        return self._streamer
 
     def enter_control(self) -> None:
         """入控: 起流 + 并行发 startControl。
@@ -373,8 +411,13 @@ class ArmController:
 
     # ------------------------------------------------------------ 帧
 
-    def push_frame(self, state: JointState) -> None:
-        """播放引擎送来的一帧目标关节角。"""
+    def push_frame(
+        self,
+        state: JointState,
+        left_hand: Optional[List[int]] = None,
+        right_hand: Optional[List[int]] = None,
+    ) -> None:
+        """播放引擎送来的一帧目标关节角 (以及可选的手部目标)。"""
         with self._lock:
             if not self._streaming:
                 return
@@ -400,10 +443,10 @@ class ArmController:
             # 正常播放: 更新目标即可, 发送线程按自己的频率发最新值
             if self._left_name:
                 self._left_latest = left
-                self._streamer.set_target(self._left_name, left)
+                self._streamer.set_target(self._left_name, left, left_hand)
             if self._right_name:
                 self._right_latest = right
-                self._streamer.set_target(self._right_name, right)
+                self._streamer.set_target(self._right_name, right, right_hand)
 
     def advance_lead_in(self) -> bool:
         """推进对齐过渡。返回 True 表示对齐已完成。

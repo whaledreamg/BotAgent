@@ -68,23 +68,49 @@ def load_matrix(path: str) -> Optional[np.ndarray]:
     - configs/vision.yaml 的 extrinsic.matrix
     - 直接给一个 4x4 的 JSON
     """
+    m, _ = load_matrix_and_offset(path)
+    return m
+
+
+def load_matrix_and_offset(
+    path: str,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """读外参矩阵 + 工具偏置 (如果文件里有)。
+
+    联合解算的输出里有 ``tool_board_matrix`` —— 那才是**真正用于解算**的
+    工具偏置。验证时必须用同一个偏置回代, 否则残差虚高好几倍。
+
+    返回 ``(matrix, tool_offset)``; 第二个可能是 None (表示没有偏置信息,
+    用 session 里记的)。
+    """
     p = Path(path) if path else config_path("handeye.json")
     if not p.exists():
         print(f"找不到 {p}", file=sys.stderr)
-        return None
+        return None, None
 
     try:
         with open(p, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except Exception as exc:
         print(f"读 {p} 失败: {exc}", file=sys.stderr)
-        return None
+        return None, None
 
-    if "matrix" in data:
-        return np.array(data["matrix"], dtype=np.float64)
+    if "matrix" not in data:
+        print(f"{p} 里没有 matrix 字段", file=sys.stderr)
+        return None, None
 
-    print(f"{p} 里没有 matrix 字段", file=sys.stderr)
-    return None
+    matrix = np.array(data["matrix"], dtype=np.float64)
+
+    offset: Optional[np.ndarray] = None
+    for key in ("tool_board_matrix", "tool_offset"):
+        raw = data.get(key)
+        if raw is not None:
+            arr = np.asarray(raw, dtype=np.float64)
+            if arr.shape == (4, 4):
+                offset = arr
+                break
+
+    return matrix, offset
 
 
 def chirality_check(matrix: np.ndarray) -> None:
@@ -142,13 +168,38 @@ def chirality_check(matrix: np.ndarray) -> None:
 
 
 def sample_consistency_check(
-    matrix: np.ndarray, samples: List[PoseSample]
+    matrix: np.ndarray,
+    samples: List[PoseSample],
+    tool_offset: Optional[np.ndarray] = None,
 ) -> None:
-    """用采样回代: 每个位姿算出的 T_world_cam 应该都等于标定结果。"""
+    """用采样回代: 每个位姿算出的 T_world_cam 应该都等于标定结果。
+
+    **工具偏置从哪来** (踩过的坑):
+
+    采样时 session 里记的 ``t_tool_board`` 可能只是**占位的单位阵** —— 那
+    是「还没解出偏置时」的默认值。而真正解算用的是解出来的偏置 (写在
+    ``configs/handeye.json`` 的 ``tool_board_matrix`` 里)。
+
+    如果验证时用 session 的单位阵去回代, 而标定时用的是真偏置, 残差会
+    虚高好几倍 (实测 134mm/10° 被报成 583mm/120°), 让人误判成
+    「数据完全不能用」。
+
+    所以这里**优先用外参文件里的 ``tool_board_matrix``**, session 的只
+    作为兜底。
+    """
     print("\n[采样一致性]")
     if len(samples) < 3:
         check("采样数足够", False, f"只有 {len(samples)} 个")
         return
+
+    # 优先用外参文件里的真偏置
+    if tool_offset is not None:
+        offset_src = "外参文件里的 tool_board_matrix"
+        for s in samples:
+            s.t_tool_board = tool_offset
+    else:
+        offset_src = "session 里记的 t_tool_board"
+    print(f"  (工具偏置用的是: {offset_src})")
 
     pos_errs: List[float] = []
     rot_errs: List[float] = []
@@ -283,7 +334,7 @@ def main() -> int:
     print("标定验证")
     print("=" * 62)
 
-    matrix = load_matrix(args.matrix)
+    matrix, tool_offset = load_matrix_and_offset(args.matrix)
     if matrix is None:
         print("\n没有外参可验 —— 先跑 tools/calib_handeye.py", file=sys.stderr)
         return 1
@@ -296,7 +347,7 @@ def main() -> int:
 
     if args.samples:
         samples = load_samples(args.samples)
-        sample_consistency_check(matrix, samples)
+        sample_consistency_check(matrix, samples, tool_offset)
 
     if args.live:
         live_check(matrix)

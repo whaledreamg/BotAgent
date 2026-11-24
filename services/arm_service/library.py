@@ -70,6 +70,7 @@ class ActionUnit:
                 interpolation=s.interpolation,
                 left_hand=list(s.left_hand),
                 right_hand=list(s.right_hand),
+                hand_sides=list(s.hand_sides),
             )
             for s in self.segments
         ]
@@ -134,6 +135,14 @@ def _parse_segment(raw: Dict) -> Segment:
     seg.right_hand = [
         max(0, min(1000, int(rh[d]))) if d < len(rh) else 0 for d in range(6)
     ]
+    # **只写了哪只手, 就只管哪只手** —— 没写的那只不能跟着动。
+    # 动作文件里只写 rightHand 时, 左手得保持原样, 而不是被拉到 0。
+    sides: List[str] = []
+    if lh:
+        sides.append("left")
+    if rh:
+        sides.append("right")
+    seg.hand_sides = sides
 
     return seg
 

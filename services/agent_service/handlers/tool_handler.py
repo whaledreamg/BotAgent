@@ -784,13 +784,13 @@ class ToolHandler(Handler):
         return "ok", reply + "。"
 
     async def _execute_grasp_object(self, args: Dict[str, Any]) -> Tuple[str, str]:
-        """抓取: 识别最近的目标 -> 请求移动到预抓取点。
+        """抓取: 跑完 5 步流程 (准备点->拍照->上方点->抓取点->安全点)。
 
         结果文案 (含失败原因) 直接念给用户。
 
         **动不动由机械臂服务决定** (``configs/arm.yaml`` 的
         ``arm.enabled`` 控制指令总闸) —— 这里无条件请求移动, 总闸关着
-        的话 arm_service 会只算位置、不下发指令。
+        的话 arm_service 会只算位置、不下发指令, 流程照走完。
         """
         from skill.builtin.vision_grasp import VisionGraspSkill
 
@@ -828,7 +828,11 @@ class ToolHandler(Handler):
         frame = str(args.get("frame", "camera") or "camera")
 
         try:
-            result = await self.vision_client.find(label, frame=frame)
+            # fresh=True —— 「XX 在哪」问的是**此刻**的位置, 不是上一次
+            # 有人看的时候的位置。走缓存会报出被挪动过的旧坐标。
+            result = await self.vision_client.find(
+                label, frame=frame, fresh=True
+            )
         except VisionError as exc:
             logger.error("[视觉] 查询失败: %s", exc)
             return "failed", "视觉服务暂时用不了，请稍后再试"

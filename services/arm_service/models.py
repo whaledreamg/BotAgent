@@ -30,6 +30,9 @@ class PlayRequest(BaseModel):
     loop: bool = Field(False, description="循环播放")
     #: 是否允许在没有实测关节角时自动补拉一次
     fetch_joints: bool = Field(True, description="缺实测关节角时自动补拉")
+    #: **等播完再返回**。抓取流程要按顺序走 (回准备点 -> 拍照 -> 移到
+    #: 上方点 -> ...), 下一步必须等上一步真的动完了才能开始。
+    wait: bool = Field(False, description="等播完再返回 (同步)")
 
     def action_list(self) -> List[str]:
         """归一化出要播放的动作列表。
@@ -56,6 +59,10 @@ class PlayResponse(BaseModel):
     actions: List[str] = Field(default_factory=list)
     phase: str = "entering"
     message: str = ""
+    #: **播完了吗** (只有 ``wait=true`` 时才有意义)
+    finished: bool = False
+    #: 没播完时的原因 (超时 / 播放失败)
+    error: str = ""
 
 
 class StopResponse(BaseModel):

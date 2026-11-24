@@ -190,10 +190,20 @@ def detect_charuco(
     obj_pts = np.asarray(obj_pts, dtype=np.float64)
     img_pts = np.asarray(img_pts, dtype=np.float32)
 
-    if obj_pts.ndim == 3 and obj_pts.shape[0] == 1:
-        obj_pts = obj_pts[0]
-    if img_pts.ndim == 3 and img_pts.shape[0] == 1:
-        img_pts = img_pts[0]
+    # ``matchImagePoints`` 的返回形状**随 OpenCV 版本变**:
+    #   老版本 (4.x 早期): (1, N, 3) / (1, N, 2)
+    #   新版本 (4.14+):     (N, 1, 3) / (N, 1, 2)
+    #
+    # 之前只判 ``shape[0] == 1``, 新版本下 shape[0] 是 N 不是 1 -> 摊平
+    # 没生效, 3 维形状一路漏到 JSON 序列化, 报
+    # "only 0-dimensional arrays can be converted to Python scalars"。
+    #
+    # 用 reshape 而不是 squeeze: 两种布局都能摊成 (N, 3) / (N, 2),
+    # 而且 squeeze 在 N=1 时会把 (1, 1, 3) 压成 (3,), 更糟。
+    if obj_pts.ndim == 3:
+        obj_pts = obj_pts.reshape(-1, 3)
+    if img_pts.ndim == 3:
+        img_pts = img_pts.reshape(-1, 2)
 
     return img_pts, obj_pts
 

@@ -631,6 +631,7 @@ class VisionService:
         self,
         label: str,
         frame: str = "camera",
+        fresh: bool = False,
     ) -> List[Dict[str, Any]]:
         """按类别名取最近一次检测到的目标。
 
@@ -642,6 +643,19 @@ class VisionService:
         **置信度阈值要放宽**: 用户明确点名了要找什么, 就该尽力去找 ——
         用默认阈值 (0.35) 会漏掉置信度 0.2~0.3 的目标 (比如半遮挡的
         瓶子、远处的杯子), 让服务回答「没有看到」, 明明目标就在画面里。
+
+        Args:
+            label:  要找的类名 (中英文都行)
+            frame:  想要的坐标系
+            fresh:  **强制重新拍一张**。
+
+                这个开关很重要 —— 抓取这类动作要求的是「**此刻**物体
+                在哪」, 而不是「上一次有人看的时候物体在哪」。物体被
+                挪动、或者机械臂的姿态变了, 缓存里的坐标就全废了。
+
+                之前没有这个开关, ``find()`` 命中缓存就直接返回, 于是
+                连续三次抓同一个瓶子拿到的坐标和置信度**完全一样**
+                (连 conf 都一样 —— 那不可能是两次真实推理的结果)。
         """
         want = (label or "").strip().lower()
         if not want:
@@ -654,6 +668,10 @@ class VisionService:
         names = [c.lower() for c in
                  class_names.candidates(label, self._model_classes())]
 
+        # ---- fresh: 跳过缓存, 直接重新拍 ----
+        if fresh:
+            return self._find_by_detect(names, frame, label)
+
         with self._lock:
             cached = list(self._last_objects)
 
@@ -662,12 +680,28 @@ class VisionService:
             return self._reframe(hits, frame)
 
         # 缓存里没有 -> 现场检测一次 (用更宽松的置信度阈值)
+        return self._find_by_detect(names, frame, label)
+
+    def _find_by_detect(
+        self,
+        names: List[str],
+        frame: str,
+        label: str = "",
+    ) -> List[Dict[str, Any]]:
+        """现场拍一张, 再按类名筛。
+
+        置信度阈值用宽松的那个 (见 ``_find_conf``) —— 用户点名了要找
+        什么, 就该尽力去找。
+        """
         try:
             result = self.detect(conf=self._find_conf(), frame=frame)
         except (CameraError, DetectorError) as exc:
-            self._record_error(f"查找 {label} 失败: {exc}")
+            self._record_error(f"查找 {label or '物体'} 失败: {exc}")
             return []
 
+        # ``detect()`` 返回的 pose 已经在 ``frame`` 里了, 但再走一遍
+        # ``_reframe`` 更保险 —— 它会看 pose 里标的 frame, 已经是目标系
+        # 就原样返回, 不会重复变换。
         return self._reframe(self._match_label(result["objects"], names), frame)
 
     def _model_classes(self) -> List[str]:

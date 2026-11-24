@@ -398,6 +398,14 @@ def capture_samples(
             sample.t_tool_board = tool_offset
             samples.append(sample)
             images.append(getattr(sample, "image", None))
+
+            # ---- **实时体检**: 每采一帧就查一次装夹/坐标/尺度 ----
+            #
+            # 这些判据**不需要外参**, 所以采集现场就能用。
+            # 目的是: 摆位姿的过程中就把问题暴露出来, 而不是采完 20 个
+            # 姿态才发现数据废了 (半小时白费)。
+            _print_live_diagnostic(samples)
+
     finally:
         cam.close()
 
@@ -406,6 +414,37 @@ def capture_samples(
         return [], [], rejected
 
     return samples, images, rejected
+
+
+def _print_live_diagnostic(samples: List[PoseSample]) -> None:
+    """采集中途的实时体检 —— 有问题立刻提示。
+
+    检查三件事 (都不需要外参):
+
+    1. **旋转激励度** —— 绕各轴转得够不够。纯平移的采集对旋转没约束,
+       外参会「解得出来但是错的」。
+    2. **相对转动** —— 板相对工具有没有在滑动/摆动。
+    3. **位移尺度比** —— 板位移/工具位移, 应该等于 1。
+    """
+    if len(samples) < 3:
+        return
+
+    from calibration.diagnostics import report
+
+    tool_poses = [s.t_world_tool for s in samples]
+    board_poses = [s.t_cam_board for s in samples]
+    problems = report(tool_poses, board_poses)
+    if not problems:
+        return
+
+    # 只在问题「变严重」时提示, 免得刷屏
+    bar = "-" * 62
+    print(f"\n{bar}", file=sys.stderr)
+    print("  **采集体检发现问题** (摆位姿的过程中就改, 别等采完)", file=sys.stderr)
+    print(f"{bar}", file=sys.stderr)
+    for p in problems:
+        print(f"  ! {p}", file=sys.stderr)
+    print(f"{bar}\n", file=sys.stderr)
 
 
 def _check_pose_liveness(client: ArmKinematicsClient, arm: str) -> Optional[str]:

@@ -111,6 +111,21 @@ class SessionData:
                 return None
             return [[float(v) for v in row] for row in np.asarray(x)]
 
+        def mpts(
+            x: Optional[np.ndarray], cols: int
+        ) -> Optional[List[List[float]]]:
+            """点集 -> [[x, y, ...], ...]。
+
+            **必须先摊成 2 维** —— ``PoseSample.obj_points`` 的形状
+            取决于 OpenCV 版本 ((N,3) 或 (N,1,3))。不摊平的话
+            ``float(v)`` 会拿到一个数组而不是标量, 直接抛
+            "only 0-dimensional arrays can be converted to Python scalars"。
+            """
+            if x is None:
+                return None
+            arr = np.asarray(x, dtype=np.float64).reshape(-1, cols)
+            return [[float(v) for v in row] for row in arr]
+
         return {
             "version": SESSION_VERSION,
             "created_at": self.created_at,
@@ -132,16 +147,8 @@ class SessionData:
                     "t_world_tool": m4(s.t_world_tool),
                     "t_tool_board": m4(s.t_tool_board),
                     "t_cam_board": m4(s.t_cam_board),
-                    "obj_points": (
-                        None
-                        if s.obj_points is None
-                        else [[float(v) for v in row] for row in s.obj_points]
-                    ),
-                    "img_points": (
-                        None
-                        if s.img_points is None
-                        else [[float(v) for v in row] for row in s.img_points]
-                    ),
+                    "obj_points": mpts(s.obj_points, 3),
+                    "img_points": mpts(s.img_points, 2),
                     "corner_count": s.corner_count,
                     "board_distance_m": round(float(s.board_distance_m), 6),
                     "label": s.label,

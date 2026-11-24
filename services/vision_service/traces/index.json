@@ -1,27 +1,17 @@
 {
-  "created_at": "2026-11-17T11:03:40.358883",
+  "created_at": "2026-11-24T18:40:17.186602",
   "labels": {
-    "chair": {
+    "bottle": {
+      "count": 3,
+      "last_record_id": "1795516941523_0005",
+      "last_confidence": 0.3637676239013672
+    },
+    "airplane": {
       "count": 2,
-      "last_record_id": "1794884644461_0003",
-      "last_confidence": 0.4121573865413666
-    },
-    "person": {
-      "count": 1,
-      "last_record_id": "1794884644457_0002",
-      "last_confidence": 0.5315330624580383
-    },
-    "tv": {
-      "count": 1,
-      "last_record_id": "1794884644465_0004",
-      "last_confidence": 0.22093512117862701
-    },
-    "bed": {
-      "count": 1,
-      "last_record_id": "1794884659766_0005",
-      "last_confidence": 0.5941677689552307
+      "last_record_id": "1795516881079_0003",
+      "last_confidence": 0.22532305121421814
     }
   },
   "total_records": 5,
-  "last_timestamp": "2026-11-17T11:04:19.770174"
+  "last_timestamp": "2026-11-24T18:42:21.527973"
 }

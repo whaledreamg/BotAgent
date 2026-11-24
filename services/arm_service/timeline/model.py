@@ -63,6 +63,12 @@ class Segment:
     #: 仅 HAND 片段有意义: 灵巧手 6 自由度目标 (0~1000)
     left_hand: List[int] = field(default_factory=lambda: [0] * 6)
     right_hand: List[int] = field(default_factory=lambda: [0] * 6)
+    #: 这个片段**管的是哪只手**。
+    #:
+    #: HAND 片段要区分「只控制右手」和「两只手都控制」—— 动作文件里
+    #: 只写了 ``rightHand`` 时, 左手不能跟着动。
+    #: 空 = 两只手都不管。
+    hand_sides: List[str] = field(default_factory=list)
 
     @property
     def end_time(self) -> float:
@@ -71,6 +77,17 @@ class Segment:
     @property
     def is_arm(self) -> bool:
         return self.type == SegmentType.ARM
+
+    def hand_for(self, side: str) -> Optional[List[int]]:
+        """取这条片段给某只手的目标值。
+
+        Returns:
+            6 个 0~1000 的值; 这条片段不管这只手时返回 **None**
+            (跟「目标全是 0」区分开 —— 那是要把手张开到 0 位)。
+        """
+        if side not in self.hand_sides:
+            return None
+        return list(self.right_hand if side == "right" else self.left_hand)
 
 
 class TimelineModel:

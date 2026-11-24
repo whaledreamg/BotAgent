@@ -20,6 +20,7 @@ GUI 程序里剥离出来, 做成与 TTS / ASR / Agent 并列的独立服务。
 | GET  | `/v1/status` | 当前播放状态 (阶段 / 进度 / 错误 / 最近一次门阀结果 / 队列) |
 | GET  | `/v1/safety` | 跑一次安全门阀检查 (不执行动作) |
 | GET  | `/v1/kinematics` | 运动学快照 (TCP 世界系位姿 / 基座位姿 / 关节角), 手眼标定用 |
+| GET  | `/v1/flow` | 抓取流程 (5 步) 的配置 —— agent 的 `vision.grasp` 用 |
 
 ```bash
 # 看动作库
@@ -50,8 +51,20 @@ curl -s http://127.0.0.1:8802/v1/status
 | `actions` | string[] | — | 动作序列, 按顺序依次播放 |
 | `speed` | float | 1.0 | 倍速, 0.1 ~ 3.0 |
 | `loop` | bool | false | 循环播放 |
+| `wait` | bool | false | **等播完再返回** (同步) |
 
 `action` 与 `actions` **二选一**, 都给时以 `actions` 为准。两个都不给返回 HTTP 400。
+
+**`wait=true`** —— 抓取流程要按顺序走 (回准备点 -> 拍照 -> 移到上方点 -> ...),
+下一步必须等上一步真的动完了才能开始。开了这个参数服务端会阻塞到播完,
+应答里多两个字段: `finished` (播完了吗) 和 `error` (没播完的原因)。
+
+```bash
+# 等播完再返回
+curl -s -X POST http://127.0.0.1:8802/v1/play \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"准备点", "wait":true}'
+```
 
 ### 播放队列
 
@@ -143,6 +156,106 @@ curl -s "http://127.0.0.1:8802/v1/kinematics?refresh=true" | python -m json.tool
 
 视觉服务配置 `target_frame: world` + `dynamic: true` 时, 每次检测前都会
 拉一次这个接口。
+
+## 笛卡尔移动: 本地逆解 + 关节流
+
+`POST /v1/move_to` 把 TCP 移到世界系目标点。**逆解在本地做, 不调用控制器的
+逆解接口**。
+
+### 为什么不用控制器的逆解
+
+控制器的末端逆解 (`cartesianIkPath: analytic`) 有自己的参考坐标系约定
+(API 说明 21.9):
+
+| 机型模板 | 入控位姿在哪个系 | 末端是什么 |
+|----------|------------------|------------|
+| `HM5-54-*` / `DA5-54-*` | **躯干系** | 该机型数值模型的第 7 关节坐标系 |
+| `NDA-06-*` | **该臂基座系** | 法兰 |
+
+而 `robot/status.cartesian` 是**基座系 + 工具偏置**。前两者**不是同一个系**,
+两套位姿不可互相代入。
+
+一旦搞混, ``flange = target_base · tool⁻¹`` 算出来的「工具偏置」是垃圾 ——
+本项目实测过 **1.01 米 / 120°**, 目标位姿整个翻转, 逆解必然失败。
+
+### 本地方案
+
+```
+目标位姿 (世界系)
+  → 减去控制器实测的 baseFrame, 换到该臂基座系
+  → pinocchio (URDF) DLS 逆解 → 关节角
+  → 关节空间 S 曲线插值
+  → UDP controlSpace=0 关节流下发
+```
+
+入控参数是 ``cartesianIkPath: "none"`` —— 控制器**全程不做末端逆解**,
+只吃关节角。
+
+| 组件 | 位置 |
+|------|------|
+| 运动学 (FK/IK) | `services/arm_service/robot/kinematics.py` |
+| 关节流移动 | `services/arm_service/joint_mover.py` |
+| URDF | `services/arm_service/urdf/{left,right}_arm.urdf` |
+
+### 坐标系口径 (关键)
+
+- IK / FK 都在**该臂基座系 (base_link)** 里做;
+- 世界系 ↔ 基座系靠控制器的 ``baseFrame`` 换算 (真机唯一正确的口径);
+- URDF 自带的装法与实测 ``baseFrame`` **不是同一个数** —— 不覆盖的话
+  IK 目标整体偏。
+
+### 关节约定探测
+
+URDF 的 ``j1..j7`` 与控制器上报的 ``joints[0..6]`` 是否同序同向**没有文档
+保证**。猜错的后果是机械臂朝完全相反的方向动, 而且**不报任何错**。
+
+``detect_joint_convention()`` 把实测关节角代入 FK, 与控制器上报的 TCP
+位姿对比, 自动探测「同序 / 反序 / 取反」。本机实测两条臂都是**同序**,
+误差 0.00mm / 0.00°。
+
+自检:
+
+```bash
+python3 services/arm_service/tools/check_local_ik.py
+```
+
+### 奇异位形与姿态回退
+
+七轴冗余有无数解, 位置定了姿态本来就不唯一。而且手臂**伸直**时
+(j3 ≈ 0) 雅可比近奇异 —— 姿态方向的那个自由度**丢失了**, 此时要求姿态
+精确会把位置一起拖死 (实测位置差 100mm 都下不去, 而纯位置逆解能到
+0.000mm)。
+
+所以逆解分三层回退:
+
+1. **全姿态** (`rot_weight=1`) —— 位置姿态都要;
+2. **多起点** —— 换种子再试;
+3. **位置优先** (`rot_weight=0`) —— 只管位置, 姿态随冗余自由度走。
+
+第 3 步命中时, 响应的 `ik` 字段里会有 ``"position_only": true`` 和
+``rot_deviation_deg``, 并打一条警告 —— 抓取只按位置走, 姿态偏差要靠
+视觉结果复核。
+
+### 依赖
+
+本地逆解需要 ``numpy`` + ``pinocchio``:
+
+```bash
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple "numpy<2.3" pin
+```
+
+装不上时本地逆解**降级但不崩** (``/v1/move_to`` 如实报「本地运动学不可用」),
+动作库播放等老功能照常。
+
+### 切换回控制器逆解
+
+```yaml
+arm:
+  move_mode: controller_ik   # local_ik (缺省) | controller_ik
+```
+
+``controller_ik`` 是走控制器的 ``cartesianIkPath=analytic``, 保留是为了
+对照排障, 不是推荐路径。
 
 ## 安全门阀
 
@@ -244,6 +357,46 @@ data/伸左手.json  -> 动作 "伸左手"
 
 新增动作直接在 `data/` 下放一个 `<动作名>.json` 即可, 服务重启后自动加载。
 
+## 抓取流程 (5 步)
+
+`vision.grasp` skill 一次调用跑完这 5 步:
+
+| 步 | 做什么 | 怎么做的 |
+|----|--------|----------|
+| 1 | 回准备点 | 播动作库的 `准备点` (拍照前固定视角) |
+| 2 | 拍照识别 | 视觉服务 `fresh=True` (强制重拍, 不走缓存) |
+| 3 | 移到上方点 | `move_to` 目标正上方 `above_distance` 米 |
+| 4 | 移到抓取点 + 闭夹爪 | `move_to` 目标 + 偏移, 然后播 `闭合夹爪` |
+| 5 | 回安全点 | 播动作库的 `安全点` |
+
+配置在 `configs/arm.yaml` 的 `arm.grasp.flow`:
+
+```yaml
+    flow:
+      ready_action: "准备点"      # 第 1 步, 留空 = 跳过
+      safe_action: "安全点"        # 第 5 步, 留空 = 跳过
+      above_distance: 0.10        # 上方点离目标多远 (米)
+      grasp_offset:               # 抓取点相对目标的偏移 (米)
+        x: 0.0
+        y: 0.0
+        z: 0.0
+      close_action: "闭合夹爪"     # 留空 = 不闭夹爪
+      open_action: "张开夹爪"
+      durations:
+        above: 3.0                # 移到上方点的时长 (秒)
+        grasp: 2.0                # 移到抓取点的时长 (秒)
+```
+
+**失败收尾** —— 每步都可能单独失败:
+
+- 第 1 步失败 -> 直接返回, 不拍照
+- 第 2 步失败 (没找到) -> 返回, **不回安全点** (已经在准备点了)
+- 第 3/4 步失败 -> **必须先回安全点**再报失败, 否则手停在半空
+- 第 5 步失败 -> 抓取已成功, 如实说「抓到了但回安全点失败」
+
+**总闸关着的时候 5 步全走完** (`arm.enabled: false`) —— 只是不动。
+用户要看的正是每一步算出来的位置, 中途就停掉等于什么都看不到。
+
 ## 协议约束 (踩错就是机器人不动或直接被停控)
 
 这部分决定了实现的正确性, **不能简化**:
@@ -271,6 +424,15 @@ data/伸左手.json  -> 动作 "伸左手"
 5. **UDP 报文格式**
    扁平 JSON, 无 `{id,ty,db}` 包裹:
    `{"robot":"LeftArm","controlSpace":0,"commandMode":0,"value":[7 个 rad]}`
+
+   **手部字段 (灵巧手)** —— 只有 `configs/arm.yaml` 的 `arm.hand.enabled`
+   打开时才会带:
+   `{"robot":"RightArm","controlSpace":0,"commandMode":0,"value":[7 个 rad],"hand":[6 个 0~1000]}`
+
+   > ⚠️ **默认关着**。控制器认不认 `hand` 这个字段名还没在真机上验证过 ——
+   > 格式不对的话控制器会**整包丢弃** (`invalidDatagram`), 那时候连手臂
+   > 都不动了, 比不动手指糟得多。验证脚本: `tools/probe_hand.py`
+   > (真机: `--controller <ip> --arm right`)。确认接受后再打开配置。
 
 6. **入控前必须清残留会话**
    控制器上残留的会话 (尤其 `state="stopped"` 的) 会占住该臂, 表现为
@@ -334,6 +496,17 @@ cd services/arm_service
 python tools/check_arm.py          # 协议级: 时序 / 报文格式 / 对齐 / 停控
 python tools/check_arm_service.py  # 端到端: mock 控制器 + 真实 HTTP/WS 服务
 python tools/check_safety.py       # 安全门阀: 逐项判定 + 播报文案 (不需要真机)
+python tools/check_grasp_flow.py   # 抓取流程: 手部字段 / 插值 / 5 步顺序
+```
+
+**真机探针** (需要能连到控制器):
+
+```bash
+# 验证控制器认不认 UDP 报文里的手部字段
+python tools/probe_hand.py --controller 192.168.100.16 --arm right
+
+# 录一个固定点动作 (安全点/准备点) —— 关节角必须现场示教
+python tools/record_safe_point.py --name 安全点
 ```
 
 ## 与 Agent 服务的对接 (已接通)

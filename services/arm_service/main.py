@@ -98,6 +98,31 @@ async def health() -> Dict[str, Any]:
     return _svc().health()
 
 
+@app.get("/v1/flow")
+async def flow_config() -> Dict[str, Any]:
+    """抓取流程 (5 步) 的配置。
+
+    agent 的 ``vision.grasp`` skill 要按顺序走这几步, 每一步用哪个
+    动作、多高、多长 —— 这些都在 ``configs/arm.yaml`` 的
+    ``arm.grasp.flow`` 里。这个接口把它暴露出来, 让 skill 不用自己
+    再读一遍 yaml (两处配置不同步是很麻烦的事)。
+    """
+    svc = _svc()
+    f = svc.arm_cfg.flow
+    return {
+        "ready_action": f.ready_action,
+        "safe_action": f.safe_action,
+        "above_distance": f.above_distance,
+        "grasp_offset_x": f.grasp_offset_x,
+        "grasp_offset_y": f.grasp_offset_y,
+        "grasp_offset_z": f.grasp_offset_z,
+        "close_action": f.close_action,
+        "open_action": f.open_action,
+        "above_duration": f.above_duration,
+        "grasp_duration": f.grasp_duration,
+    }
+
+
 @app.get("/v1/actions", response_model=ActionListResponse)
 async def list_actions() -> Dict[str, Any]:
     svc = _svc()
@@ -115,12 +140,20 @@ async def play(req: PlayRequest) -> Dict[str, Any]:
     """下发播放。
 
     传 ``action`` 播一个动作, 传 ``actions`` 播一串 (按顺序, 只入控一次)。
+
+    ``wait=true`` 时**等播完再返回** —— 抓取流程要按顺序走, 下一步必须
+    等上一步真的动完了才能开始。
     """
     svc = _svc()
     actions = req.action_list()
     if not actions:
         raise HTTPException(status_code=400, detail="没指定动作")
     try:
+        if req.wait:
+            # 播放要几秒到几十秒, 必须放线程池, 否则事件循环被卡住
+            return await await_run(
+                svc.play_many, actions, req.speed, req.loop, True
+            )
         return svc.play_many(actions, speed=req.speed, loop=req.loop)
     except ActionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -132,14 +165,17 @@ async def play(req: PlayRequest) -> Dict[str, Any]:
 async def move_to(req: MoveToRequest) -> Dict[str, Any]:
     """把 TCP 移到世界系目标点 (同步, 走完才返回)。
 
-    流程: 安全门阀 -> 臂展粗检 -> 控制器逆解 (cartesianIkPath=analytic) ->
-    S 曲线 ``duration`` 秒 -> 读回 TCP 核对。被拒绝或没到位时 ``ok=false``,
+    流程: 安全门阀 -> 臂展粗检 -> **本地逆解 (pinocchio)** ->
+    关节流下发 -> 读回 TCP 核对。被拒绝或没到位时 ``ok=false``,
     ``message`` 是可以直接播报的原因。HTTP 状态码恒为 200, 成败看 ``ok``。
+
+    **不用控制器的逆解接口** —— 逆解在本地做, 控制器全程只吃关节角
+    (``cartesianIkPath="none"``)。
     """
     svc = _svc()
     # 移动会阻塞到走完 (几秒), 必须放线程池, 否则事件循环被卡住
     return await await_run(
-        svc._mover.move_to,
+        svc.move_to,
         req.arm, req.x, req.y, req.z, req.a, req.b, req.c, req.duration, req.speak,
     )
 

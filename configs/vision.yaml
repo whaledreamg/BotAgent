@@ -2,62 +2,25 @@ vision:
   server:
     host: 0.0.0.0
     port: 8803
-
-  # ---- 相机自动恢复 ----
-  #
-  # 相机是 USB 独占设备, 掉线 (USB 重置/线材松动/供电不足) 后不会自己
-  # 回来。开着 auto_reconnect 后, 每次请求发现相机不可用就自动
-  # close + reopen 一次 —— 不用重启服务。
-  #
-  # 之前的行为: 相机一掉线, /v1/detect 就一直返回 503 「相机没连上」,
-  # 直到手工重启视觉服务。
   auto_reconnect: true
-  # 两次重连之间的最小间隔 (秒)。太小会在失败时连着狂试, 把 USB 栈
-  # 搞得更糟 (日志里见过 UVC transfer queue exhausted)。
   reconnect_interval: 2.0
-
   camera:
     camera_brand: orbbec
     camera_type: head
-    # 本机插着的相机: Orbbec Gemini 336L, SN=CPCBC53000H5
-    #
-    # 留空 = 用枚举到的第一个设备 (换机器/换相机时最省事, 推荐这样)。
-    # 填了序列号 = 只认这一台 —— 多相机时用来区分, 但换机器要记得改。
     serial_number: CPCBC53000H5
-    # 彩色流分辨率。
-    #
-    # **保持 0 = 用 SDK 默认 (1280x800)**。
-    #
-    # 别为了「省点带宽」改成 640x400 —— 位置精度会明显掉:
-    #   - 标定内参 fx=605.78 是在 1280x800 上标的, 1 像素对应 1.65mm;
-    #     降到 640x400 后 1 像素对应 3.30mm, 物体框偏 5 像素位置就差 1.6cm
-    #   - 手眼标定 (configs/handeye.json) 也是在 1280x800 下做的
-    #   - 对齐模式会从 SW_MODE 变成 HW_MODE, 深度/彩色的对应关系也变了
-    #
-    # 要换分辨率, 必须连着重新标内参 + 重新标手眼。
     width: 0
     height: 0
     fps: 0
     frame_timeout_ms: 2000
     align_depth_to_color: true
     calibrated_intrinsics:
-      fx: 605.779933
-      fy: 609.009161
-      cx: 635.684459
-      cy: 407.178887
+      fx: 617.109343
+      fy: 620.175718
+      cx: 649.377026
+      cy: 416.056983
       width: 1280
       height: 800
   detector:
-    # ---- 权重路径怎么写 ----
-    #
-    # @ 前缀 = 相对**仓库根** (BotAgent/)。仓库里放了就在仓库里找,
-    # 换机器不用改配置。
-    #
-    # 也可以写绝对路径, 或者设环境变量指到仓库外 (大文件不建议进 git):
-    #   export VISION_MODEL_DIR=/data/models
-    #   export VISION_WEIGHTS=/data/models/yolo26n.pt
-    #
-    # 留空 = 让 ultralytics 自己按名字下载。
     weights: '@models/yolo/yolo26n.pt'
     pose_weights: ''
     conf: 0.15
@@ -78,17 +41,13 @@ vision:
     frames: 5
     output_dir: logs
   training:
-    # 数据集描述文件 (ultralytics 的 data.yaml)
-    # @ = 相对仓库根; 也可以写绝对路径或用 VISION_DATA_DIR 指到仓库外。
     data: '@datasets/myobjects/data.yaml'
-    # 迁移学习的起点权重 (或 .yaml 表示从零训)
     base_weights: '@models/yolo/yolo26n.pt'
     epochs: 100
     imgsz: 640
     batch: 16
     patience: 30
     device: '0'
-    # 训练输出目录
     project: '@datasets/runs'
     name: myobjects
     hsv_h: 0.01
@@ -102,18 +61,18 @@ vision:
   extrinsic:
     enabled: true
     matrix:
-    - - 0.01895335
-      - -0.64996966
-      - 0.75972378
-      - 0.04554415
-    - - -0.99977783
-      - -0.01933029
-      - 0.00840442
-      - -0.06425278
-    - - 0.00922307
-      - -0.75971428
-      - -0.65019163
-      - 0.12808003
+    - - -0.01848515
+      - -0.41471759
+      - 0.9097624
+      - 0.05516546
+    - - -0.99971438
+      - -0.00611914
+      - -0.02310228
+      - 0.03317113
+    - - 0.01514788
+      - -0.9099296
+      - -0.41448602
+      - 0.15205405
     - - 0.0
       - 0.0
       - 0.0

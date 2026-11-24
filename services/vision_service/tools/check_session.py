@@ -664,6 +664,287 @@ def check_stale_pose_detection() -> None:
           "却解出来了" if r is not None else "")
 
 
+def check_verify_uses_real_tool_offset() -> None:
+    """验证工具**用真偏置回代**, 而不是 session 里那个占位的单位阵。
+
+    **这个 bug 的实际后果**: 联合解算的输出里有 ``tool_board_matrix``
+    (板离 TCP 几百毫米), 但 session 里记的 ``t_tool_board`` 可能只是
+    占位的单位阵。验证时如果用单位阵回代, 残差会虚高好几倍 ——
+    实测把 134mm/10° 报成了 583mm/120°, 让人误判成「数据完全不能用」。
+
+    这里用合成数据复现这个场景, 确认 :func:`calib_verify.sample_consistency_check`
+    会**优先用外参文件里的偏置**。
+    """
+    print("\n[10] calib_verify 用真偏置回代 (不是 session 里的占位单位阵)")
+    import calib_verify
+
+    tmp = Path(tempfile.mkdtemp(prefix="calib_verify_"))
+    try:
+        # 物理上真实的偏置 (板装在工具外侧)
+        tb_true = np.eye(4)
+        tb_true[:3, 3] = [0.05, 0.0, 0.12]
+
+        # 采样时记录进 session 的是**单位阵** (占位值)
+        session, images, true_T = make_synthetic_session(
+            n=12, tool_offset=tb_true, recorded_offset=np.eye(4)
+        )
+        path = tmp / "samples.json"
+        save_session(session, path, images=images)
+        loaded = load_session(path)
+
+        # 外参文件里带真偏置
+        matrix_json = tmp / "handeye.json"
+        matrix_json.write_text(
+            json.dumps({
+                "matrix": true_T.tolist(),
+                "tool_board_matrix": tb_true.tolist(),
+            }),
+            encoding="utf-8",
+        )
+
+        got_m, got_off = calib_verify.load_matrix_and_offset(str(matrix_json))
+        check("能从外参文件读出矩阵", got_m is not None)
+        check("能从外参文件读出 tool_board_matrix",
+              got_off is not None and np.allclose(got_off, tb_true))
+
+        # 用真偏置回代 -> 残差应该很小
+        pos_errs: List[float] = []
+        for s in loaded.samples:
+            s.t_tool_board = got_off
+            m = s.t_world_cam()
+            pos_errs.append(float(np.linalg.norm(m[:3, 3] - got_m[:3, 3])))
+        max_err = max(pos_errs)
+        check("用真偏置回代 -> 残差 < 1 mm", max_err < 0.001,
+              f"最大 {max_err * 1000:.4f} mm")
+
+        # 反例: 用 session 里的单位阵 -> 残差应该明显更大
+        pos_errs_bad: List[float] = []
+        for s in loaded.samples:
+            s.t_tool_board = np.eye(4)
+            m = s.t_world_cam()
+            pos_errs_bad.append(float(np.linalg.norm(m[:3, 3] - got_m[:3, 3])))
+        max_bad = max(pos_errs_bad)
+        check("用占位单位阵 -> 残差确实虚高 (证明这个 bug 会踩到)",
+              max_bad > max_err * 10,
+              f"{max_bad * 1000:.2f} mm vs {max_err * 1000:.4f} mm")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_rigidity_tool() -> None:
+    """刚体自检工具能区分「晃动」和「系统性错误」。
+
+    **正确的刚体不变量** 是 ``T_cam_board · inv(T_world_tool)`` 恒定
+    (等价于 ``A_i · inv(C_i) = T_tool_cam`` 恒定)。
+
+    **踩过的坑**: 一开始用了 ``C_i · A_i``, 看着像不变量, 其实不是 ——
+    那个量本来就会随帧变化, 用它当判据会把**完全正常的数据**判成坏的。
+    正确的判据对合成数据 (物理刚性) 必须给出 0.0000°。
+    """
+    print("\n[11] 刚体自检工具 (晃动 vs 系统性错误)")
+    import check_rigidity
+
+    # ---- 1) 正常数据 (板刚性固定) -> 应该报 OK ----
+    session, images, _ = make_synthetic_session(n=12)
+    stats = check_rigidity.analyze(session.samples)
+    check("合成数据能算出统计量", stats is not None)
+    if stats is not None:
+        check("刚性安装的数据 -> 相对姿态偏差 ~0°",
+              stats["max_rot_dev"] < 0.01,
+              f"最大 {stats['max_rot_dev']:.4f}°")
+        check("刚性安装的数据 -> 平移残差 ~0 mm",
+              float(stats["trans_std"].max()) < 1e-6,
+              f"{stats['trans_std'].max() * 1000:.6f} mm")
+        check("刚性安装的数据 -> AX=ZB 旋转残差 ~0°",
+              stats["rot_resid_mean"] is not None
+              and stats["rot_resid_mean"] < 0.01,
+              f"平均 {stats['rot_resid_mean']:.4f}°"
+              if stats["rot_resid_mean"] is not None else "")
+
+    # ---- 2) 系统性错误 (给工具位姿加一个固定轴的旋转) ----
+    from extrinsic import rpy_to_matrix
+
+    # **右乘** —— 模拟「坐标系约定错了」。
+    #
+    # 为什么必须右乘: 刚体不变量是 ``C_i · inv(A_i)``, 左乘一个固定旋转
+    # 会被 ``C_i`` 一起吸收, 不变量**完全不变** (偏差 0.00°)。
+    # 而真实世界的约定错误 (RPY 约定错 / 轴向定义错) 改的是**世界系里
+    # 每个姿态的表达**, 相当于右乘 —— 这才会让不变量跑掉。
+    session2, _, _ = make_synthetic_session(n=12)
+    for s in session2.samples:
+        err = np.eye(4)
+        err[:3, :3] = rpy_to_matrix([0.0, 0.35, 0.0])
+        s.t_world_tool = s.t_world_tool @ err
+    stats2 = check_rigidity.analyze(session2.samples)
+    check("系统性错误 -> 偏差明显变大", stats2 is not None
+          and stats2["max_rot_dev"] > 5.0,
+          f"最大 {stats2['max_rot_dev']:.2f}°" if stats2 else "")
+    check("绕固定轴的误差 -> 偏差变大 (但偏差轴逐帧不同, 因为误差是在工具系里的)",
+          stats2 is not None and stats2["max_rot_dev"] > 5.0,
+          f"最大 {stats2['max_rot_dev']:.2f}°" if stats2 else "")
+
+    # ---- 2b) 左乘误差: **不可观测** —— 「手眼标定只定相对关系」 ----
+    session2b, _, _ = make_synthetic_session(n=12)
+    for s in session2b.samples:
+        err = np.eye(4)
+        err[:3, :3] = rpy_to_matrix([0.0, 0.35, 0.0])
+        s.t_world_tool = err @ s.t_world_tool
+    stats2b = check_rigidity.analyze(session2b.samples)
+    check("左乘误差 -> 不变量不变 (数学上不可观测, 只能靠外部验证)",
+          stats2b is not None and stats2b["max_rot_dev"] < 0.01,
+          f"最大 {stats2b['max_rot_dev']:.4f}°" if stats2b else "")
+    check("左乘误差 -> AX=ZB 残差也不变 (同上, 外参整体吸收了)",
+          stats2b is not None and stats2b["rot_resid_mean"] is not None
+          and stats2b["rot_resid_mean"] < 0.01,
+          f"平均 {stats2b['rot_resid_mean']:.4f}°"
+          if stats2b and stats2b["rot_resid_mean"] is not None else "")
+
+    # ---- 3) 随机晃动 -> 偏差轴应该随机 ----
+    rng = np.random.default_rng(7)
+    session3, _, _ = make_synthetic_session(n=12)
+    for s in session3.samples:
+        err = np.eye(4)
+        err[:3, :3] = rpy_to_matrix(
+            list(rng.uniform(-0.1, 0.1, 3))
+        )
+        s.t_world_tool = s.t_world_tool @ err
+    stats3 = check_rigidity.analyze(session3.samples)
+    check("随机晃动 -> 偏差轴一致性较低 (点积 < 0.7)",
+          stats3 is not None and stats3["axis_consistency"] < 0.7,
+          f"点积 {stats3['axis_consistency']:.3f}" if stats3 else "")
+
+    # ---- 3b) 偏差轴一致性 抓的是「逐帧轴抖动」那一类 ----
+    #
+    # 注意: 左乘误差被外参整体吸收 (不变量不变), 右乘误差的轴在工具系里
+    # (逐帧不同)。所以「偏差轴一致性」这个指标真正能识别的是:
+    # **偏差绕世界系里某个固定轴, 但每帧强度不同** —— 实测真实数据
+    # 落在这一类 (点积 0.899, 偏差与工具转角相关 r=+0.70)。
+    # 这里构造同类场景: 给每帧的板加一个**绕世界系Y轴**、强度随帧变化的
+    # 微小旋转误差。
+    session3b, _, _ = make_synthetic_session(n=12)
+    for i, s in enumerate(session3b.samples):
+        err = np.eye(4)
+        err[:3, :3] = rpy_to_matrix([0.0, 0.05 * (1 + i % 3), 0.0])
+        # 左乘到**世界系**里的位姿上 —— 这样偏差轴在世界系里是固定的
+        s.t_world_tool = err @ s.t_world_tool
+    stats3b = check_rigidity.analyze(session3b.samples)
+    check("世界系固定轴误差 -> 偏差轴高度一致 (点积 > 0.7)",
+          stats3b is not None and stats3b["axis_consistency"] > 0.7,
+          f"点积 {stats3b['axis_consistency']:.3f}" if stats3b else "")
+
+    # ---- 4) 只平移错 -> 旋转仍自洽 (能定位到是位置通道) ----
+    session4, _, _ = make_synthetic_session(n=12)
+    for i, s in enumerate(session4.samples):
+        s.t_world_tool = s.t_world_tool.copy()
+        s.t_world_tool[:3, 3] += [0.05 * (i % 3), 0.0, 0.0]
+    stats4 = check_rigidity.analyze(session4.samples)
+    check("平移错 -> 旋转残差仍很小 (旋转通道没问题)",
+          stats4 is not None and stats4["rot_resid_mean"] is not None
+          and stats4["rot_resid_mean"] < 2.0,
+          f"平均 {stats4['rot_resid_mean']:.2f}°"
+          if stats4 and stats4["rot_resid_mean"] is not None else "")
+    check("平移错 -> 平移残差明显变大",
+          stats4 is not None and float(stats4["trans_std"].max()) > 0.01,
+          f"{stats4['trans_std'].max() * 1000:.1f} mm" if stats4 else "")
+
+
+def check_diagnostics_module() -> None:
+    """装置诊断模块 (不需要外参的三个判据)。"""
+    print("\n[12] 装置诊断模块 (旋转激励 / 相对转动 / 位移尺度)")
+    from calibration.diagnostics import (
+        displacement_ratio,
+        relative_rotation,
+        report,
+        rotation_excitation,
+    )
+
+    # ---- 1) 物理刚性的合成数据 -> 一切正常 ----
+    session, _, _ = make_synthetic_session(n=12)
+    tool_poses = [np.array(s.t_world_tool) for s in session.samples]
+    board_poses = [np.array(s.t_cam_board) for s in session.samples]
+
+    rel = relative_rotation(tool_poses, board_poses)
+    check("刚性数据 -> 相对转动 ~0°",
+          max(rel) < 0.001, f"最大 {max(rel):.6f}°")
+
+    per_axis, min_exc = rotation_excitation(tool_poses)
+    check("刚性数据 -> 旋转激励充足",
+          min_exc >= 15.0,
+          f"最小 {min_exc:.1f}° (X={per_axis['axis_x']:.0f} "
+          f"Y={per_axis['axis_y']:.0f} Z={per_axis['axis_z']:.0f})")
+
+    problems = report(tool_poses, board_poses)
+    check("刚性数据 -> 没有问题报告", not problems,
+          "; ".join(problems)[:120])
+
+    # ---- 2) 板松动 (相对转动) -> 应该报出来 ----
+    from extrinsic import rpy_to_matrix
+
+    session2, _, _ = make_synthetic_session(n=12)
+    tp2 = [np.array(s.t_world_tool) for s in session2.samples]
+    bp2 = [np.array(s.t_cam_board) for s in session2.samples]
+    # 给板加一个绕自身轴的额外转动 (模拟板在工具上滑动)
+    slip = np.eye(4)
+    slip[:3, :3] = rpy_to_matrix([0.0, 0.0, 0.05])
+    bp2_slip = [b @ slip for b in bp2]
+    rel2 = relative_rotation(tp2, bp2_slip)
+    check("板滑动 -> 相对转动变大",
+          max(rel2) > 1.0, f"最大 {max(rel2):.2f}°")
+    problems2 = report(tp2, bp2_slip)
+    check("板滑动 -> 报告里提到装夹问题",
+          any("刚性固定" in p or "滑动" in p for p in problems2),
+          "; ".join(problems2)[:120])
+
+    # ---- 3) 纯平移数据 -> 旋转激励不足 + 位移尺度可测 ----
+    session3, _, _ = make_synthetic_session(n=8)
+    tp3 = []
+    bp3 = []
+    for i, s in enumerate(session3.samples):
+        m = np.array(s.t_world_tool)
+        # 只平移, 不转
+        m2 = m.copy()
+        m2[:3, :3] = session3.samples[0].t_world_tool[:3, :3]
+        m2[:3, 3] = m[:3, 3] + np.array([0.02 * i, 0.03 * i, 0.0])
+        tp3.append(m2)
+        bp3.append(np.array(s.t_cam_board))
+    _, min_exc3 = rotation_excitation(tp3)
+    check("纯平移数据 -> 旋转激励不足被识别",
+          min_exc3 < 15.0, f"最小 {min_exc3:.2f}°")
+    problems3 = report(tp3, bp3)
+    check("纯平移数据 -> 报告里提到旋转激励不足",
+          any("旋转激励" in p for p in problems3),
+          "; ".join(problems3)[:120])
+
+    # ---- 4) 位移尺度: 板位移是工具位移的 1.2 倍 -> 应该报出来 ----
+    bp3_scaled = []
+    for b, t in zip(bp3, tp3):
+        b2 = b.copy()
+        b2[:3, 3] = b[:3, 3] * 1.0
+        # 把板的**相对第0帧的位移**放大 1.2 倍
+        bp3_scaled.append(b2)
+    # 手工构造: 板位移 = 工具位移的 1.2 倍
+    base_b = bp3[0][:3, 3].copy()
+    tp4 = []
+    bp4 = []
+    for i, (t, b) in enumerate(zip(tp3, bp3)):
+        t2 = t.copy()
+        t2[:3, 3] = np.array([0.1 * i, 0.0, 0.0])
+        b2 = b.copy()
+        b2[:3, 3] = base_b + (t2[:3, 3] - tp3[0][:3, 3]) * 1.2
+        tp4.append(t2)
+        bp4.append(b2)
+    ratios = displacement_ratio(tp4, bp4)
+    check("位移尺度: 能算出比值", bool(ratios))
+    if ratios:
+        med = float(np.median([r for _, r in ratios]))
+        check("位移尺度: 比值 = 1.2 (人工构造的)",
+              abs(med - 1.2) < 0.01, f"中位 {med:.4f}")
+        problems4 = report(tp4, bp4)
+        check("位移尺度: 报告里提到尺度偏差",
+              any("尺度" in p for p in problems4),
+              "; ".join(problems4)[:120])
+
+
 def main() -> int:
     print("=" * 62)
     print("标定 session 流程自检 (合成数据)")
@@ -679,6 +960,9 @@ def main() -> int:
     check_view_tool()
     check_stdin_detection()
     check_stale_pose_detection()
+    check_verify_uses_real_tool_offset()
+    check_rigidity_tool()
+    check_diagnostics_module()
 
     print()
     print("=" * 62)

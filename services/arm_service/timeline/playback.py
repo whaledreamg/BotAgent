@@ -282,3 +282,78 @@ class PlaybackEngine:
 
         # 超出时长: 停在时间上最后一个机械臂片段的结束姿态。
         return self._model.get_segment(order[-1]).end_joints.copy()
+
+    # ------------------------------------------------------------ 手部求值
+
+    def evaluate_hand_at(
+        self, t: float, side: str = "right"
+    ) -> List[int]:
+        """求某个时刻的手部目标值 (0~1000, 6 个自由度)。
+
+        **跟关节求值是分开的** —— 手部片段不产生关节插值 (混进来会让
+        Catmull-Rom 把手臂拽向零位), 但它自己要被插值: 手指要连续合拢,
+        不能一步跳过去。
+
+        语义:
+        - 落在手部片段里 -> 线性插值到该片段的目标
+        - 没落在任何手部片段里 -> **保持上一个手部片段的目标**
+          (跟关节的「保持不动」语义一致)
+        - 一个手部片段都没有 -> 返回空 (表示这条臂不控制手部)
+
+        Args:
+            t:    时间 (秒)
+            side: "left" / "right"
+        """
+        segments = self._model.segments
+        if not segments:
+            return []
+
+        # 只看**管这只手**的片段 —— 动作文件里只写了 rightHand 时,
+        # 左手不能跟着动。
+        hand_segs = [
+            s for s in segments
+            if not s.is_arm and s.hand_for(side) is not None
+        ]
+        if not hand_segs:
+            return []
+
+        # ---- 落在某个手部片段里 -> 插值 ----
+        for seg in hand_segs:
+            if seg.start_time <= t < seg.end_time:
+                target = seg.hand_for(side) or []
+                start = self._hand_start_value(segments, seg, side)
+                span = max(1e-6, seg.duration)
+                local_t = min(1.0, max(0.0, (t - seg.start_time) / span))
+                return [
+                    int(round(start[i] + local_t * (target[i] - start[i])))
+                    for i in range(min(6, len(target)))
+                ]
+
+        # ---- 没落在手部片段里 -> 保持最近一个手部片段的目标 ----
+        prev = None
+        for seg in hand_segs:
+            if seg.start_time <= t:
+                prev = seg
+            else:
+                break
+        if prev is not None:
+            return list(prev.hand_for(side) or [])
+
+        # t 在第一个手部片段之前 -> 保持第一个手部片段的**起点**
+        first = hand_segs[0]
+        return list(self._hand_start_value(segments, first, side))
+
+    @staticmethod
+    def _hand_start_value(
+        segments: List, seg: object, side: str
+    ) -> List[int]:
+        """手部片段的起点值 = 上一个手部片段的终点 (没有就是 0)。"""
+        prev_end: Optional[List[int]] = None
+        for other in segments:
+            if other is seg:
+                break
+            if not other.is_arm:
+                val = other.hand_for(side)
+                if val is not None:
+                    prev_end = list(val)
+        return prev_end if prev_end is not None else [0] * 6

@@ -33,7 +33,7 @@ class RobotConnection:
         url: str,
         timeout: float = 5.0,
         on_state: Optional[Callable[[Dict[str, Any]], None]] = None,
-        on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_event: Optional[Callable[[str, Dict[str, Any], Dict[str, Any]], None]] = None,
         on_reconnect: Optional[Callable[[], None]] = None,
     ) -> None:
         self.url = url
@@ -53,6 +53,12 @@ class RobotConnection:
         self._closing = False
         #: 同步请求用的应答槽: msg_id -> {"event": Event, "response": dict}
         self._sync_slots: Dict[int, Dict[str, Any]] = {}
+        #: **在途请求的上下文**: msg_id -> 附加信息 (dict)
+        #:
+        #: 有些应答里**没有** name 字段 (实测 ``robot/status`` 就是),
+        #: 光看报文无法判断它是哪条臂的 —— 必须靠「发出去时就知道是谁」
+        #: 来关联。所以发请求时把上下文记在这里, 应答回来时按 id 取。
+        self._pending_meta: Dict[int, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------ 连接
 
@@ -241,8 +247,9 @@ class RobotConnection:
                 return
             with self._lock:
                 action = self._pending.pop(msg_id, "")
+                meta = self._pending_meta.pop(msg_id, None)
             if action and self._on_event is not None:
-                self._on_event(action, obj)
+                self._on_event(action, obj, meta or {})
 
     # ------------------------------------------------------------ 同步请求
 
@@ -288,8 +295,16 @@ class RobotConnection:
         return slot["response"]
     # ------------------------------------------------------------ 发命令
 
-    def send_command(self, ty: str, db: Optional[Dict[str, Any]] = None) -> int:
-        """发送一条命令, 返回消息 id (失败返回 -1)。"""
+    def send_command(
+        self, ty: str, db: Optional[Dict[str, Any]] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """发送一条命令, 返回消息 id (失败返回 -1)。
+
+        ``meta`` 是**这次请求的上下文**, 应答回来时原样交给
+        ``on_event`` 的第三个参数。用来解决「应答里没有 name 字段,
+        分不清是哪条臂的」这类问题。
+        """
         if not self._connected or self._ws is None:
             logger.warning("[控制面] 未连接, 丢弃命令 %s", ty)
             return -1
@@ -298,6 +313,8 @@ class RobotConnection:
             msg_id = self._message_id
             self._message_id += 1
             self._pending[msg_id] = ty
+            if meta:
+                self._pending_meta[msg_id] = dict(meta)
 
         payload = {"id": msg_id, "ty": ty, "db": db or {}}
         try:
@@ -306,6 +323,7 @@ class RobotConnection:
             logger.warning("[控制面] 发送 %s 失败: %s", ty, exc)
             with self._lock:
                 self._pending.pop(msg_id, None)
+                self._pending_meta.pop(msg_id, None)
             return -1
         logger.debug("[控制面] -> %s", payload)
         return msg_id
@@ -339,8 +357,13 @@ class RobotConnection:
     def list_robots(self) -> None:
         self.send_command("robot/list", {})
 
-    def get_robot_status(self, name: str) -> None:
-        self.send_command("robot/status", {"name": name})
+    def get_robot_status(self, name: str) -> int:
+        """查询某臂状态。
+
+        **返回消息 id** —— ``robot/status`` 的应答里**没有** name 字段,
+        调用方必须靠 id 才知道「这个应答是哪条臂的」。
+        """
+        return self.send_command("robot/status", {"name": name})
 
     def enable_robot(self, name: str) -> None:
         self.send_command("robot/enable", {"name": name})

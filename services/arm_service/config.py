@@ -149,6 +149,48 @@ class GraspConfig:
 
 
 @dataclass
+class HandConfig:
+    """灵巧手 (夹爪) 配置。
+
+    **enabled 默认 false** —— 控制器认不认 UDP 报文里的手部字段还没在
+    真机上验证过 (``tools/probe_hand.py`` 就是干这个的)。没验证就发,
+    万一格式不对, 控制器会**整包丢弃** (invalidDatagram) —— 那时候
+    连手臂都不动了, 比不发手部指令糟得多。
+
+    探针确认控制器接受之后, 把这个打开即可, 不用改代码。
+    """
+
+    #: 是否在报文里带手部字段
+    enabled: bool = False
+
+
+@dataclass
+class GraspFlowConfig:
+    """抓取流程 (5 步) 配置。
+
+    流程: 回准备点 -> 拍照识别 -> 移到上方点 -> 移到抓取点 -> 回安全点。
+    """
+
+    #: 第 1 步: 回准备点的动作名。留空 = 跳过这一步。
+    ready_action: str = "准备点"
+    #: 第 5 步: 回安全点的动作名。留空 = 跳过这一步。
+    safe_action: str = "安全点"
+    #: 上方点相对目标点的高度 (米)。世界系 Z 向上。
+    above_distance: float = 0.10
+    #: 抓取点相对目标点的偏移 (米), 可分轴。
+    grasp_offset_x: float = 0.0
+    grasp_offset_y: float = 0.0
+    grasp_offset_z: float = 0.0
+    #: 闭合/张开夹爪的动作名。留空 = 不做这一步。
+    close_action: str = "闭合夹爪"
+    open_action: str = "张开夹爪"
+    #: 移到上方点的运动时长 (秒)
+    above_duration: float = 3.0
+    #: 移到抓取点的运动时长 (秒)
+    grasp_duration: float = 2.0
+
+
+@dataclass
 class ArmConfig:
     #: **控制指令总闸**。false = 不下发任何控制指令 (只算不动)。
     #:
@@ -176,6 +218,12 @@ class ArmConfig:
     connect_timeout: float = 5.0
     play_timeout_ms: int = 15000
     grasp: GraspConfig = field(default_factory=GraspConfig)
+    #: 抓取流程 (5 步) 配置
+    flow: GraspFlowConfig = field(default_factory=GraspFlowConfig)
+    #: 灵巧手 (夹爪) 配置
+    hand: HandConfig = field(default_factory=HandConfig)
+    #: 笛卡尔移动走哪条路
+    move_mode: str = "local_ik"
 
     @property
     def action_path(self) -> Path:
@@ -272,7 +320,29 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         raw = gr.get(side) or {}
         if not isinstance(raw, dict):
             return {}
+
+        # ---- 防呆: 位置写错成列表 ----
+        #
+        # ``right: {-1.485, -0.331, 0.260}`` 会被 YAML 解析成
+        # ``{-1.485: null, -0.331: null, 0.26: null}`` —— 数字当键名。
+        # 这时 ``raw.get("a")`` 全是 None, 下面会当成「没填」而**静默
+        # 丢掉整条姿态**: 机械臂照常动, 但姿态不是你设的那个, 而且
+        # 没有任何报错, 极难排查。
+        #
+        # 所以这里显式识别「键不是 a/b/c」的情况, 直接把用户写的原样
+        # 报出来, 让他知道该改成三行写法。
         keys = ("a", "b", "c")
+        stray = [k for k in raw if k not in keys]
+        if stray:
+            logger.error(
+                "grasp.%s 姿态的键 %s 不是 a/b/c —— "
+                "多半写成了 YAML 列表写法 (如 `right: {1.0, 2.0, 3.0}`), "
+                "那样会被解析成数字键而整条丢弃。请改成三行: "
+                "`%s:` 下面写 `a: ... / b: ... / c: ...`",
+                side, ", ".join(str(x) for x in stray), side,
+            )
+            return {}
+
         present = [k for k in keys if raw.get(k) is not None]
         if not present:
             return {}
@@ -293,6 +363,49 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         max_reach=float(gr.get("max_reach", 1.2)),
         orientation={"left": _abc("left"), "right": _abc("right")},
     )
+
+    # ---- 抓取流程 (5 步) ----
+    fl = (gr.get("flow") or {})
+    if not isinstance(fl, dict):
+        fl = {}
+    offset = (fl.get("grasp_offset") or {})
+    if not isinstance(offset, dict):
+        offset = {}
+    durations = (fl.get("durations") or {})
+    if not isinstance(durations, dict):
+        durations = {}
+
+    def _num(value: Any, fallback: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    flow = GraspFlowConfig(
+        ready_action=str(fl.get("ready_action", "准备点") or ""),
+        safe_action=str(fl.get("safe_action", "安全点") or ""),
+        above_distance=_num(fl.get("above_distance"), 0.10),
+        grasp_offset_x=_num(offset.get("x"), 0.0),
+        grasp_offset_y=_num(offset.get("y"), 0.0),
+        grasp_offset_z=_num(offset.get("z"), 0.0),
+        close_action=str(fl.get("close_action", "闭合夹爪") or ""),
+        open_action=str(fl.get("open_action", "张开夹爪") or ""),
+        above_duration=_num(durations.get("above"), 3.0),
+        grasp_duration=_num(durations.get("grasp"), 2.0),
+    )
+
+    # ---- 灵巧手 ----
+    hd = (a.get("hand") or {})
+    if not isinstance(hd, dict):
+        hd = {}
+    hand = HandConfig(
+        enabled=bool(
+            hd.get("enabled", os.environ.get("ARM_HAND_ENABLED", False))
+        )
+    )
+    if hand.enabled:
+        logger.info("灵巧手通道已启用 (报文里会带 hand 字段)")
+
     # 控制指令总闸: 环境变量优先 (ARM_ENABLED), 否则用 yaml。
     # 空字符串当作「没设置」 -> 用 yaml 的值。
     env_enabled = os.environ.get("ARM_ENABLED")
@@ -324,6 +437,11 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         connect_timeout=float(a.get("connect_timeout", 5.0)),
         play_timeout_ms=int(a.get("play_timeout_ms", 15000)),
         grasp=grasp,
+        flow=flow,
+        hand=hand,
+        move_mode=os.environ.get(
+            "ARM_MOVE_MODE", a.get("move_mode", "local_ik")
+        ).strip().lower(),
     )
 
     s = merged.get("server", {})

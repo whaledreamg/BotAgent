@@ -1,0 +1,17 @@
+# arm_service 运行依赖
+#
+# 装法 (清华镜像快很多):
+#   pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+#
+# ---- 本地逆解 (笛卡尔移动) ----
+#
+# **numpy 与 pinocchio 是「本地逆解」的依赖** —— 装上才走
+# ``arm.move_mode: local_ik`` (缺省路径)。控制器逆解本身不需要它们。
+#
+# 装不上也不崩: 本地逆解降级, ``/v1/move_to`` 如实报「本地运动学不可用」,
+# 动作库播放等老功能照常。
+#
+# pinocchio 没有等价的 pip 包在所有平台都齐, conda 装也行:
+#   conda install -c conda-forge pinocchio=4.1.0
+numpy<2.3
+pin

@@ -111,12 +111,52 @@ class ArmClient:
             [action], speed=speed, loop=loop, replace=replace
         )
 
+    async def play_and_wait(
+        self,
+        action: str,
+        timeout: float = 30.0,
+        replace: bool = True,
+    ) -> Dict[str, Any]:
+        """播放一个动作并**等它播完**。
+
+        抓取流程要按顺序走 (回准备点 -> 拍照 -> 移到上方点 -> ...) ——
+        下一步必须等上一步真的动完了才能开始, 否则「拍照」会在手臂还没
+        到准备点时就拍了。
+
+        服务端 ``wait=true`` 会阻塞到播完, 所以这里不用轮询
+        ``/v1/status`` —— 轮询既慢又容易在边界上判错。
+
+        Returns:
+            服务端应答 + ``finished`` (bool) 与 ``error`` (str)
+        """
+        payload = {"action": action, "wait": True}
+        try:
+            resp = await self._client.post(
+                "/v1/play", json=payload, timeout=timeout
+            )
+        except Exception as exc:
+            raise ArmError(f"机械臂服务不可达 ({self.base_url}): {exc}") from exc
+
+        if resp.status_code >= 400:
+            detail = ""
+            try:
+                detail = resp.json().get("detail", "")
+            except Exception:
+                detail = resp.text[:200]
+            raise ArmError(f"下发播放失败 (HTTP {resp.status_code}): {detail}")
+
+        body = resp.json()
+        if not body.get("ok", False):
+            raise ArmError(f"机械臂拒绝执行: {body.get('message') or body}")
+        return body
+
     async def play_many(
         self,
         actions: List[str],
         speed: float = 1.0,
         loop: bool = False,
         replace: bool = True,
+        wait: bool = False,
     ) -> Dict[str, Any]:
         """下发播放一个动作序列 (按顺序)。返回服务端应答。
 
@@ -137,6 +177,8 @@ class ArmClient:
             "speed": speed,
             "loop": loop,
         }
+        if wait:
+            payload["wait"] = True
         try:
             resp = await self._client.post("/v1/play", json=payload)
         except Exception as exc:
@@ -237,6 +279,19 @@ class ArmClient:
         if resp.status_code >= 400:
             raise ArmError(f"移动请求失败 (HTTP {resp.status_code}): {resp.text[:200]}")
         return resp.json()
+
+    async def flow_config(self) -> Dict[str, Any]:
+        """抓取流程 (5 步) 的配置。
+
+        来自机械臂服务的 ``configs/arm.yaml`` —— agent 那边不自己读
+        yaml, 两处配置不同步很麻烦。
+        """
+        try:
+            resp = await self._client.get("/v1/flow", timeout=6.0)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"查询抓取流程配置失败: {exc}") from exc
 
     async def check_safety(self) -> Dict[str, Any]:
         """跑一次安全门阀检查 (不执行动作)。

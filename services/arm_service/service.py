@@ -16,13 +16,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config import Config
+from joint_mover import JointSpaceMover
 from library import ActionLibrary, ActionNotFound, ActionUnit
 from mover import CartesianMover
 from notifier import ArmNotifier
@@ -102,6 +105,7 @@ class ArmService:
             lead_in_ms=self.arm_cfg.lead_in_ms,
             joint_limit=self.arm_cfg.joint_limit.to_config(),
             idle_stop_ms=self.arm_cfg.idle_stop_ms,
+            hand_enabled=self.arm_cfg.hand.enabled,
             on_phase=self._on_phase,
             on_error=self._on_error,
         )
@@ -136,8 +140,21 @@ class ArmService:
         self._started = False
         #: 笛卡尔移动执行器 (POST /v1/move_to)
         self._mover = CartesianMover(self)
-        #: 最近一次查询 robot/status 的臂名 (应答里没有 name 字段, 只能记住)
-        self._status_query_arm = ""
+        #: 关节流移动执行器 —— 本地逆解 + 关节流, 不走控制器逆解
+        self._joint_mover = JointSpaceMover(self)
+        #: 各臂的机型模板 (robot/list 里的 subType)
+        #:
+        #: **它决定入控位姿在哪个坐标系里解释** —— API 说明 28965:
+        #: ``HM5-54-*`` / ``DA5-54-*`` 的位姿在**躯干系**, 末端是该机型
+        #: 数值模型的第 7 关节坐标系, 与 ``robot/status.cartesian``
+        #: (基座系 + 工具) **不是同一个系**; ``NDA-06-*`` 才是基座系法兰。
+        self._arm_sub_types: Dict[str, str] = {}
+        #: 本地运动学 (pinocchio) —— 客户端自己做逆解, 不用控制器的逆解接口
+        #:
+        #: ``{臂名: ArmKinematics}``。懒加载 —— pinocchio 不在时整个功能
+        #: 降级 (但不崩), 控制器的关节流播放等老功能照常。
+        self._kinematics: Dict[str, Any] = {}
+        self._kinematics_lock = threading.Lock()
         #: 后台重连线程 (控制器启动时连不上时用)
         self._reconnect_thread: Optional[threading.Thread] = None
 
@@ -243,6 +260,9 @@ class ArmService:
     def _on_connected(self) -> None:
         """连上控制器: 拉机器人清单以识别左右臂。"""
         self._conn.list_robots()
+        # 机型模板 (``subType``) 只在 ``device/robots`` 里有 ——
+        # ``robot/list`` 不带。它决定入控位姿在哪个系里解释, 必须拿到。
+        self._conn.send_command("device/robots", {})
 
     def _on_reconnected(self) -> None:
         """重连成功后: 重新订阅状态推送 + 重新拉机器人清单。
@@ -374,16 +394,24 @@ class ArmService:
             entry["timestamp_ms"] = int(time.monotonic() * 1000)
             self._column = entry
 
-    def _on_controller_event(self, action: str, response: Dict[str, Any]) -> None:
-        """收到控制器的请求-响应。"""
+    def _on_controller_event(
+        self, action: str, response: Dict[str, Any], meta: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """收到控制器的请求-响应。
+
+        ``meta`` 是发出这个请求时记下的上下文 (见 ``RobotConnection``),
+        用来解决「应答里没有 name 字段, 分不清是哪条臂的」。
+        """
         db = response.get("db")
         if not isinstance(db, (dict, list)):
             db = {}
 
         if action == "robot/list":
             self._handle_robot_list(db)
+        elif action == "device/robots":
+            self._handle_device_robots(db)
         elif action == "robot/status":
-            self._handle_robot_status(db)
+            self._handle_robot_status(db, meta or {})
         elif action == "realtime/getStatus":
             self._handle_realtime_status(db, response)
         elif action == "realtime/startControl":
@@ -411,6 +439,9 @@ class ArmService:
             if isinstance(raw, list):
                 items = raw
 
+        # 原始内容记一条, 排查「机型模板拿不到」时用
+        logger.info("[服务] robot/list 原始: %s", json.dumps(db, ensure_ascii=False)[:2000])
+
         left = ""
         right = ""
         unnamed: List[str] = []
@@ -421,6 +452,12 @@ class ArmService:
             name = str(item.get("name", ""))
             if not name:
                 continue
+            # 记下机型模板 —— 它决定入控位姿在哪个坐标系里解释
+            # (见 API 说明 28965: HM5/DA5 是躯干系, NDA-06 是基座系)
+            sub_type = item.get("subType") or item.get("subtype") or ""
+            if sub_type:
+                self._arm_sub_types[name] = str(sub_type)
+                logger.info("[服务] %s 机型模板 = %s", name, sub_type)
             arm = _arm_of(name)
             if arm == "left" and not left:
                 left = name
@@ -452,15 +489,73 @@ class ArmService:
                 self._query_robot_status(name)
 
     def _query_robot_status(self, name: str) -> None:
-        """查询某臂状态, 并记住是哪条臂 (应答里没有 name 字段)。"""
-        self._status_query_arm = name
-        self._conn.get_robot_status(name)
+        """查询某臂状态。
 
-    def _handle_robot_status(self, db: Any) -> None:
+        **臂名记在请求的 meta 里** —— 应答回来时按消息 id 带回,
+        这样即使应答本身没有 name 字段, 也能确定是哪条臂的数据。
+
+        (之前用 ``self._status_query_arm`` 这个单值槽位, 两条臂的
+        查询会互相覆盖, 导致右臂的槽位里装上左臂的数据。)
+        """
+        self._conn.send_command("robot/status", {"name": name}, meta={"arm": name})
+
+    def _handle_device_robots(self, db: Any) -> None:
+        """处理 ``device/robots`` 应答 —— 取各臂的机型模板。
+
+        **为什么必须拿**: ``robot/list`` 不带 ``subType``, 只有这里有。
+        而机型模板决定**入控位姿在哪个坐标系里解释** (API 说明 28965):
+
+        - ``HM5-54-*`` / ``DA5-54-*``: 位姿在**躯干系**, 末端是该机型
+          数值模型的第 7 关节坐标系 —— 与 ``robot/status.cartesian``
+          (基座系 + 工具偏置) **不是同一个系**, 两套位姿不可互相代入。
+        - ``NDA-06-*``: 位姿在**该臂基座系**, 末端是法兰, 与
+          ``robot/status.cartesian`` 同系同点。
+
+        搞错的话, ``_flange_target`` 算出来的「工具偏置」是垃圾。
+        """
+        items: List[Any] = []
+        if isinstance(db, list):
+            items = db
+        elif isinstance(db, dict):
+            raw = db.get("items")
+            if isinstance(raw, list):
+                items = raw
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", ""))
+            sub_type = str(item.get("subType") or "")
+            if not name or not sub_type:
+                continue
+            self._arm_sub_types[name] = sub_type
+            logger.info("[服务] %s 机型模板 = %s", name, sub_type)
+
+    def _handle_robot_status(
+        self, db: Any, meta: Optional[Dict[str, Any]] = None
+    ) -> None:
         if not isinstance(db, dict):
             return
-        # robot/status 的应答里**没有** name 字段 (实测), 所以用查询时记住的臂名。
-        name = str(db.get("name") or self._status_query_arm)
+        # ---- 这是哪条臂的? ----
+        #
+        # ``robot/status`` 的应答里**没有** name 字段 (实测), 所以必须靠
+        # 「发出去的时候就知道是哪条臂」来关联 —— 见 ``_query_robot_status``:
+        # 请求的 meta 里带着臂名, 应答按消息 id 原样带回来。
+        #
+        # **不要用 ``self._status_query_arm`` 那种单值槽位** —— 那是之前
+        # 的做法, 两条臂的查询会互相覆盖: 后到的应答把先到的顶掉,
+        # 于是右臂的槽位里装上了左臂的数据。现场表现是基座系坐标整个
+        # 翻转 (误差可达 0.88m), 逆解必然失败。
+        name = str((meta or {}).get("arm") or db.get("name") or "")
+        if not name:
+            # 兜底: 实在认不出来就**不写** —— 宁可少一条快照,
+            # 也不能把一条臂的数据写到另一条臂名下。
+            logger.warning(
+                "[服务] robot/status 应答认不出是哪条臂 (meta=%s, db.name=%s), 丢弃",
+                (meta or {}).get("arm"), db.get("name"),
+            )
+            return
+
         # 使能状态要先记下来: 未上使能时入控会被拒 (24077), 播放前要补使能。
         if "enabled" in db and name:
             self._controller.set_arm_enabled(name, bool(db.get("enabled")))
@@ -549,6 +644,19 @@ class ArmService:
     def _handle_start_control(self, db: Any, response: Dict[str, Any]) -> None:
         """入控响应。"""
         # 笛卡尔移动在等这个应答 (它自己判成败并播报), 无论成败都先转给它
+        #
+        # **两条路径都要转** —— 关节流移动 (JointSpaceMover) 也在等入控
+        # 应答, 漏了它就会一直等到超时。
+        if self._joint_mover.busy:
+            self._joint_mover.on_start_control(db, response)
+            if "err" in response:
+                err = response.get("err") or {}
+                logger.warning(
+                    "[服务] 关节流入控失败 (%s): %s", err.get("code", "?"), err.get("message", "")
+                )
+            else:
+                logger.info("[服务] 关节流入控成功")
+            return
         if self._mover.busy:
             self._mover.on_start_control(db, response)
             if "err" in response:
@@ -624,15 +732,22 @@ class ArmService:
         action_name: str,
         speed: float = 1.0,
         loop: bool = False,
+        wait: bool = False,
     ) -> Dict[str, Any]:
-        """下发播放 (单个动作)。立即返回, 实际播放在后台线程进行。"""
-        return self.play_many([action_name], speed=speed, loop=loop)
+        """下发播放 (单个动作)。立即返回, 实际播放在后台线程进行。
+
+        ``wait=True`` 时等播完再返回 (抓取流程要按顺序走)。
+        """
+        return self.play_many(
+            [action_name], speed=speed, loop=loop, wait=wait
+        )
 
     def play_many(
         self,
         action_names: List[str],
         speed: float = 1.0,
         loop: bool = False,
+        wait: bool = False,
     ) -> Dict[str, Any]:
         """下发播放 (动作队列)。立即返回, 实际播放在后台线程进行。
 
@@ -641,6 +756,11 @@ class ArmService:
 
         每个动作播完时重新取一次实测关节角作为下一个动作的起点 ——
         轨迹不落盘起始姿态, 避免把机器人拽到某个固定姿态上去。
+
+        Args:
+            wait: **等播完再返回**。抓取流程要按顺序走 (回准备点 ->
+                  拍照 -> 移到上方点 -> ...), 下一步必须等上一步真的
+                  动完了才能开始。默认 False = 立即返回。
         """
         names = [str(x).strip() for x in (action_names or []) if str(x).strip()]
         if not names:
@@ -690,7 +810,7 @@ class ArmService:
             total_duration,
             " -> ".join(u.label for u in units),
         )
-        return {
+        result = {
             "ok": True,
             "action": units[0].label,
             "key": units[0].key,
@@ -698,6 +818,49 @@ class ArmService:
             "actions": [u.label for u in units],
             "phase": Phase.ENTERING,
             "message": "",
+        }
+
+        # ---- 等播完 (可选) ----
+        #
+        # 抓取流程要**按顺序**走: 回准备点 -> 拍照 -> 移到上方点 -> ...
+        # 下一步必须等上一步真的动完了才能开始, 所以这里提供「等播完」
+        # 的选项。
+        if wait:
+            result.update(self._wait_for_playback(total_duration))
+        return result
+
+    def _wait_for_playback(self, expected_duration: float) -> Dict[str, Any]:
+        """等当前播放队列播完。
+
+        超时时间按动作总时长算, 再留点余量 —— 动作库里的 ``duration``
+        只是轨迹长度, 实际还要加上入控 + 700ms 对齐的时间。
+        """
+        timeout = max(5.0, float(expected_duration) * 2.0 + 5.0)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                thread = self._play_thread
+            if thread is None or not thread.is_alive():
+                # 播完了 (或者一开始就失败了)
+                err = self._controller.last_error
+                if err:
+                    return {
+                        "finished": False,
+                        "error": err,
+                        "phase": self._controller.phase,
+                    }
+                return {
+                    "finished": True,
+                    "error": "",
+                    "phase": Phase.IDLE,
+                }
+            time.sleep(0.05)
+
+        logger.warning("[服务] 等播放超时 (%.1fs)", timeout)
+        return {
+            "finished": False,
+            "error": f"等待动作播完超时 ({timeout:.0f} 秒)",
+            "phase": self._controller.phase,
         }
 
     def _play_loop(self, unit: ActionUnit) -> None:
@@ -932,7 +1095,11 @@ class ArmService:
         # prime_start_frame 冻结出发姿态并算出时间轴 0 时刻的那一帧。
         # 把这一帧推给控制器, 它会启动 700ms 的 S 曲线对齐。
         start_frame = engine.prime_start_frame()
-        self._controller.push_frame(start_frame)
+        self._controller.push_frame(
+            start_frame,
+            engine.evaluate_hand_at(0.0, "left"),
+            engine.evaluate_hand_at(0.0, "right"),
+        )
 
         # 等对齐完成
         deadline = time.time() + 5.0
@@ -1040,7 +1207,11 @@ class ArmService:
         # 这里仍然要对齐 —— 控制器要求第一帧必须贴近实测角, 否则拒收
         # (firstFrameJumpRejected)。对齐期间机器人平滑过渡到新轨迹起点。
         start_frame = engine.prime_start_frame()
-        self._controller.push_frame(start_frame)
+        self._controller.push_frame(
+            start_frame,
+            engine.evaluate_hand_at(0.0, "left"),
+            engine.evaluate_hand_at(0.0, "right"),
+        )
 
         deadline = time.time() + 5.0
         while time.time() < deadline:
@@ -1084,8 +1255,18 @@ class ArmService:
         return state
 
     def _on_frame(self, t: float, state: JointState) -> None:
-        """播放引擎送来一帧目标。"""
-        self._controller.push_frame(state)
+        """播放引擎送来一帧目标。
+
+        手部值**同时**送过去 —— 手部片段不产生关节插值, 但手部指令
+        跟关节指令在同一个 UDP 包里发, 所以得在同一帧里一起给。
+        """
+        engine = self._engine
+        left_hand: Optional[List[int]] = None
+        right_hand: Optional[List[int]] = None
+        if engine is not None:
+            left_hand = engine.evaluate_hand_at(t, "left")
+            right_hand = engine.evaluate_hand_at(t, "right")
+        self._controller.push_frame(state, left_hand, right_hand)
 
     def _on_playback_finished(self) -> None:
         self._broadcast({"type": "finished"})
@@ -1226,7 +1407,168 @@ class ArmService:
             )
         return self.control_enabled
 
+    # ------------------------------------------------------------ 本地运动学
+
+    def move_to(
+        self,
+        arm: str,
+        x: float,
+        y: float,
+        z: float,
+        a: Optional[float] = None,
+        b: Optional[float] = None,
+        c: Optional[float] = None,
+        duration: Optional[float] = None,
+        speak: bool = True,
+    ) -> Dict[str, Any]:
+        """笛卡尔移动的统一入口 —— 按配置选实现。
+
+        ``arm.move_mode``:
+
+        - ``local_ik`` (缺省) —— **本地逆解 + 关节流**。用 pinocchio 在
+          本地把目标位姿解成关节角, 控制器 ``cartesianIkPath="none"``
+          全程不做末端逆解。**这是推荐路径**。
+        - ``controller_ik`` —— 走控制器的 ``cartesianIkPath=analytic``。
+          保留是为了对照/排障, 不是推荐。
+
+        两条路的**控制指令总闸**与**安全门阀**都在各自实现里生效, 这里
+        不重复检查 —— 免得两处逻辑走偏。
+        """
+        mode = (self.arm_cfg.move_mode or "local_ik").strip().lower()
+        if mode == "controller_ik":
+            return self._mover.move_to(
+                arm, x, y, z, a, b, c, duration, speak
+            )
+        return self._joint_mover.move_to(
+            arm, x, y, z, a, b, c, duration, speak
+        )
+
+    def kinematics_for(self, arm: str) -> Any:
+        """拿某条臂的本地运动学对象 (pinocchio)。拿不到返回 ``None``。
+
+        **懒加载** —— 只有真的要本地逆解时才建模型 (建模型要解析 URDF,
+        几百毫秒)。pinocchio 不可用时返回 ``None``, 上层如实报「本地
+        运动学不可用」, 而不是崩掉。
+        """
+        if not arm:
+            return None
+        with self._kinematics_lock:
+            kin = self._kinematics.get(arm)
+            if kin is not None:
+                return kin
+        try:
+            from robot.kinematics import (
+                ArmKinematics,
+                KINEMATICS_AVAILABLE,
+            )
+        except Exception as exc:
+            logger.warning("[运动学] 导入失败: %s", exc)
+            return None
+        if not KINEMATICS_AVAILABLE:
+            logger.warning(
+                "[运动学] pinocchio 不可用 —— 本地逆解已禁用。"
+                "装: pip install numpy pin"
+            )
+            return None
+        try:
+            kin = ArmKinematics(arm)
+        except Exception as exc:
+            logger.error("[运动学] %s 加载 URDF 失败: %s", arm, exc)
+            return None
+        logger.info("[运动学] %s 本地运动学就绪 (URDF=%s)", arm, kin.urdf_path)
+        with self._kinematics_lock:
+            self._kinematics[arm] = kin
+        return kin
+
+    def sync_kinematics_base(self, arm: str, base_frame: Dict[str, float]) -> bool:
+        """用控制器的 ``base_frame`` 同步本地运动学的基座位姿。
+
+        **真机必须做这一步** —— URDF 自带的装法与实测 ``baseFrame`` 不是
+        同一个数, 不同步的话 IK 目标整体偏。
+
+        返回是否同步成功。
+        """
+        kin = self.kinematics_for(arm)
+        if kin is None:
+            return False
+        try:
+            return bool(kin.set_base_from_arm_frame_dict(base_frame))
+        except Exception as exc:
+            logger.warning("[运动学] %s 同步基座失败: %s", arm, exc)
+            return False
+
+    def _target_in_base(self, arm: str, world_pos: Sequence[float]) -> Tuple[float, float, float]:
+        """目标世界系坐标 -> 该臂基座系坐标 (只算位置)。"""
+        from robot.geometry import euler_to_quat, pose_from_xyzabc, world_to_base
+
+        with self._kin_lock:
+            data = dict(self._kin.get(arm) or {})
+        bf = data.get("base_frame")
+        if not bf:
+            return tuple(world_pos)  # type: ignore[return-value]
+        base = pose_from_xyzabc(bf)
+        base_q = euler_to_quat(float(bf.get("a", 0.0)), float(bf.get("b", 0.0)),
+                               float(bf.get("c", 0.0)))
+        rel = world_to_base(base[0], base_q, tuple(world_pos), (1.0, 0.0, 0.0, 0.0))
+        return tuple(rel[0])  # type: ignore[return-value]
+
     # ------------------------------------------------------------ 运动学
+
+    @staticmethod
+    def _detect_crossed_arms(arms: Dict[str, Dict[str, Any]]) -> str:
+        """检查各臂的运动学数据有没有串台。返回问题描述 (空串 = 正常)。
+
+        **背景**: ``_kin`` 按臂名分槽存数据。曾经有个 bug 是用单个
+        变量 ``_status_query_arm`` 记住「这次查的是哪条臂」, 而
+        ``robot/status`` 的应答里又没有 name 字段 —— 两条臂的应答
+        互相覆盖, 右臂的槽位里装上了左臂的 TCP 和基座。
+
+        **现场表现**: 基座系目标坐标整个翻转 (差 0.88m), 逆解失败,
+        控制器报 ``numericalIkFailed`` 或直接安全停机。
+
+        **判据**: 两条臂的 TCP 若几乎重合 —— 说明其中一个槽位里装的是
+        对方的数据。两条臂分居基座两侧, 正常情况下它们的 TCP 不该
+        重合 (除非机械臂真的摆到了同一处, 那极罕见)。
+
+        另外还要看基座: 两条臂的 ``base_frame`` 正常应该**不同**
+        (左右两侧, y 和绕 z 角都不一样)。如果两条臂的基座**完全
+        一样**, 那更说明其中一条的数据是抄来的。
+        """
+        names = sorted(arms.keys())
+        if len(names) < 2:
+            return ""
+
+        def _vec(d: Dict[str, Any], key: str):
+            v = d.get(key)
+            if not isinstance(v, dict):
+                return None
+            try:
+                return tuple(float(v.get(k, 0.0) or 0.0) for k in ("x", "y", "z"))
+            except (TypeError, ValueError):
+                return None
+
+        problems: List[str] = []
+        for i, n1 in enumerate(names):
+            for n2 in names[i + 1:]:
+                d1, d2 = arms[n1], arms[n2]
+                b1, b2 = _vec(d1, "base_frame"), _vec(d2, "base_frame")
+                c1, c2 = _vec(d1, "cartesian"), _vec(d2, "cartesian")
+                if not (b1 and b2 and c1 and c2):
+                    continue
+                # 基座差异 (它们在基座两侧, 应该差得开)
+                base_gap = math.sqrt(sum((a - b) ** 2 for a, b in zip(b1, b2)))
+                # TCP 差异
+                tcp_gap = math.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2)))
+                if tcp_gap < 0.05:
+                    problems.append(
+                        f"{n1} 与 {n2} 的 TCP 只差 {tcp_gap:.3f}m —— 位姿数据疑似串台"
+                    )
+                elif base_gap < 1e-6:
+                    problems.append(
+                        f"{n1} 与 {n2} 的基座位姿完全相同 (差 {base_gap:.4f}m) —— "
+                        f"其中一条的数据是抄来的"
+                    )
+        return "; ".join(problems)
 
     def kinematics(self) -> Dict[str, Any]:
         """运动学快照 —— 手眼标定要用的位姿数据。
@@ -1281,6 +1623,22 @@ class ArmService:
                     "静态外参不成立: " + ", ".join(derived)
                 )
 
+            # ---- 交叉校验: 别臂的数据串进来了 ----
+            #
+            # ``_kin`` 是按臂名分槽的。如果某条臂的槽位里装的其实是
+            # **另一条臂**的数据 (之前 ``_status_query_arm`` 单值槽位的
+            # 竞态就会造成这个), 那么基座系换算会整个算错, 逆解必然失败。
+            #
+            # 判据: 两条臂的 ``base_frame`` 应当**明显不同** (它们在基座
+            # 两侧), 而它们的 TCP 若几乎重合, 就说明数据串了。
+            crossed = self._detect_crossed_arms(arms)
+            if crossed:
+                notes.append(
+                    "[数据串帧] " + crossed
+                    + " —— 这条臂的位姿数据可能来自另一条臂, "
+                    "用它算出来的目标点是错的, 不要用于运动"
+                )
+
         if column is None:
             notes.append("没有升降柱状态 (控制器上可能没有配升降柱)")
 
@@ -1325,6 +1683,8 @@ class ArmService:
             "lifting_column": column,
             "head_frame": head_frame,
             "head_frame_kind": head_frame_kind,
+            #: 各臂的机型模板 —— 决定入控位姿在哪个系解释
+            "arm_sub_types": dict(self._arm_sub_types),
             "controller_connected": connected,
             #: 数据是否是新鲜的 (False = 陈旧, 不能用于标定)
             "stale": stale,
@@ -1355,8 +1715,12 @@ class ArmService:
                 for name, data in self._kin.items()
             }
 
-        for name in self._controller.active_arms():
-            self._conn.get_robot_status(name)
+        # **必须走 _query_robot_status** —— 它把臂名放进请求的 meta,
+        # 应答回来时靠 id 关联。直接调 ``get_robot_status`` 会丢掉这个
+        # 关联, 应答就分不清是哪条臂的 (然后两条臂互相覆盖)。
+        arms = self._controller.active_arms()
+        for name in arms:
+            self._query_robot_status(name)
 
         # 升降柱
         column = None
@@ -1372,6 +1736,11 @@ class ArmService:
         # 等应答回来 (在读线程里处理)
         #
         # **判据是「时间戳变了」, 不是「有数据」** —— 后者会立刻返回旧快照。
+        #
+        # **而且要等**所有**要查的臂都更新了** —— 之前用的是
+        # ``any(...)`` (任意一条臂更新就返回), 于是「右臂拿到的是
+        # 上一次陈旧的数据」这种问题完全查不出来。抓取要的就是
+        # 每一条臂**当下**的位姿。
         deadline = time.time() + 0.6
         while time.time() < deadline:
             with self._kin_lock:
@@ -1379,8 +1748,8 @@ class ArmService:
                     name: int(data.get("timestamp_ms") or 0)
                     for name, data in self._kin.items()
                 }
-            if any(
-                ts > before.get(name, 0) for name, ts in now.items()
+            if all(
+                now.get(name, 0) > before.get(name, 0) for name in arms
             ):
                 break
             time.sleep(0.02)

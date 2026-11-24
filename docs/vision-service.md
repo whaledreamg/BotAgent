@@ -429,7 +429,7 @@ SDK 给的是**标称内参**, 实测差 1~2% (1.5 m 处就是 15 mm)。标定�
 | GET | `/v1/status` | 最近一次检测摘要 + 聚合 summary |
 | POST | `/v1/detect` | 触发一次检测, 返回全部目标 (**结果会广播给 WS 订阅者**) |
 | GET | `/v1/objects` | 取最近一次检测结果 (缓存) |
-| GET | `/v1/objects/{name}` | 按类别名取目标 (Agent 用这个) |
+| GET | `/v1/objects/{name}` | 按类别名取目标 (Agent 用这个); `?fresh=true` 强制重新拍 |
 | GET | `/v1/summary` | 按类别聚合的摘要 |
 | GET | `/v1/frames` | 一次给出所有坐标系下的同一个点 (调试标定用) |
 | GET | `/v1/calibration` | 标定状态 (内参标没标 / 外参配没配 / 有没有坑) |
@@ -602,6 +602,24 @@ recognition:
 
 `/v1/objects/{name}` 支持中文名 (「瓶子」-> `bottle`), 映射表在
 `class_names.py`。
+
+### `fresh=true` —— 强制重新拍
+
+`/v1/objects/{name}` **默认走缓存**: 缓存里有这个类别就直接返回, 不重新拍。
+这对「看看刚才看到了什么」很省事, 但对「物体**现在**在哪」是错的 ——
+物体被挪动了服务也不知道, 报出来的还是老坐标。
+
+加 `?fresh=true` 就强制重新拍一张:
+
+```bash
+# 缓存里的 (可能是几分钟前的)
+curl -s "http://127.0.0.1:8803/v1/objects/瓶子?frame=world"
+
+# 强制重新拍
+curl -s "http://127.0.0.1:8803/v1/objects/瓶子?frame=world&fresh=true"
+```
+
+**Agent 的抓取和找物体都用 `fresh=true`** —— 这两类问的都是「此刻在哪」。
 
 ---
 

@@ -308,7 +308,7 @@ def _refine(
                 continue
             rvec, tvec = _rodrigues(t_cam_board[:3, :3]), t_cam_board[:3, 3]
             proj = _project(s.obj_points, rvec, tvec, intr, dist)
-            out.extend((proj - s.img_points).ravel().tolist())
+            out.extend((proj - _pts2(s.img_points)).ravel().tolist())
         return np.array(out, dtype=np.float64) if out else np.zeros(1)
 
     r0 = residuals(params)
@@ -458,7 +458,7 @@ def solve_joint(
             rvec = _rodrigues(t_cb[:3, :3])
             tvec = t_cb[:3, 3]
             proj = _project(s.obj_points, rvec, tvec, intr, dist)
-            out.extend((proj - s.img_points).ravel().tolist())
+            out.extend((proj - _pts2(s.img_points)).ravel().tolist())
         return np.array(out, dtype=np.float64) if out else np.zeros(1)
 
     p = np.hstack([
@@ -607,6 +607,17 @@ def _rodrigues(rot: np.ndarray) -> np.ndarray:
 
     rvec, _ = cv2.Rodrigues(np.asarray(rot, dtype=np.float64))
     return np.asarray(rvec, dtype=np.float64).ravel()
+
+
+def _pts2(x: Any) -> np.ndarray:
+    """点集 -> (N, 2)。
+
+    ``PoseSample.img_points`` 的形状取决于 OpenCV 版本: 可能是 (N, 2)
+    也可能是 (N, 1, 2)。**不摊平的话**, ``proj - img_points`` 会被
+    NumPy 广播成 (N, N, 2) —— 残差数量翻 N 倍, 而且不报错, 只会让
+    标定结果悄悄偏掉。所以这里统一摊成 2 维。
+    """
+    return np.asarray(x, dtype=np.float64).reshape(-1, 2)
 
 
 def _project(
