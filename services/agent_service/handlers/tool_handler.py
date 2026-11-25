@@ -784,7 +784,7 @@ class ToolHandler(Handler):
         return "ok", reply + "。"
 
     async def _execute_grasp_object(self, args: Dict[str, Any]) -> Tuple[str, str]:
-        """抓取: 跑完 5 步流程 (准备点->拍照->上方点->抓取点->安全点)。
+        """抓取: 按流程定义跑一遍 (默认: 准备点->拍照->上方点->抓取点->安全点)。
 
         结果文案 (含失败原因) 直接念给用户。
 
@@ -804,7 +804,8 @@ class ToolHandler(Handler):
             arm_client=self.arm_client,
         )
         skill_args: Dict[str, Any] = {"target": target}
-        for key in ("arm", "approach_distance", "duration"):
+        # ``flow`` 让用户可以指定别的流程 (configs/flows/ 里定义的)
+        for key in ("arm", "approach_distance", "duration", "flow"):
             if args.get(key) not in (None, ""):
                 skill_args[key] = args[key]
 

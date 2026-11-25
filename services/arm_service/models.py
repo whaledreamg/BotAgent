@@ -126,6 +126,21 @@ class MoveToRequest(BaseModel):
     speak: bool = Field(True, description="失败时是否由服务端语音播报 (调用方自己会念就关掉)")
 
 
+class MoveJointsRequest(BaseModel):
+    """把某条臂**直接**移到给定的关节角 (不走逆解)。
+
+    给 ``arm`` + ``pose`` 的流程片段用 —— 目标关节角是配置里写死的,
+    没必要再解一遍。
+    """
+
+    arm: str = Field("right", description="left / right, 或控制器里的真实臂名")
+    joints: List[float] = Field(
+        ..., description="7 个目标关节角 (rad), 按控制器上报的顺序"
+    )
+    duration: Optional[float] = Field(None, description="运动时长 (秒), 默认取配置")
+    speak: bool = Field(True, description="失败时是否由服务端语音播报")
+
+
 class MoveToResponse(BaseModel):
     """移动结果。除下面的固定字段外还带规划与核对明细 (extra)。"""
 

@@ -27,7 +27,7 @@ import contextlib
 import logging
 import os
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 now_dir = os.getcwd()
 if now_dir not in sys.path:
@@ -44,6 +44,7 @@ from models import (  # noqa: E402
     ActionListResponse,
     HealthResponse,
     KinematicsResponse,
+    MoveJointsRequest,
     MoveToRequest,
     MoveToResponse,
     PlayRequest,
@@ -98,14 +99,91 @@ async def health() -> Dict[str, Any]:
     return _svc().health()
 
 
+@app.get("/v1/flows")
+async def list_flows() -> Dict[str, Any]:
+    """列出所有流程。
+
+    流程定义在 ``configs/flows/*.yaml`` —— 每个文件一条流程, 文件名即
+    流程名。抓取流程不再是写死的 5 步, 而是这里声明的步骤列表。
+
+    **热重载**: 每次调用都会比对目录指纹 (mtime + 大小) —— yaml 改了
+    就重读, 没改就用缓存。所以改完 yaml 直接调这个接口就能看到新版本。
+    """
+    svc = _svc()
+    flows = svc.load_flows()
+    items = []
+    for name in sorted(flows):
+        flow = flows[name]
+        items.append({
+            "name": flow.name,
+            "description": flow.description,
+            "step_count": len(flow.steps),
+            "steps": flow.step_ids,
+            "source": flow.source,
+        })
+    return {"count": len(items), "flows": items}
+
+
+@app.post("/v1/flows/reload")
+async def reload_flows() -> Dict[str, Any]:
+    """**强制重载**流程定义 (忽略缓存)。
+
+    通常**不用**手动调 —— 每次 ``GET /v1/flows`` 和每次抓取都会自动
+    比对目录指纹, 改了 yaml 就自动生效。
+
+    什么时候需要手动调:
+
+    - yaml 的 mtime 和大小都没变 (同秒内改的), 自动重载可能漏掉
+    - 想确认当前用的是哪一版
+    """
+    svc = _svc()
+    flows = svc.load_flows(force=True)
+    return {
+        "ok": True,
+        "count": len(flows),
+        "flows": sorted(flows),
+        "signature": [list(item) for item in svc.flows_signature()],
+    }
+
+
+@app.get("/v1/flows/{name}")
+async def get_flow(name: str) -> Dict[str, Any]:
+    """拿一条流程的完整定义 (含每一步的参数)。
+
+    ``defaults`` 是从 ``configs/arm.yaml`` 来的兜底值 —— 步骤里没写
+    ``action`` / ``duration`` 时用它们。
+    """
+    svc = _svc()
+    flow = svc.get_flow(name)
+    if flow is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"没有流程 {name!r} (可用: {', '.join(svc.flow_names())})",
+        )
+    cfg = svc.arm_cfg
+    return {
+        **flow.to_dict(),
+        "approach_distance": cfg.flow.above_distance,
+        "defaults": {
+            "close_action": cfg.flow.close_action,
+            "open_action": cfg.flow.open_action,
+            "move_duration": cfg.grasp.duration,
+        },
+    }
+
+
 @app.get("/v1/flow")
 async def flow_config() -> Dict[str, Any]:
-    """抓取流程 (5 步) 的配置。
+    """默认流程 (``grasp``) 的配置。
 
-    agent 的 ``vision.grasp`` skill 要按顺序走这几步, 每一步用哪个
-    动作、多高、多长 —— 这些都在 ``configs/arm.yaml`` 的
-    ``arm.grasp.flow`` 里。这个接口把它暴露出来, 让 skill 不用自己
-    再读一遍 yaml (两处配置不同步是很麻烦的事)。
+    **保留这个旧端点** —— 早期客户端直接读这里的扁平字段
+    (``above_distance`` / ``grasp_offset_*`` / ``close_action`` …)。
+
+    新代码建议用 ``GET /v1/flows/{name}`` —— 那份带**完整的步骤定义**,
+    而这里只有扁平参数 (没有步骤列表, 也就没法自定义流程)。
+
+    返回的 ``flow`` 字段里带默认流程的步骤定义, 这样老客户端一次调用
+    也能拿到, 不用多发一次请求。
     """
     svc = _svc()
     f = svc.arm_cfg.flow
@@ -120,6 +198,9 @@ async def flow_config() -> Dict[str, Any]:
         "open_action": f.open_action,
         "above_duration": f.above_duration,
         "grasp_duration": f.grasp_duration,
+        # 新增: 默认流程的完整定义
+        "flow_name": svc.default_flow().name,
+        "flow": svc.default_flow().to_dict(),
     }
 
 
@@ -180,6 +261,22 @@ async def move_to(req: MoveToRequest) -> Dict[str, Any]:
     )
 
 
+@app.post("/v1/move_joints", response_model=MoveToResponse)
+async def move_joints(req: MoveJointsRequest) -> Dict[str, Any]:
+    """把某条臂**直接**移到给定的关节角 (同步, 走完才返回)。
+
+    **不走逆解** —— 目标关节角是调用方直接给的。给流程里的
+    ``arm`` + ``pose`` 片段用 (目标关节角写死在 YAML 里, 没必要再解)。
+
+    流程: 安全门阀 -> 关节流下发 -> 读回实测角核对。
+    HTTP 状态码恒为 200, 成败看 ``ok``。
+    """
+    svc = _svc()
+    return await await_run(
+        svc.move_joints, req.arm, req.joints, req.duration, req.speak,
+    )
+
+
 @app.post("/v1/stop", response_model=StopResponse)
 async def stop() -> Dict[str, Any]:
     return _svc().stop()
@@ -225,9 +322,227 @@ async def set_control_enabled(req: ControlEnabledRequest) -> Dict[str, Any]:
     }
 
 
+class HandRequest(BaseModel):
+    """灵巧手指令。"""
+
+    #: 只动哪只手; 省略 = 两只都动
+    side: Optional[str] = None
+    #: 手位 (6 个 0~1000); 省略 = 用预设
+    positions: Optional[List[int]] = None
+    #: 预设手势名 (一把抓 / 释放 / 半抓 / 两指捏 / 点赞 / 指点)
+    preset: Optional[str] = None
+
+
+class SequenceRequest(BaseModel):
+    """动作序列合成。"""
+
+    #: 要播的动作名, 按执行顺序
+    actions: List[str] = []
+    #: 相邻动作之间的停顿 (秒)
+    gap: float = 0.0
+    #: 等播完再返回
+    wait: bool = True
+
+
+class GraspSequenceRequest(BaseModel):
+    """识别之后合成抓取动作序列。"""
+
+    #: 目标位置 (世界系, 米) —— 识别服务给的
+    x: float
+    y: float
+    z: float
+    #: 用哪条臂
+    side: str = "right"
+    #: 流程名 (configs/flows/ 里的)
+    flow: str = "grasp"
+    #: 上方点的高度 (米); 不给用配置值
+    approach_distance: Optional[float] = None
+    #: 统一覆盖所有移动步的时长 (秒)
+    duration: Optional[float] = None
+    #: 只合成不执行
+    plan_only: bool = False
+    #: 等播完再返回
+    wait: bool = True
+
+
+@app.post("/v1/sequence", response_model=PlayResponse)
+async def play_sequence(req: SequenceRequest) -> Dict[str, Any]:
+    """把几个动作合成**一条**时间轴, 一次入控播完。
+
+    夹爪片段不在这条时间轴上直接下发 (实时指令包里没有手部字段),
+    而是记成时间点, 播放到那个时刻再走 ``rs485/*`` 透传。
+
+    ```bash
+    curl -X POST localhost:8802/v1/sequence \\
+      -d '{"actions": ["准备点", "闭合夹爪", "安全点"]}'
+    ```
+    """
+    svc = _svc()
+    if not req.actions:
+        raise HTTPException(status_code=400, detail="没指定动作")
+    try:
+        if req.wait:
+            return await await_run(
+                lambda: svc.play_sequence(
+                    req.actions, wait=True, gap=req.gap
+                )
+            )
+        return svc.play_sequence(req.actions, wait=False, gap=req.gap)
+    except ActionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ControllerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/grasp_sequence")
+async def grasp_sequence(req: GraspSequenceRequest) -> Dict[str, Any]:
+    """识别之后, 把流程合成成一条动作序列并执行。
+
+    **顺序**: 目标位置由调用方 (agent 侧的视觉 skill) 先算好传进来 ——
+    服务这边只负责「合成 + 执行」。
+
+    流程: 流程定义 -> 步骤清单 (移动步用**本地 pinocchio 逆解**算成关节角)
+    -> 一条时间轴 (关节片段) + 若干夹爪时间点。
+
+    ```bash
+    curl -X POST localhost:8802/v1/grasp_sequence \\
+      -d '{"x": 0.55, "y": -0.30, "z": -0.15, "side": "right"}'
+    ```
+    """
+    svc = _svc()
+    try:
+        composed, ik_results, arm, arm_side = svc.plan_grasp_sequence(
+            req.flow, (req.x, req.y, req.z),
+            side=req.side,
+            approach_distance=req.approach_distance,
+            duration=req.duration,
+        )
+    except ControllerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    planned = {
+        "ok": True,
+        "sequence": composed.to_dict(),
+        "ik": ik_results,
+        "arm": arm,
+        "side": arm_side,
+    }
+
+    if req.plan_only:
+        return planned
+
+    try:
+        if req.wait:
+            svc._play_composed(composed)
+            planned["finished"] = True
+        else:
+            svc._enqueue_sequence(composed)
+        return planned
+    except ControllerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/v1/hand/status")
+async def hand_status() -> Dict[str, Any]:
+    """灵巧手状态。
+
+    灵巧手走控制器的 ``rs485/*`` 透传 (Modbus RTU), **不在 UDP 关节包里**
+    —— 控制器实时指令包没有 ``hand`` 字段 (见 API 说明 §21.9)。
+    """
+    return _svc().hand_status()
+
+
+@app.post("/v1/hand/connect")
+async def hand_connect() -> Dict[str, Any]:
+    """连接灵巧手 (解析 rs485 通道 + 初始化串口)。
+
+    **幂等** —— 已经连上就直接返回状态。
+    """
+    svc = _svc()
+    try:
+        # 走控制器要两三次往返, 放线程池
+        return await await_run(svc.connect_hand, True)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/hand/open")
+async def hand_open(req: HandRequest) -> Dict[str, Any]:
+    """张开手 (``configs/arm.yaml`` 的 ``arm.hand.open_pose``)。"""
+    svc = _svc()
+    try:
+        ok = await await_run(svc.send_hand_open, req.side)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": bool(ok), "action": "open", "side": req.side}
+
+
+@app.post("/v1/hand/close")
+async def hand_close(req: HandRequest) -> Dict[str, Any]:
+    """握紧手 (``configs/arm.yaml`` 的 ``arm.hand.close_pose``)。"""
+    svc = _svc()
+    try:
+        ok = await await_run(svc.send_hand_close, req.side)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": bool(ok), "action": "close", "side": req.side}
+
+
+@app.post("/v1/hand/preset")
+async def hand_preset(req: HandRequest) -> Dict[str, Any]:
+    """下发一个预设手势。
+
+    ```bash
+    curl -X POST localhost:8802/v1/hand/preset -d '{"preset": "一把抓"}'
+    ```
+    """
+    if not req.preset:
+        raise HTTPException(status_code=400, detail="没指定 preset")
+    svc = _svc()
+    try:
+        ok = await await_run(svc.send_hand_preset, req.preset, req.side)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": bool(ok), "action": "preset", "preset": req.preset,
+            "side": req.side}
+
+
 @app.get("/v1/status", response_model=StatusResponse)
 async def status() -> Dict[str, Any]:
     return _svc().status()
+
+
+@app.post("/v1/stream_trace")
+async def stream_trace(
+    enable: bool = False, reset: bool = False
+) -> Dict[str, Any]:
+    """开关/读取关节流诊断记录。
+
+    「轨迹抖动」这类问题要分清是**上游算出的目标在抖**还是**下发环节
+    在抖** —— 这个接口记下每一帧实际下发的关节目标, 可以直接对比。
+
+    ```bash
+    curl -X POST 'localhost:8802/v1/stream_trace?enable=true&reset=true'
+    # ... 跑一次抓取 ...
+    curl localhost:8802/v1/stream_trace
+    ```
+    """
+    svc = _svc()
+    with svc._lock:
+        if reset:
+            svc._stream_trace = []
+        svc._stream_trace_on = enable
+        count = len(svc._stream_trace)
+    return {"ok": True, "enabled": enable, "frames": count}
+
+
+@app.get("/v1/stream_trace")
+async def get_stream_trace() -> Dict[str, Any]:
+    """取回记录的关节流。"""
+    svc = _svc()
+    with svc._lock:
+        frames = list(svc._stream_trace)
+    return {"ok": True, "count": len(frames), "frames": frames}
 
 
 @app.get("/v1/safety", response_model=SafetyResponse)

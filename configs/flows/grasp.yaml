@@ -1,0 +1,128 @@
+# 标准抓取流程
+#
+# 这条流程等价于原来写死在 vision_grasp.py 里的那套固定 5 步, 只是
+# 搬到了这里 —— **行为完全不变**, 但以后改流程不用改代码了。
+#
+# 格式与可扩展范围见同目录的 README.md。
+
+name: grasp
+# 描述里带冒号, 必须加引号 —— 否则 YAML 会把「标准抓取: 回准备点」
+# 解析成「标准抓取」+ 一个嵌套映射, 报 "mapping values are not allowed here"
+description: "标准抓取: 回准备点 -> 拍照识别 -> 移到上方点 -> 移到抓取点 -> 闭合夹爪 -> 回安全点"
+
+# 某一步失败时的收尾动作 —— 先播它, 再报失败。
+#
+# 为什么要它: 手停在半空是不能就这么报失败的。默认回「安全点」。
+# 留空 = 失败后不收尾 (直接报失败)。
+recovery_action: 安全点
+recovery_label: 回安全点
+
+steps:
+  # ---- 第 1 段: 回准备点 ----
+  #
+  # 拍照前把手臂摆到固定姿态, 保证每次拍的视角一致 (标定才对得上)。
+  # action 指的是动作库里的文件名 (services/arm_service/data/*.json)。
+  - id: ready
+    type: arm
+    action: 准备点
+    label: 回准备点
+
+  # ---- 第 2 段: 拍照识别 ----
+  #
+  # 这一段会产出「识别结果」。后面的 target 片段从它取值。
+  #
+  # duration 让这一段在时间轴上真的占这么久 —— 识别期间机械臂保持不动。
+  #
+  # ---- orientation: 拍照时手的姿态 ----
+  #
+  # 这规定的是**拍照时手是什么姿态**, 也就等于**从那个姿态出发去抓**时
+  # 的抓取姿态 —— **两者必须一致**。
+  #
+  # 为什么: 抓取流程第 1 步播「准备点」, 然后拍照, 然后从那个姿态抓。
+  # 如果抓取姿态跟拍照姿态不一致, 机械臂得先转一个姿态, 而那个姿态在
+  # 目标点很可能**根本不可达** —— 历史上每次抓瓶子都报 unreachable 就是
+  # 这个原因 (示教姿态跟准备点差了 107 度)。
+  #
+  # 这两个值来自「准备点」动作的 TCP 姿态 (从 准备点.json 的关节角做 FK
+  # 算出来, 基座用控制器实测的 baseFrame)。**换准备点动作后要重新算**:
+  #   python3 services/arm_service/tools/check_grasp_reachable.py --scan
+  #
+  # 写成字典形式 (a/b/c 三行或行内) —— 别写成 YAML 的集合语法
+  # ``right: {1.6683, 0.6821, 1.9317}``, 那会被解析成
+  # ``{1.6683: null, ...}`` 静默丢掉姿态。
+  - id: detect
+    type: detect
+    duration: 1.5
+    label: 拍照识别
+    orientation:
+      right:
+        a: 1.6683
+        b: 0.6821
+        c: 1.9317
+      left:
+        a: -1.6900
+        b: 0.5548
+        c: -1.9033
+
+  # ---- 具名点声明 (纯声明, 不产生运动) ----
+  #
+  # object = 这次识别到的那个东西。**不假设它是什么类型** ——
+  # 物体名由 skill 的 target 参数 (用户说「抓瓶子」) 决定。
+  - id: object
+    type: target
+    source: detect
+    label: 目标物体
+
+  # above_point = object 正上方
+  #
+  # distance: approach 表示「上方点的高度」取流程级的 approach_distance
+  # (即 configs/arm.yaml 的 grasp.flow.above_distance) —— 这样调用参数
+  # approach_distance 能覆盖它, 不用把高度写死在 YAML 里。
+  - id: above_point
+    type: target
+    base: object
+    distance: approach
+    offset:
+      x: -0.1
+      y: -0.07
+      z: 0.0
+    label: 目标上方
+
+  # ---- 第 3 段: 移到上方点 ----
+  #
+  # point 引用上面声明的具名点 -> 走本地逆解到那个点。
+  # offset 在具名点基础上再偏移, 可分轴 (米) —— 用来补偿
+  # 「物体中心 ≠ 实际抓握点」。
+  - id: above
+    type: arm
+    point: above_point
+    duration: 3.0
+    label: 移到上方点
+
+  # ---- 第 4 段: 移到抓取点 ----
+  - id: grasp
+    type: arm
+    point: object
+    offset:
+      x: -0.1
+      y: -0.07
+      z: -0.06
+    duration: 2.0
+    label: 移到抓取点
+
+  # ---- 第 4 段的后半: 闭夹爪 ----
+  #
+  # type: hand 的终点三选一:
+  #   action: 动作库里的动作名 (这里用动作库, 时长自动跟动作走)
+  #   pose:   6 个 0~1000 的手位 (纯 pose 必须再给 direction)
+  #   preset: 手势名 (如「一把抓」)
+  - id: close
+    type: hand
+    action: 闭合夹爪
+    label: 闭合夹爪
+
+  # ---- 第 5 段: 回安全点 ----
+  - id: safe
+    type: arm
+    action: 安全点
+    label: 回安全点

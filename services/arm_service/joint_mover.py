@@ -150,6 +150,223 @@ class JointSpaceMover:
 
     # ------------------------------------------------------------ 执行
 
+    def move_joints(
+        self,
+        arm: str,
+        joints: Sequence[float],
+        duration: Optional[float] = None,
+        speak: bool = True,
+    ) -> Dict[str, Any]:
+        """把某条臂**直接**移到给定的关节角。**阻塞到走完**。
+
+        与 :meth:`move_to` 的区别: 这里**不走逆解** —— 目标关节角是
+        调用方直接给的 (``arm`` + ``pose`` 片段)。
+
+        **控制指令总闸** 关着时: 只算不动 (``ok=false, code="disabled"``),
+        但仍会返回算好的目标关节角。
+        """
+        if not self._svc.control_enabled:
+            logger.warning("[关节流移动] 控制指令总闸已关闭: 只算位置, 不下发指令")
+            return self._reject(
+                "disabled",
+                "机械臂控制已关闭，只计算了位置，机械臂没有动",
+                stage="gate", speak=False,
+                extra={
+                    "target_joints": [float(v) for v in joints],
+                    "planned_only": True,
+                },
+            )
+
+        values = [float(v) for v in (joints or [])]
+        if len(values) != 7:
+            return self._reject(
+                "bad_param", f"关节角必须正好 7 个 (给了 {len(values)} 个)",
+                speak=False,
+            )
+        if not all(math.isfinite(v) for v in values):
+            return self._reject("bad_param", "关节角不是有限数", speak=False)
+
+        grasp = self._svc.arm_cfg.grasp
+        dur = float(duration) if duration else float(grasp.duration)
+        if not (MIN_DURATION <= dur <= MAX_DURATION):
+            return self._reject("bad_param", f"运动时长 {dur} 秒不合法", speak=False)
+
+        if not self._lock.acquire(blocking=False):
+            return self._reject("busy", "机械臂正在执行上一个移动", speak=True)
+        try:
+            self._abort.clear()
+            self._speak_enabled = bool(speak)
+            return self._run_joints(arm, values, dur)
+        finally:
+            self._lock.release()
+
+    def _run_joints(
+        self,
+        arm: str,
+        q_target: List[float],
+        duration: float,
+    ) -> Dict[str, Any]:
+        """按给定的关节角走一遍 (不做逆解)。"""
+        svc = self._svc
+        ctl = svc._controller
+        conn = svc._conn
+
+        t = svc._play_thread
+        if t is not None and t.is_alive():
+            return self._reject("busy", "机械臂正在播放动作，请先停止", speak=True)
+
+        # ---- 1. 安全门阀 ----
+        report = svc.check_safety()
+        if not report.ok:
+            logger.warning("[关节流移动] 门阀拒绝: %s", report.reason)
+            if self._speak_enabled:
+                svc._speak_reject(report)
+            return self._reject(
+                report.code or "safety", report.reason, stage="safety", speak=False
+            )
+
+        # ---- 2. 选臂 ----
+        name, side = self._resolve_arm(arm)
+        if not name:
+            return self._reject("no_arm", f"找不到机械臂 {arm!r}", speak=True)
+
+        # ---- 3. 运动学快照 (要实测角当起点) ----
+        snap = svc.refresh_kinematics()
+        if snap.get("stale") or not snap.get("ok"):
+            return self._reject(
+                "stale", "拿不到最新的机械臂位姿，不能移动", stage="plan", speak=True
+            )
+        data = (snap.get("arms") or {}).get(name) or {}
+        joints_now = data.get("joints")
+        if not joints_now or len(joints_now) < 7:
+            return self._reject(
+                "no_joints", f"{name} 没有实测关节角", stage="plan", speak=True
+            )
+
+        q_start = [float(v) for v in joints_now[:7]]
+        info: Dict[str, Any] = {
+            "arm": name,
+            "side": side,
+            "duration": duration,
+            "joints_before": [round(v, 5) for v in q_start],
+            "joints_target": [round(v, 5) for v in q_target],
+            #: 目标关节角是直接给的, 没有逆解环节
+            "ik_mode": "explicit_joints",
+        }
+        logger.info(
+            "[关节流移动] %s 直接移到关节角 %s (时长 %.1fs)",
+            name, [round(v, 4) for v in q_target], duration,
+        )
+
+        # ---- 4. 确保使能 ----
+        if name in ctl.disabled_arms():
+            ctl.enable_arms()
+            deadline = time.time() + 3.0
+            while time.time() < deadline and name in ctl.disabled_arms():
+                time.sleep(0.05)
+            if name in ctl.disabled_arms():
+                return self._reject(
+                    "enable_failed", "机械臂上使能失败", stage="plan",
+                    speak=True, extra=info,
+                )
+
+        # ---- 5. 入控 (关节流, 不带末端逆解) ----
+        conn.get_realtime_status()
+        time.sleep(0.3)
+
+        entered = False
+        streamer: Optional[JointStreamer] = None
+        try:
+            ctl.clear_failure()
+            ctl._set_phase(Phase.ENTERING, "正在进入关节控制")
+            self._start_event.clear()
+            self._start_result = {}
+
+            streamer = JointStreamer(
+                port=ctl.streamer_port,
+                frequency=ctl.streamer_frequency,
+            )
+            streamer.set_host(conn.host or "127.0.0.1")
+            streamer.set_target(name, q_start)
+            streamer.start()
+
+            cfg = ctl.joint_control_config()
+            cmd_id = conn.start_control(cfg, [name])
+            if cmd_id < 0:
+                return self._reject(
+                    "send_failed", "发送入控命令失败", stage="enter",
+                    speak=True, extra=info,
+                )
+            entered = True
+
+            if not self._start_event.wait(START_TIMEOUT):
+                return self._reject(
+                    "start_timeout", "机械臂入控超时", stage="enter",
+                    speak=True, extra=info,
+                )
+            res = self._start_result
+            if not res.get("ok"):
+                from mover import translate_control_error
+                text = translate_control_error(
+                    res.get("code"), res.get("message", "")
+                )
+                logger.warning("[关节流移动] 入控失败 (%s): %s",
+                               res.get("code"), res.get("message"))
+                info["controller_error"] = {
+                    "code": res.get("code"), "message": res.get("message"),
+                }
+                return self._reject(
+                    "enter_failed", text, stage="enter", speak=True, extra=info,
+                )
+
+            # ---- 6. 关节空间插值下发 ----
+            ctl._set_phase(Phase.PLAYING, "正在移动到目标关节角")
+            abort_msg = self._stream_joint_trajectory(
+                streamer, name, q_start, q_target, duration, info
+            )
+            if abort_msg:
+                return self._reject(
+                    info.get("abort_code", "aborted"), abort_msg,
+                    stage="move", speak=True, extra=info,
+                )
+        finally:
+            if streamer is not None:
+                try:
+                    streamer.stop()
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("[关节流移动] 停关节流失败: %s", exc)
+            if entered:
+                conn.stop_control([name])
+                logger.info("[关节流移动] 已发 realtime/stopControl")
+            ctl._set_phase(Phase.IDLE)
+
+        # ---- 7. 读回实测角核对 ----
+        time.sleep(SETTLE_S)
+        after = svc.refresh_kinematics()
+        actual = ((after.get("arms") or {}).get(name) or {}).get("joints")
+        if actual and len(actual) >= 7:
+            err = max(abs(a - b) for a, b in zip(actual[:7], q_target))
+            info["joints_after"] = [round(float(v), 5) for v in actual[:7]]
+            info["joint_error_deg"] = round(math.degrees(err), 3)
+            if math.degrees(err) > 2.0:
+                message = f"没有完全到位，关节角还差 {math.degrees(err):.1f} 度"
+                code = "not_arrived"
+                ok = False
+            else:
+                message = f"已到达目标关节角，误差 {math.degrees(err):.1f} 度"
+                code = "ok"
+                ok = True
+        else:
+            message = "已下发目标关节角，但读不回实测角"
+            code = "no_feedback"
+            ok = False
+
+        logger.info("[关节流移动] %s: %s", "成功" if ok else "失败", message)
+        if not ok and self._speak_enabled:
+            svc._speak_text(message)
+        return {"ok": ok, "code": code, "stage": "done", "message": message,
+                **info}
+
     def _run(
         self,
         arm: str,

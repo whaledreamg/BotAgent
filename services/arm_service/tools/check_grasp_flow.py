@@ -28,8 +28,10 @@ if str(SERVICE_DIR) not in sys.path:
 
 from library import ActionLibrary  # noqa: E402
 from robot.controller import ArmController, ControllerError  # noqa: E402
-from robot.streamer import HAND_DOF, JOINT_COUNT, JointStreamer  # noqa: E402
+from robot.hand import DOF_COUNT, PRESETS  # noqa: E402
+from robot.streamer import JOINT_COUNT, JointStreamer  # noqa: E402
 from timeline.model import JOINT_COUNT as MODEL_JOINT_COUNT  # noqa: E402
+from timeline.model import JointState  # noqa: E402
 from timeline.playback import PlaybackEngine  # noqa: E402
 
 PASS = "\033[32mPASS\033[0m"
@@ -132,14 +134,21 @@ class MockConnection:
 # ---------------------------------------------------------------- 测试项
 
 
-def test_streamer_hand_packet() -> None:
-    """报文里的手部字段: 有目标才带, 没目标就**一点都不能多**。"""
-    print("\n[1] 报文格式")
+def test_streamer_has_no_hand_field() -> None:
+    """实时指令包里**绝对不能**有手部字段。
+
+    控制器文档 §21.9: 实时指令包的字段只有 ``robot`` / ``controlSpace``
+    / ``commandMode`` / ``poseType`` / ``value``。多塞一个 ``hand`` 字段,
+    控制器会**整包判 invalidDatagram** —— 那时候连手臂都不动了, 比不动
+    手指糟得多。
+
+    灵巧手改走控制器的 ``rs485/*`` 透传 (见 ``robot/hand.py``)。
+    """
+    print("\n[1] 报文格式 (不含手部字段)")
     mock = MockController(actual_joints=[0.1] * JOINT_COUNT)
     try:
-        # ---- 没手部目标: 报文跟改动前逐字节一样 ----
         streamer = JointStreamer(
-            host="127.0.0.1", port=mock.udp_port, frequency=100, hand_enabled=True
+            host="127.0.0.1", port=mock.udp_port, frequency=100
         )
         streamer.set_idle_stop_ms(0)
         streamer.set_target("RightArm", [0.5] * JOINT_COUNT)
@@ -147,153 +156,142 @@ def test_streamer_hand_packet() -> None:
         time.sleep(0.3)
         streamer.stop()
 
-        plain = mock.packets_without_hand()
-        check("没手部目标时不带 hand 字段", len(plain) > 0,
-              f"{len(plain)} 包没有 hand")
-        check("没手部目标时不带 hand 字段 (2)",
+        check("发出的包不为空", len(mock.received_packets) > 0,
+              f"{len(mock.received_packets)} 包")
+        check("报文里没有 hand 字段",
               all("hand" not in p for p in mock.received_packets))
-        if plain:
+        if mock.received_packets:
             check("报文只有 4 个键",
-                  set(plain[0]) == {"robot", "controlSpace", "commandMode", "value"},
-                  str(sorted(plain[0])))
+                  set(mock.received_packets[0]) == {
+                      "robot", "controlSpace", "commandMode", "value"},
+                  str(sorted(mock.received_packets[0])))
+            check("controlSpace 是关节空间 (0)",
+                  mock.received_packets[0]["controlSpace"] == 0)
     finally:
         mock.stop()
 
 
-def test_streamer_hand_enabled() -> None:
-    """手部通道打开后, 手部目标要真的进报文。"""
-    print("\n[2] 手部字段下发")
-    mock = MockController(actual_joints=[0.1] * JOINT_COUNT)
-    try:
-        streamer = JointStreamer(
-            host="127.0.0.1", port=mock.udp_port, frequency=100, hand_enabled=True
-        )
-        streamer.set_idle_stop_ms(0)
-        streamer.set_target("RightArm", [0.5] * JOINT_COUNT, [1000] * HAND_DOF)
-        streamer.start()
-        time.sleep(0.3)
-        streamer.stop()
+def test_hand_protocol_frames() -> None:
+    """灵巧手协议帧 —— 必须与 ActionPlanner 逐字节一致。"""
+    print("\n[2] 灵巧手协议帧")
+    from robot.hand import (
+        REG_READ_POS,
+        REG_WRITE_ALL,
+        build_read_positions_frame,
+        build_write_all_frame,
+        verify_crc,
+    )
 
-        with_hand = mock.packets_with_hand()
-        check("手部目标进了报文", len(with_hand) > 0, f"{len(with_hand)} 包带 hand")
-        if with_hand:
-            hand = with_hand[0]["hand"]
-            check("hand 是 6 个值", len(hand) == HAND_DOF, str(hand))
-            check("hand 全是 1000", all(v == 1000 for v in hand), str(hand))
-            check("关节值还是 7 个",
-                  len(with_hand[0]["value"]) == JOINT_COUNT)
-    finally:
-        mock.stop()
+    pose = PRESETS["一把抓"]
+    frame = build_write_all_frame(127, pose, 100)
+    check("写帧 CRC 正确", verify_crc(frame))
+    check("写帧功能码 0x10", frame[1] == 0x10)
+    check("写帧起始寄存器 0x03F2",
+          (frame[2] << 8 | frame[3]) == REG_WRITE_ALL)
+    check("写帧带 6 个 DOF",
+          len(frame) == 7 + DOF_COUNT * 4 + 2, str(len(frame)))
 
+    rframe = build_read_positions_frame(127)
+    check("读帧 CRC 正确", verify_crc(rframe))
+    check("读帧功能码 0x04", rframe[1] == 0x04)
+    check("读帧起始寄存器 0x07D0",
+          (rframe[2] << 8 | rframe[3]) == REG_READ_POS)
 
-def test_hand_channel_disabled_by_default() -> None:
-    """**手部通道默认关着** —— 没在真机上验证过就不能发。
-
-    控制器不认这个字段名的话会**整包丢弃** (invalidDatagram),
-    那时候连手臂都不动了 —— 比不动手指糟得多。
-    """
-    print("\n[3] 手部通道默认关着")
-    mock = MockController(actual_joints=[0.1] * JOINT_COUNT)
-    try:
-        streamer = JointStreamer(
-            host="127.0.0.1", port=mock.udp_port, frequency=100
-        )
-        check("默认不启用手部字段", streamer.hand_enabled is False)
-        streamer.set_idle_stop_ms(0)
-        streamer.set_target("RightArm", [0.5] * JOINT_COUNT, [1000] * HAND_DOF)
-        streamer.start()
-        time.sleep(0.3)
-        streamer.stop()
-
-        check("通道关着时不发 hand 字段",
-              len(mock.packets_with_hand()) == 0,
-              f"{len(mock.packets_with_hand())} 包带了 hand")
-    finally:
-        mock.stop()
+    # 越界值要夹紧
+    clamped = build_write_all_frame(127, [99999, -50, 0, 0, 0, 0], 100)
+    check("越界的位置被夹到 1000",
+          clamped[7] == 0x03 and clamped[8] == 0xE8,
+          f"{clamped[7] << 8 | clamped[8]}")
+    # 每个 DOF 占 4 字节 (位置 2 + 时长 2), 所以 DOF1 的位置在 11-12
+    check("负值被夹到 0",
+          clamped[11] == 0 and clamped[12] == 0,
+          f"{clamped[11] << 8 | clamped[12]}")
 
 
-def test_hand_clamped() -> None:
-    """超范围的手部值要夹紧 —— 不能发控制器不认的值。"""
-    print("\n[4] 手部值规整")
-    norm = JointStreamer._normalize_hand([99999, -50, 500, 1, 2, 3])
-    check("超范围的值被夹到 0~1000",
-          norm == [1000, 0, 500, 1, 2, 3], str(norm))
-    short = JointStreamer._normalize_hand([100])
-    check("短的补齐到 6 个", len(short) == HAND_DOF, str(short))
-    check("None = 不控制手部", JointStreamer._normalize_hand(None) == [])
+def test_hand_presets() -> None:
+    """Revo2 预设手势。"""
+    print("\n[3] 预设手势")
+    check("一把抓 = 拇指弯曲拉满 + 四指拉满",
+          PRESETS["一把抓"] == [1000, 0, 1000, 1000, 1000, 1000],
+          str(PRESETS["一把抓"]))
+    check("释放 = 全 0", PRESETS["释放"] == [0] * 6, str(PRESETS["释放"]))
+    check("半抓 = 500", PRESETS["半抓"] == [500, 0, 500, 500, 500, 500])
+    check("预设都是 6 个值",
+          all(len(v) == DOF_COUNT for v in PRESETS.values()))
 
 
-def test_hand_interpolation() -> None:
-    """手部片段要**插值** —— 手指不能一步跳过去。"""
-    print("\n[5] 手部求值")
+def test_sequence_composition() -> None:
+    """动作序列合成: 时间轴不重叠, 夹爪指令落在正确的时间点。"""
+    print("\n[4] 动作序列合成")
+    from sequence import compose_from_names
+
     lib = ActionLibrary(SERVICE_DIR / "data")
     lib.load()
 
+    seq = compose_from_names(
+        lib, ["准备点", "闭合夹爪", "安全点"], JointState.zero()
+    )
+    segs = seq.timeline.segments
+    # 准备点自带一个手部片段 (张开到 [0,900,0,0,0,0]), 加上闭合夹爪的
+    # 手部片段 —— 所以是 4 段 / 2 个夹爪指令, 不是 3 段 / 1 个。
+    arm_segs = [s for s in segs if s.is_arm]
+    hand_segs = [s for s in segs if not s.is_arm]
+    check("合成出 4 段 (2 关节 + 2 手部)", len(segs) == 4, str(len(segs)))
+    check("关节片段 2 个", len(arm_segs) == 2, str(len(arm_segs)))
+    check("手部片段 2 个", len(hand_segs) == 2, str(len(hand_segs)))
+    check("片段时间不重叠",
+          all(segs[i].end_time <= segs[i + 1].start_time + 1e-9
+              for i in range(len(segs) - 1)),
+          str([(s.start_time, s.end_time) for s in segs]))
+    check("总时长 = 各段之和",
+          abs(seq.duration - sum(s.duration for s in segs)) < 1e-6,
+          f"{seq.duration}")
+    check("夹爪指令 2 个", len(seq.cues) == 2, str(len(seq.cues)))
+    if seq.cues:
+        # 第一个是准备点自带的「张开」, 第二个才是「闭合夹爪」的一把抓
+        close_cues = [c for c in seq.cues if c.right == PRESETS["一把抓"]]
+        check("有且只有一个「一把抓」的夹爪指令", len(close_cues) == 1,
+              str(len(close_cues)))
+        if close_cues:
+            cue = close_cues[0]
+            check("夹爪指令在准备点结束之后",
+                  cue.time >= arm_segs[0].end_time - 1e-9,
+                  f"t={cue.time} vs {arm_segs[0].end_time}")
+            check("夹爪手位是一把抓", cue.right == PRESETS["一把抓"])
+
+
+def test_hand_evaluation_semantics() -> None:
+    """手部片段的求值语义 (保持 / 插值)。"""
+    print("\n[5] 手部求值语义")
+    lib = ActionLibrary(SERVICE_DIR / "data")
+    lib.load()
     close = lib.find("闭合夹爪")
     check("动作库里有「闭合夹爪」", close is not None)
     if close is None:
         return
 
-    model = close.to_timeline()
-    engine = PlaybackEngine(model)
-
+    engine = PlaybackEngine(close.to_timeline())
     h0 = engine.evaluate_hand_at(0.0, "right")
     h1 = engine.evaluate_hand_at(0.5, "right")
     h2 = engine.evaluate_hand_at(0.99, "right")
 
-    check("起点是 0", h0 == [0] * 6, str(h0))
+    check("起点是 0", h0 == [0] * DOF_COUNT, str(h0))
     check("中途是插值出来的 (不是 0 也不是 1000)",
           0 < h1[0] < 1000, str(h1))
     check("末点接近 1000 (线性插值到 990)", h2[0] == 990, str(h2))
-    check("中点是 ~500", 400 < h1[0] < 600, str(h1[0]))
-    check("没在手部控制下时返回空",
-          engine.evaluate_hand_at(0.0, "left") == [])
+    # 「闭合夹爪」动作**两只手都管** —— 所以左手也有值
+    hl = engine.evaluate_hand_at(0.5, "left")
+    check("两只手都管时左手也有值", hl and 0 < hl[0] < 1000, str(hl))
+    # 只管右手的动作, 左手应该返回空
+    only_right = lib.find("挥手")
+    if only_right is not None:
+        e2 = PlaybackEngine(only_right.to_timeline())
+        check("只管关节的动作, 左手返回空",
+              e2.evaluate_hand_at(0.0, "left") == [])
 
-
-def test_hand_keeps_value_outside_segment() -> None:
-    """落在手部片段**外面** -> 保持上一个手部目标 (跟关节语义一致)。"""
-    print("\n[6] 手部保持语义")
-    lib = ActionLibrary(SERVICE_DIR / "data")
-    lib.load()
-    close = lib.find("闭合夹爪")
-    if close is None:
-        return
-    engine = PlaybackEngine(close.to_timeline())
-    # 片段结束后 -> 保持 1000
+    # 落在手部片段外面 -> 保持上一个手部目标
     h = engine.evaluate_hand_at(5.0, "right")
     check("片段结束后保持 1000", h and h[0] == 1000, str(h))
-
-
-def test_hand_independent_from_joints() -> None:
-    """手部和关节**各自**插值 —— 关节动的时候手部不该跟着跳。
-
-    共用时间戳的话, 「手臂在动、夹爪保持张开」会把手的插值区间算错。
-    """
-    print("\n[7] 手部与关节独立插值")
-    mock = MockController(actual_joints=[0.1] * JOINT_COUNT)
-    try:
-        streamer = JointStreamer(
-            host="127.0.0.1", port=mock.udp_port, frequency=100, hand_enabled=True
-        )
-        streamer.set_idle_stop_ms(0)
-        # 手部目标从头到尾都是 1000 (保持闭合), 只有关节在动
-        streamer.set_target("RightArm", [0.5] * JOINT_COUNT, [1000] * HAND_DOF)
-        time.sleep(0.15)
-        streamer.set_target("RightArm", [0.7] * JOINT_COUNT, [1000] * HAND_DOF)
-        streamer.start()
-        time.sleep(0.4)
-        streamer.stop()
-
-        with_hand = mock.packets_with_hand()
-        check("有手部目标的包", len(with_hand) > 0, f"{len(with_hand)} 包")
-        if with_hand:
-            hands = [tuple(p["hand"]) for p in with_hand]
-            # 手部目标没变 -> 值就该一直是 1000, 不能被关节的运动带着跑
-            check("关节动的时候手部保持不变",
-                  all(h == (1000,) * HAND_DOF for h in hands),
-                  f"看到 {set(hands)}")
-    finally:
-        mock.stop()
 
 
 def test_grasp_flow_steps() -> None:
@@ -303,6 +301,85 @@ def test_grasp_flow_steps() -> None:
     lib.load()
     for name in ("准备点", "安全点", "闭合夹爪"):
         check(f"动作库里有「{name}」", lib.find(name) is not None)
+
+
+def test_named_points() -> None:
+    """具名点解析 —— 声明、引用、链式偏移。"""
+    print("\n[8b] 具名点解析")
+    from flow import FlowError, parse_flow
+    from sequence import plan_from_flow, resolve_named_points
+
+    raw = {
+        "name": "t",
+        "steps": [
+            {"id": "detect", "type": "detect", "duration": 1.5},
+            {"id": "object", "type": "target", "source": "detect"},
+            {"id": "above_point", "type": "target", "base": "object",
+             "offset": {"z": 0.05}},
+            {"id": "side_point", "type": "target", "base": "above_point",
+             "offset": {"x": 0.02, "z": 0.01}},
+            {"id": "fixed", "type": "target",
+             "pose": {"x": 0.1, "y": 0.2, "z": 0.3}},
+            {"id": "reach", "type": "arm", "point": "above_point",
+             "duration": 3.0},
+            {"id": "grasp", "type": "arm", "point": "object",
+             "offset": {"z": -0.01}, "duration": 2.0},
+        ],
+    }
+    flow = parse_flow(raw)
+
+    target = (0.5, -0.1, -0.3)
+    named = resolve_named_points(flow, target)
+    check("object = 识别结果", named["object"] == target)
+    check(
+        "above_point = object + z0.05",
+        named["above_point"] == (0.5, -0.1, -0.25),
+    )
+    check(
+        "side_point = 链式偏移 (基于 above_point)",
+        named["side_point"] == (0.52, -0.1, -0.24),
+    )
+    check(
+        "fixed = 写死的坐标",
+        named["fixed"] == (0.1, 0.2, 0.3),
+    )
+
+    plan = plan_from_flow(flow, target)
+    by_id = {s.id: s for s in plan}
+    check("reach 段是 arm 类型", by_id["reach"].type == "arm")
+    check(
+        "reach 段目标 = above_point",
+        by_id["reach"].pos == (0.5, -0.1, -0.25),
+    )
+    check(
+        "grasp 段目标 = object + offset",
+        by_id["grasp"].pos == (0.5, -0.1, -0.31),
+    )
+    check(
+        "target 段不产生运动 (纯声明)",
+        by_id["object"].type == "target",
+    )
+    check(
+        "detect 段变成 hold (占时长, 手臂不动)",
+        by_id["detect"].type == "hold" and by_id["detect"].duration == 1.5,
+    )
+
+    # 没有识别结果时, 取自识别的点算不出来
+    try:
+        resolve_named_points(flow, None)
+        check("缺识别结果 -> 应该报错", False)
+    except ValueError:
+        check("缺识别结果 -> 正确报错", True)
+
+    # 引用不存在的点 -> 加载时就报错
+    try:
+        parse_flow({
+            "name": "t",
+            "steps": [{"id": "a", "type": "arm", "point": "nope"}],
+        })
+        check("引用不存在的点 -> 应该报错", False)
+    except FlowError:
+        check("引用不存在的点 -> 正确报错", True)
 
 
 def test_control_gate_blocks_everything() -> None:
@@ -348,14 +425,13 @@ def main() -> int:
     print("抓取流程自检 (mock 控制器, 不需要真机)")
     print("=" * 60)
 
-    test_streamer_hand_packet()
-    test_streamer_hand_enabled()
-    test_hand_channel_disabled_by_default()
-    test_hand_clamped()
-    test_hand_interpolation()
-    test_hand_keeps_value_outside_segment()
-    test_hand_independent_from_joints()
+    test_streamer_has_no_hand_field()
+    test_hand_protocol_frames()
+    test_hand_presets()
+    test_sequence_composition()
+    test_hand_evaluation_semantics()
     test_grasp_flow_steps()
+    test_named_points()
     test_control_gate_blocks_everything()
 
     passed = sum(1 for _, ok, _ in _results if ok)

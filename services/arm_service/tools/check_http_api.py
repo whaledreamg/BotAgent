@@ -150,6 +150,9 @@ def _smoke_gets(client: Any) -> None:
         ("/v1/safety", None),
         ("/v1/kinematics", None),
         ("/v1/kinematics?refresh=true", None),
+        ("/v1/flows", None),
+        ("/v1/flows/grasp", None),
+        ("/v1/hand/status", None),
     ]
     for url, _ in gets:
         try:
@@ -180,6 +183,57 @@ def _smoke_gets(client: Any) -> None:
             check("refresh=true 的响应能通过模型校验", False, f"HTTP {resp.status_code}")
     except Exception as exc:
         check("refresh=true 的响应能通过模型校验", False, f"{type(exc).__name__}: {exc}")
+
+    _smoke_posts(client)
+
+
+def _smoke_posts(client: Any) -> None:
+    """POST 接口冒烟。
+
+    **期望的不是 200** —— 控制器连不上时这些接口应该返回 409 (冲突),
+    而不是 500 (服务器错误)。500 说明代码本身有 bug。
+    """
+    posts = [
+        ("/v1/sequence", {"actions": ["准备点", "闭合夹爪", "安全点"]}),
+        ("/v1/grasp_sequence", {"x": 0.5, "y": 0.0, "z": -0.3, "side": "right"}),
+        ("/v1/hand/connect", {}),
+        ("/v1/hand/open", {}),
+        ("/v1/hand/close", {}),
+        ("/v1/hand/preset", {"preset": "一把抓"}),
+    ]
+    for url, payload in posts:
+        try:
+            resp = client.post(url, json=payload)
+        except Exception as exc:
+            check(f"POST {url}", False, f"抛异常: {type(exc).__name__}: {exc}")
+            continue
+        # 200 (成功) 或 409 (控制器不可达/冲突) 都算正常
+        ok = resp.status_code in (200, 409)
+        detail = f"HTTP {resp.status_code}"
+        if not ok:
+            detail += f"  {resp.text[:160]}"
+        check(f"POST {url}", ok, detail)
+
+    # 参数缺失应该 400, 不是 500
+    try:
+        resp = client.post("/v1/sequence", json={"actions": []})
+        check(
+            "POST /v1/sequence 没指定动作 -> 400",
+            resp.status_code == 400,
+            f"HTTP {resp.status_code}",
+        )
+    except Exception as exc:
+        check("POST /v1/sequence 没指定动作 -> 400", False, str(exc))
+
+    try:
+        resp = client.post("/v1/hand/preset", json={})
+        check(
+            "POST /v1/hand/preset 没指定预设 -> 400",
+            resp.status_code == 400,
+            f"HTTP {resp.status_code}",
+        )
+    except Exception as exc:
+        check("POST /v1/hand/preset 没指定预设 -> 400", False, str(exc))
 
 
 def main() -> int:

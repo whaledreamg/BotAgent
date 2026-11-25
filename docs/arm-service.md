@@ -20,7 +20,12 @@ GUI 程序里剥离出来, 做成与 TTS / ASR / Agent 并列的独立服务。
 | GET  | `/v1/status` | 当前播放状态 (阶段 / 进度 / 错误 / 最近一次门阀结果 / 队列) |
 | GET  | `/v1/safety` | 跑一次安全门阀检查 (不执行动作) |
 | GET  | `/v1/kinematics` | 运动学快照 (TCP 世界系位姿 / 基座位姿 / 关节角), 手眼标定用 |
-| GET  | `/v1/flow` | 抓取流程 (5 步) 的配置 —— agent 的 `vision.grasp` 用 |
+| GET  | `/v1/flows` | 流程清单 (configs/flows/ 里的每条流程) |
+| GET  | `/v1/flows/{name}` | 一条流程的完整定义 (片段 + 参数) |
+| POST | `/v1/flows/reload` | **强制重载**流程定义 (平时不用, 自动热重载) |
+| GET  | `/v1/flow` | 默认流程的扁平参数 (旧接口, 兼容用) |
+| POST | `/v1/move_to` | TCP 移到世界系目标点 (本地逆解 + 关节流) |
+| POST | `/v1/move_joints` | **直接**移到给定关节角 (不走逆解) |
 
 ```bash
 # 看动作库
@@ -357,45 +362,298 @@ data/伸左手.json  -> 动作 "伸左手"
 
 新增动作直接在 `data/` 下放一个 `<动作名>.json` 即可, 服务重启后自动加载。
 
-## 抓取流程 (5 步)
+## 抓取流程 (声明式)
 
-`vision.grasp` skill 一次调用跑完这 5 步:
+`vision.grasp` skill 是**通用流程执行器** —— 流程本身不在代码里, 而是
+定义在 `configs/flows/*.yaml` 里。改流程**不用改代码**。
 
-| 步 | 做什么 | 怎么做的 |
-|----|--------|----------|
-| 1 | 回准备点 | 播动作库的 `准备点` (拍照前固定视角) |
-| 2 | 拍照识别 | 视觉服务 `fresh=True` (强制重拍, 不走缓存) |
-| 3 | 移到上方点 | `move_to` 目标正上方 `above_distance` 米 |
-| 4 | 移到抓取点 + 闭夹爪 | `move_to` 目标 + 偏移, 然后播 `闭合夹爪` |
-| 5 | 回安全点 | 播动作库的 `安全点` |
+默认流程 (`configs/flows/grasp.yaml`):
 
-配置在 `configs/arm.yaml` 的 `arm.grasp.flow`:
+| 段 | id | type | 做什么 |
+|----|----|------|--------|
+| 1 | `ready` | `arm` | 播动作库的 `准备点` (拍照前固定视角) |
+| 2 | `detect` | `detect` | 视觉服务 `fresh=True` (强制重拍, 不走缓存), 时间轴上占 1.5s |
+| 3 | `object` | `target` | **声明**具名点 = 这次识别到的东西 (纯声明, 不动) |
+| 4 | `above_point` | `target` | **声明**具名点 = `object` 正上方 5cm (纯声明, 不动) |
+| 5 | `above` | `arm` | `move_to` `above_point` (走本地逆解) |
+| 6 | `grasp` | `arm` | `move_to` `object` + 偏移 |
+| 7 | `close` | `hand` | 播动作库的 `闭合夹爪` |
+| 8 | `safe` | `arm` | 播动作库的 `安全点` |
+
+### 流程文件格式
 
 ```yaml
-    flow:
-      ready_action: "准备点"      # 第 1 步, 留空 = 跳过
-      safe_action: "安全点"        # 第 5 步, 留空 = 跳过
-      above_distance: 0.10        # 上方点离目标多远 (米)
-      grasp_offset:               # 抓取点相对目标的偏移 (米)
-        x: 0.0
-        y: 0.0
-        z: 0.0
-      close_action: "闭合夹爪"     # 留空 = 不闭夹爪
-      open_action: "张开夹爪"
-      durations:
-        above: 3.0                # 移到上方点的时长 (秒)
-        grasp: 2.0                # 移到抓取点的时长 (秒)
+name: grasp
+description: "标准抓取: 回准备点 -> 拍照 -> 上方点 -> 抓取点 -> 闭夹爪 -> 回安全点"
+
+# 某一段失败时的收尾动作 —— 先播它, 再报失败
+recovery_action: 安全点
+recovery_label: 回安全点
+
+steps:
+  - id: ready
+    type: arm           # 关节片段
+    action: 准备点      # 终点来自动作库
+    label: 回准备点
+
+  - id: detect
+    type: detect        # 识别片段 —— 产出识别结果
+    duration: 1.5       # 在时间轴上真的占 1.5s
+    label: 拍照识别
+
+  # ---- 具名点声明: 只登记, 不产生运动 ----
+  - id: object
+    type: target
+    source: detect      # 取自识别结果
+    label: 目标物体
+
+  - id: above_point
+    type: target
+    base: object        # 基于另一个具名点
+    offset: {x: 0, y: 0, z: 0.05}
+    label: 目标上方
+
+  # ---- 引用具名点去做别的事 ----
+  - id: above
+    type: arm
+    point: above_point  # 引用具名点 -> 走本地逆解
+    duration: 3.0
+    label: 移到上方点
+
+  - id: close
+    type: hand          # 手部片段
+    action: 闭合夹爪
+    label: 闭合夹爪
 ```
 
-**失败收尾** —— 每步都可能单独失败:
+**片段类型** (执行器内置注册表):
 
-- 第 1 步失败 -> 直接返回, 不拍照
-- 第 2 步失败 (没找到) -> 返回, **不回安全点** (已经在准备点了)
-- 第 3/4 步失败 -> **必须先回安全点**再报失败, 否则手停在半空
-- 第 5 步失败 -> 抓取已成功, 如实说「抓到了但回安全点失败」
+| type | 作用 | 终点/取值来源 |
+|------|------|--------------|
+| `arm` | 关节片段 (机械臂动) | `action` / `pose` / `point` / `base` **四选一** |
+| `hand` | 手部片段 (灵巧手动) | `action` / `pose` / `preset` 至少一个 |
+| `detect` | 识别片段 —— 产出识别结果 | `duration` |
+| `target` | **具名点声明** —— 纯声明, 不动 | `source: detect` / `base`+`offset` / `pose` 三选一 |
 
-**总闸关着的时候 5 步全走完** (`arm.enabled: false`) —— 只是不动。
+**具名点 (target)**:
+
+- 值的来源有三 种: `source: detect` (识别结果) / `base`+`offset` (基于另一个具名点) / `pose` (写死坐标)
+- 引用方式是 `point: <步骤id>` —— **按名字引用, 位置任意**
+- **顺序约束**: `source: detect` 的点必须排在 `detect` 之后; `base` 的点必须排在被引用的点之后; 不能循环引用
+
+**`on_failure`** (可选, 每段可单独指定): `recover` = 失败后先收尾再报;
+`abort` = 直接报失败不收尾。
+
+### 新旧格式对照
+
+| 旧 (`play`/`move`/`close`/`open`) | 新 (`arm`/`hand`/`detect`/`target`) |
+|-------------------------------|-----------------------------------|
+| `type: play` + `action: 准备点` | `type: arm` + `action: 准备点` |
+| `type: move` + `target: object` | `type: arm` + `point: object` (先声明 `target` 片段) |
+| `type: move` + `target: above` | `type: arm` + `point: above_point` (基于 `object` + `z` 偏移) |
+| `type: close` | `type: hand` + `action: 闭合夹爪` (或 `direction: close`) |
+| `type: open` | `type: hand` + `action: 张开夹爪` (或 `direction: open`) |
+| `move` 的 `offset` 写在 `move` 上 | 偏移写在引用它的 `arm` 段上, 或写在 `target` 段上 |
+
+**旧格式不再被接受** (hard break) —— 加载时明确报 `未知片段类型 'play'`。
+
+### 扩展边界
+
+| 层次 | 定义在哪 | 改它要改 Python 吗 |
+|------|----------|--------------------|
+| 片段**内容** | YAML: 有几段、什么顺序、动作叫什么名 | **不用** |
+| 片段**参数** | YAML: 距离、时长、偏移、具名点 | **不用** |
+| 片段**类型** | Python 注册表 (`vision_grasp.py` 的 `_HANDLERS`) | **要** |
+
+**新流程 / 改流程 = 只写 YAML**；**新片段类型 = 要写 Python**。
+
+目前还表达不了的: 「放在桌上」(需要「具名放置点」概念)、「等 2 秒」
+(需要新类型)、调任意 HTTP 接口 (需要新类型)。详见
+`configs/flows/README.md`。
+
+### 失败收尾
+
+- `detect` 失败 -> 直接返回, **不回安全点** (此时手还在准备点, 那是安全的)
+- 中途失败 -> **先回 `recovery_action`** 再报失败, 否则手停在半空
+- 最后一步失败 -> 前面的步骤已成功, 如实说「抓到了但收尾失败」
+
+**总闸关着的时候流程全走完** (`arm.enabled: false`) —— 只是不动。
 用户要看的正是每一步算出来的位置, 中途就停掉等于什么都看不到。
+
+### 接口
+
+| 接口 | 用途 |
+|------|------|
+| `GET /v1/flows` | 列出所有流程 (名字 + 描述 + 步骤 id) |
+| `GET /v1/flows/{name}` | 拿一条流程的完整定义 (步骤 + 参数) |
+| `POST /v1/flows/reload` | 强制重载 (平时不用 —— 自动热重载) |
+| `GET /v1/flow` | 旧接口, 返回默认流程的扁平参数 (兼容用) |
+
+### 热重载
+
+**改完 `configs/flows/*.yaml` 不用重启服务** —— 服务每次用到流程时都会
+比对目录指纹 (每个 yaml 的 mtime + 大小), 变了就重读。
+
+自动生效的时机: `GET /v1/flows`、`GET /v1/flows/{name}`、每次抓取
+(`/v1/grasp_sequence`)。
+
+同秒内改文件且大小没变时指纹可能察觉不到 (有些文件系统 mtime 精度只到
+秒), 这时候手动重载:
+
+```bash
+curl -X POST localhost:8802/v1/flows/reload
+```
+
+### 自检
+
+```bash
+python services/arm_service/tools/check_flows.py
+```
+
+校验: 文件格式、步骤类型是否已知、动作名是否在动作库里、热重载的指纹
+逻辑、以及新流程与 `configs/arm.yaml` 里旧配置的**行为是否等价**
+(防止迁移时手抖改错)。
+
+## 灵巧手 (Revo2)
+
+灵巧手**不挂在 EtherCAT 上** —— 它接在末端通信板的 RS485 口, 要经控制器
+的 `rs485/*` 接口透传 Modbus RTU 帧。
+
+协议**逐字节移植**自 ActionPlanner 的 `src/robot/HandController.cpp`
+(那是这套设备上跑通过的权威实现), 代码在 `services/arm_service/robot/hand.py`。
+
+### 通道与从站
+
+| | 通信板从站名 | Modbus 从站地址 |
+|---|---|---|
+| 左手 | `EtherCAT485L` | 126 |
+| 右手 | `EtherCAT485R` | 127 |
+
+通信板从站名用来在 `rs485/list` 里找通道; Modbus 从站地址是帧里的第一个字节。
+**通道标识必须原样取自 `rs485/list`** —— 里面含主站名, 不能自己拼。
+
+波特率 115200 8N1。
+
+> **2026-11-25 真机实测确认** (控制器 `192.168.100.16`):
+>
+> ```
+> 通道:   dualEc2485:Master1/EtherCAT485R
+> 波特率: 115200  ← 只有这个能通; 9600 / 19200 都报 23256
+> 从站:   127     ← 只有这个能通; 126 报 23256
+> 寄存器: 0x07D0 读位置 (实测应答 [127,4,12,1,144,1,144,0,49,0,50,0,49,0,50,95,136])
+> ```
+>
+> 23256 = 从站无应答。**这个实测帧已作为回归用例写进
+> `tools/check_hand.py`** —— 解析器对它的 CRC、长度、6 个 DOF 都对得上。
+
+### 6 个自由度
+
+| 序号 | 名称 | 最大角度 |
+|---|---|---|
+| 0 | 拇指弯曲 | 59° |
+| 1 | 拇指侧摆 | 90° |
+| 2 | 食指 | 81° |
+| 3 | 中指 | 81° |
+| 4 | 无名指 | 81° |
+| 5 | 小指 | 81° |
+
+归一化值 0~1000, 与角度线性对应。
+
+### 预设手势
+
+| 名称 | 值 | 说明 |
+|---|---|---|
+| 一把抓 | `[1000, 0, 1000, 1000, 1000, 1000]` | 拇指弯曲 + 四指拉满 |
+| 释放 | `[0, 0, 0, 0, 0, 0]` | 全开 |
+| 半抓 | `[500, 0, 500, 500, 500, 500]` | |
+| 两指捏 | `[800, 0, 200, 0, 0, 0]` | 拇指 + 食指 |
+| 点赞 | `[0, 0, 1000, 1000, 1000, 1000]` | |
+| 指点 | `[1000, 0, 0, 1000, 1000, 1000]` | |
+
+> ⚠️ **DOF 1 (拇指侧摆) 在「一把抓」里必须保持 0**。拉满会让拇指侧张到
+> 一边, 抓不住东西。
+
+### 寄存器
+
+| 操作 | 功能码 | 起始寄存器 | 数量 |
+|---|---|---|---|
+| 写 6 个 DOF | `0x10` | `0x03F2` (1010) | 12 |
+| 读 6 个 DOF | `0x04` | `0x07D0` (2000) | 6 |
+
+写寄存器的数据按 `(位置, 时长)` 交替排列, 每个 2 字节 —— 时长就是
+`write_time_ms` (驱动器按这个时间走完目标, 避免瞬间打到)。
+
+### 为什么手部指令必须独立线程
+
+一次「写 + 读」是**两次控制面往返**, 还要等通信板发送、等手应答 —— 远慢于
+90 Hz 的臂控循环。塞进臂控循环会把关节流拖死 (缺帧保持窗只有 5 个锚点周期)。
+
+所以: 臂控线程只负责**入队**, 独立线程 `arm-hand` 负责真正下发。
+
+### 前置条件
+
+控制器里该手的 `gripper` 设备型号必须是 **Generic485**。厂商夹爪协议会
+占用 RS485 通道, 报 `23252`。停用夹爪协议要走
+`peripheral/setDeviceEnabled` (需要现场确认夹爪静止, 本程序不会替你确认)。
+
+### 接口
+
+| 接口 | 用途 |
+|------|------|
+| `GET /v1/hand/status` | 通道、就绪状态、当前位置 |
+| `POST /v1/hand/connect` | 解析通道 + 初始化串口 (幂等) |
+| `POST /v1/hand/open` | 张开手 (`arm.hand.open_pose`) |
+| `POST /v1/hand/close` | 握紧手 (`arm.hand.close_pose`) |
+| `POST /v1/hand/preset` | 下发预设手势 (`{"preset": "一把抓"}`) |
+
+### 自检
+
+```bash
+python services/arm_service/tools/check_hand.py
+# 连真机 (会真的读位置; 加 --move 还会真的动手指)
+python services/arm_service/tools/check_hand.py --controller 192.168.100.16 --move
+```
+
+离线部分校验帧构造是否与 ActionPlanner 逐字节一致、序列合成的时序是否正确。
+
+## 动作序列合成 (先识别, 再合成一条序列)
+
+**关节片段**和**夹爪片段**走两条不同的通道, 但它们要合成**一次**执行:
+
+- 关节片段 (回准备点、移到上方点) → 拼进一条时间轴, 一次入控连续播完;
+- 夹爪片段 (闭合夹爪) → 记成时间轴上的**时间点**, 到点了再单独下发。
+
+代码在 `services/arm_service/sequence.py`。
+
+### 为什么合成而不是排队播
+
+排队播 (`play_many`) 每换一个动作就重新构造时间轴, 每个动作的起点取当前
+实测姿态 —— 中间会有「重新对齐」的空隙。合成一条时间轴则完全连续。
+
+### 移动步怎么进时间轴
+
+移动步 (移到上方点 / 移到抓取点) 的目标点是**识别之后**才知道的, 所以它
+不是从动作库拿的, 而是:
+
+1. 用**本地 pinocchio 逆解** (基座系) 把目标点解成关节角;
+2. 作为一条 `arm` 片段插进时间轴。
+
+逆解失败就不合成 —— 宁可报错也不要播一条错的轨迹。
+
+### 接口
+
+| 接口 | 用途 |
+|------|------|
+| `POST /v1/sequence` | 把几个动作合成一条时间轴 (`{"actions": [...]}`) |
+| `POST /v1/grasp_sequence` | 识别之后合成抓取序列 (`{"x":…, "y":…, "z":…}`) |
+
+`/v1/grasp_sequence` 的 `plan_only: true` 可以只合成不执行, 看一眼合成的
+结果 (每个移动步的逆解误差) 再决定要不要动。
+
+### Agent 侧的模式
+
+`vision.grasp` skill 默认走**序列模式**: 先识别, 再把 flow 合成一条序列
+交给机械臂服务执行。传 `sequence: false` 退回逐步骤下发 (老行为)。
 
 ## 协议约束 (踩错就是机器人不动或直接被停控)
 
@@ -425,14 +683,12 @@ data/伸左手.json  -> 动作 "伸左手"
    扁平 JSON, 无 `{id,ty,db}` 包裹:
    `{"robot":"LeftArm","controlSpace":0,"commandMode":0,"value":[7 个 rad]}`
 
-   **手部字段 (灵巧手)** —— 只有 `configs/arm.yaml` 的 `arm.hand.enabled`
-   打开时才会带:
-   `{"robot":"RightArm","controlSpace":0,"commandMode":0,"value":[7 个 rad],"hand":[6 个 0~1000]}`
+   **报文里绝对不能有手部字段。** 控制器文档 (API 说明 §21.9) 规定实时
+   指令包的字段只有 `robot` / `controlSpace` / `commandMode` / `poseType` /
+   `value` —— **没有 `hand`**。多塞一个字段进去, 控制器会**整包判
+   `invalidDatagram`**, 那时候连手臂都不动了, 比不动手指糟得多。
 
-   > ⚠️ **默认关着**。控制器认不认 `hand` 这个字段名还没在真机上验证过 ——
-   > 格式不对的话控制器会**整包丢弃** (`invalidDatagram`), 那时候连手臂
-   > 都不动了, 比不动手指糟得多。验证脚本: `tools/probe_hand.py`
-   > (真机: `--controller <ip> --arm right`)。确认接受后再打开配置。
+   灵巧手走的是**另一条路** —— 控制器的 `rs485/*` 透传, 见下一节。
 
 6. **入控前必须清残留会话**
    控制器上残留的会话 (尤其 `state="stopped"` 的) 会占住该臂, 表现为
@@ -496,14 +752,16 @@ cd services/arm_service
 python tools/check_arm.py          # 协议级: 时序 / 报文格式 / 对齐 / 停控
 python tools/check_arm_service.py  # 端到端: mock 控制器 + 真实 HTTP/WS 服务
 python tools/check_safety.py       # 安全门阀: 逐项判定 + 播报文案 (不需要真机)
-python tools/check_grasp_flow.py   # 抓取流程: 手部字段 / 插值 / 5 步顺序
+python tools/check_grasp_flow.py   # 抓取流程: 报文格式 / 协议帧 / 序列合成 / 步骤顺序
+python tools/check_flows.py        # 流程定义: 格式 / 类型 / 动作名 / 与旧配置等价
+python tools/check_hand.py         # 灵巧手: 协议帧 + 序列合成 (不需要真机)
 ```
 
 **真机探针** (需要能连到控制器):
 
 ```bash
-# 验证控制器认不认 UDP 报文里的手部字段
-python tools/probe_hand.py --controller 192.168.100.16 --arm right
+# 验证灵巧手: 连通道、读位置 (加 --move 会真的合一次手再张开)
+python tools/check_hand.py --controller 192.168.100.16 --move
 
 # 录一个固定点动作 (安全点/准备点) —— 关节角必须现场示教
 python tools/record_safe_point.py --name 安全点

@@ -19,9 +19,11 @@ import asyncio
 import json
 import logging
 import math
+import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config import Config
@@ -32,7 +34,8 @@ from notifier import ArmNotifier
 from robot.connection import RobotConnection
 from robot.controller import ArmController, ControllerError, Phase
 from safety import SafetyCheck, SafetyGate, SafetyReport
-from timeline.model import JOINT_COUNT, JointState
+from sequence import ComposedSequence, HandCue
+from timeline.model import JOINT_COUNT, JointState, Segment, SegmentType, TimelineModel
 from timeline.playback import PlaybackEngine
 
 logger = logging.getLogger("arm.service")
@@ -105,7 +108,6 @@ class ArmService:
             lead_in_ms=self.arm_cfg.lead_in_ms,
             joint_limit=self.arm_cfg.joint_limit.to_config(),
             idle_stop_ms=self.arm_cfg.idle_stop_ms,
-            hand_enabled=self.arm_cfg.hand.enabled,
             on_phase=self._on_phase,
             on_error=self._on_error,
         )
@@ -155,6 +157,37 @@ class ArmService:
         #: 降级 (但不崩), 控制器的关节流播放等老功能照常。
         self._kinematics: Dict[str, Any] = {}
         self._kinematics_lock = threading.Lock()
+        #: 流程定义 (configs/flows/*.yaml) —— ``{流程名: FlowDef}``
+        #:
+        #: 抓取流程不再是写死的 5 步, 而是这里声明的步骤列表。
+        #: 加载失败或缺默认流程时, 用 ``grasp.flow`` 的旧配置**合成**一条
+        #: 等价流程兜底 —— 保证升级过程不破。
+        self._flows: Dict[str, Any] = {}
+        #: 流程目录的**指纹** (每个 yaml 的 mtime + 大小)
+        #:
+        #: 缓存命中靠比对它 —— 变了就重读 yaml。**不用脏标记**, 因为
+        #: yaml 是人在外面直接改的, 服务不知道什么时候该清标记。
+        self._flows_signature: Tuple[Tuple[str, int, int], ...] = ()
+        #: 灵巧手客户端 (Revo2, 经控制器 rs485 透传)
+        #:
+        #: **懒连接** —— 灵巧手要走 ``rs485/list`` + ``rs485/init`` 才能用,
+        #: 没连上就不影响机械臂的其它功能。首次需要下发手位时才连接。
+        self._hand: Optional[Any] = None
+        self._hand_connecting = False
+        #: 待下发的夹爪指令队列 (夹爪通信慢, 不能在臂控线程里同步做)
+        self._hand_queue: "queue.Queue[HandCue]" = queue.Queue()
+        self._hand_stop = threading.Event()
+        self._hand_thread: Optional[threading.Thread] = None
+        #: 当前播放里还没到点的夹爪指令
+        self._pending_cues: List[HandCue] = []
+        #: ---- 诊断: 记录实际下发的关节流 ----
+        #:
+        #: 「轨迹抖动」这类问题分不清是**上游算出来的目标在抖**还是
+        #: **下发环节在抖** —— 记下每一帧的目标就能直接对比。
+        #:
+        #: 只在显式开启时记录 (默认关), 免得长期跑把内存吃满。
+        self._stream_trace: List[Dict[str, Any]] = []
+        self._stream_trace_on = False
         #: 后台重连线程 (控制器启动时连不上时用)
         self._reconnect_thread: Optional[threading.Thread] = None
 
@@ -211,6 +244,15 @@ class ArmService:
         self.library.load()
 
         self._started = True
+
+        # 灵巧手下发线程 —— 夹爪通信慢, 不能在臂控线程里同步做
+        self._hand_stop.clear()
+        if self._hand_thread is None or not self._hand_thread.is_alive():
+            self._hand_thread = threading.Thread(
+                target=self._hand_worker, daemon=True, name="arm-hand"
+            )
+            self._hand_thread.start()
+
         # 连接是阻塞调用 (握手要等控制器的 HTTP 响应), 不能直接放在 FastAPI 的
         # 事件循环线程里 —— 那样会把整个服务卡住直到超时。丢到线程池里做。
         connected = await await_run(self._conn.connect)
@@ -249,6 +291,7 @@ class ArmService:
 
     def shutdown(self) -> None:
         self._started = False
+        self._hand_stop.set()
         self._stop_playback(silent=True)
         self._controller.shutdown()
         self._conn.disconnect()
@@ -1011,6 +1054,561 @@ class ArmService:
 
         threading.Thread(target=_worker, name="arm-notify", daemon=True).start()
 
+    # ------------------------------------------------------------ 动作序列
+
+    def plan_grasp_sequence(
+        self,
+        flow_name: str,
+        target_pos: Sequence[float],
+        *,
+        side: str = "right",
+        approach_distance: Optional[float] = None,
+        duration: Optional[float] = None,
+    ) -> Tuple[ComposedSequence, List[Dict[str, Any]], str, str]:
+        """识别之后, 把流程合成成一条可执行的动作序列。
+
+        **流程**: 流程定义 -> 步骤清单 (含 IK 解出的关节角) -> 一条时间轴
+        + 若干夹爪时间点。
+
+        关节片段 (移到上方点 / 移到抓取点) 用**本地 pinocchio 逆解**算成
+        关节角, 然后跟动作库里的关节片段 (回准备点 / 回安全点) 拼成
+        **一条**时间轴 —— 一次入控, 连续播完。
+
+        夹爪片段 (闭合夹爪) 不进时间轴, 而是记成时间点, 播放到那个时刻
+        再走 ``rs485/*`` 透传。
+
+        Args:
+            flow_name:        流程名 (configs/flows/ 里的)
+            target_pos:       识别出的目标位置 (世界系, 米)
+            side:             用哪条臂
+            approach_distance: 上方点的高度 (米); 不给用配置值
+            duration:         统一覆盖所有移动步的时长
+
+        Returns:
+            ``(序列, 各步逆解明细, 臂名, 左右)``
+        """
+        from sequence import (
+            _pose_for,
+            compose_from_names,
+            plan_from_flow,
+            set_preset_poses,
+        )
+
+        flows = self.load_flows()
+        flow = flows.get(flow_name)
+        if flow is None:
+            raise ControllerError(f"流程 {flow_name!r} 不存在")
+
+        grasp = self.arm_cfg.grasp
+        dist = (
+            float(approach_distance)
+            if approach_distance is not None
+            else float(self.arm_cfg.flow.above_distance)
+        )
+        defaults = {
+            "close_action": "闭合夹爪",
+            "open_action": "张开夹爪",
+        }
+        plan = plan_from_flow(
+            flow, target_pos,
+            approach_distance=dist,
+            duration=duration,
+            defaults=defaults,
+        )
+
+        # ---- 逆解: 把每个移动步的目标点解成关节角 ----
+        # 逆解要在**基座系**里做 —— 世界系 <-> 基座系靠控制器的 baseFrame。
+        snap = self.refresh_kinematics()
+        if snap.get("stale") or not snap.get("ok"):
+            raise ControllerError("拿不到最新的机械臂位姿，不能合成动作序列")
+        arms = snap.get("arms") or {}
+        name, arm_side = self._resolve_arm_for(side)
+        if not name or name not in arms:
+            raise ControllerError(f"找不到机械臂 {side!r}")
+        data = arms[name] or {}
+        if "base_frame" not in data or "cartesian" not in data:
+            raise ControllerError(f"{name} 还没有收到基座或末端位姿")
+        joints_now = data.get("joints")
+        if not joints_now or len(joints_now) < 7:
+            raise ControllerError(f"{name} 没有实测关节角")
+
+        # ---- 另一条臂的实测关节角 ----
+        #
+        # 时间轴上的每帧都带**双臂**的关节角 (JointState.left / .right),
+        # 但这次只用一条臂 —— 另一条臂必须保持它自己的实测姿态。
+        #
+        # **不能拿这条臂的实测角填到另一条臂的槽位** —— 那样右臂抓取时
+        # 左臂会被下发到右臂的姿态上 (实测偏差可达 117°)。
+        other_joints = list(joints_now[:7])
+        other_name = (
+            self._controller.left_arm_name if arm_side == "right"
+            else self._controller.right_arm_name
+        )
+        other_data = arms.get(other_name) or {}
+        other_actual = other_data.get("joints")
+        if other_actual and len(other_actual) >= 7:
+            other_joints = list(other_actual[:7])
+        else:
+            logger.warning(
+                "[序列] %s 没有实测关节角, 保持原状", other_name or "另一条臂"
+            )
+
+        kin = self.kinematics_for(name)
+        if kin is None:
+            raise ControllerError(
+                "本地运动学不可用（缺少 pinocchio 或 URDF），不能合成动作序列"
+            )
+        self.sync_kinematics_base(name, data.get("base_frame") or {})
+
+        # ---- 抓取姿态: 优先用流程里 detect 片段声明的, 退回全局配置 ----
+        #
+        # **拍照姿态必须和抓取姿态一致** —— 否则机械臂得先从拍照姿态转到
+        # 另一个姿态, 而那个姿态在目标点很可能根本不可达 (历史上每次抓
+        # 瓶子都报 unreachable 就是这个原因)。
+        #
+        # 所以流程里 detect 片段的 ``orientation`` 是**就近覆盖**:
+        # 流程写了就用流程的, 没写才用 configs/arm.yaml 的。
+        taught = self._flow_orientation(plan, arm_side) or \
+            grasp.orientation.get(arm_side) or {}
+        tcp = data["cartesian"]
+        if taught:
+            oa, ob, oc = (
+                float(taught["a"]), float(taught["b"]), float(taught["c"])
+            )
+        else:
+            oa, ob, oc = float(tcp["a"]), float(tcp["b"]), float(tcp["c"])
+
+        ik_results: List[Dict[str, Any]] = []
+        solved: Dict[str, Any] = {}
+
+        def _resolve(step: Any) -> Optional[Any]:
+            """把一个引用具名点的 arm 片段解成关节角。"""
+            pos = step.pos
+            ik = kin.ik_world_rpy_with_fallback(
+                pos, (oa, ob, oc), joints_now,
+                max_iters=120, tol_pos=1e-4, tol_rot=1e-3, posture_gain=0.0,
+            )
+            ik_results.append({
+                "step": step.id,
+                "pose": list(pos),
+                "ok": bool(ik.ok),
+                "err_pos_mm": round(ik.err_pos * 1000, 3),
+                "err_rot_deg": round(__import__("math").degrees(ik.err_rot), 3),
+                "iters": ik.iters,
+                "at_limit": bool(ik.at_limit),
+            })
+            if not ik.ok:
+                logger.warning(
+                    "[序列] 步骤 %s 逆解失败 (位置差 %.1fmm, 姿态差 %.1f 度)",
+                    step.id, ik.err_pos * 1000,
+                    __import__("math").degrees(ik.err_rot),
+                )
+                return None
+            q = list(ik.q)
+            if arm_side == "left":
+                return q, other_joints
+            return other_joints, q
+
+        # ---- 片段合成 ----
+        #
+        # 合成顺序按**流程片段顺序**走, 所以要把各种片段按顺序编成一条链。
+        #
+        # - ``arm`` + ``action`` -> 搬动作库的片段
+        # - ``arm`` + ``pose``   -> 用写死的关节角 (不走逆解)
+        # - ``arm`` + 具名点     -> 逆解出关节角
+        # - ``hand``             -> 手部片段 (进时间轴) + 时间点
+        # - ``hold`` (detect)    -> 关节保持片段 (期间手臂不动)
+        # - ``target``            -> 纯声明, 不产生片段
+        segments = []
+        cues = []
+        sources = []
+        steps_detail = []
+        cursor = 0.0
+
+        for step in plan:
+            if step.type == "target":
+                # 具名点声明 —— 纯声明, 不动
+                steps_detail.append({
+                    "step": step.id, "type": "target", "label": step.label,
+                    "source": step.source, "base": step.base,
+                })
+                continue
+
+            if step.type == "hold":
+                # 识别片段 —— 时间轴上占一段时长, 手臂保持不动
+                dur = float(step.duration or 1.5)
+                segments.append(
+                    Segment(
+                        type=SegmentType.ARM,
+                        label=step.label or step.id,
+                        start_time=cursor,
+                        duration=dur,
+                        end_joints=JointState(
+                            left=list(other_joints if arm_side == "right"
+                                      else joints_now[:7]),
+                            right=list(joints_now[:7] if arm_side == "right"
+                                       else other_joints),
+                        ),
+                        interpolation="cubic",
+                    )
+                )
+                cursor += dur
+                sources.append(step.id)
+                steps_detail.append({
+                    "step": step.id, "type": "hold", "label": step.label,
+                    "start": round(cursor - dur, 3), "end": round(cursor, 3),
+                })
+                continue
+
+            if step.type == "arm" and step.action:
+                # 动作库里的关节片段
+                unit = self.library.find(step.action)
+                if unit is None:
+                    logger.warning("[序列] 动作 %r 不存在, 跳过", step.action)
+                    continue
+                offset = cursor - float(unit.origin_time)
+                seg_start = cursor
+                for seg in unit.segments:
+                    segments.append(
+                        Segment(
+                            type=seg.type,
+                            label=seg.label,
+                            start_time=float(seg.start_time) + offset,
+                            duration=float(seg.duration),
+                            end_joints=seg.end_joints.copy(),
+                            interpolation=seg.interpolation,
+                            left_hand=list(seg.left_hand),
+                            right_hand=list(seg.right_hand),
+                            hand_sides=list(seg.hand_sides),
+                        )
+                    )
+                end = max(
+                    float(s.start_time) + float(s.duration) + offset
+                    for s in unit.segments
+                )
+                cursor = end
+                sources.append(step.action)
+                steps_detail.append({
+                    "step": step.id, "type": "arm", "label": step.label,
+                    "action": step.action, "start": round(seg_start, 3),
+                    "end": round(end, 3),
+                })
+                continue
+
+            if step.type == "arm" and step.pose:
+                # 显式关节角 —— **不走逆解**
+                dur = float(step.duration or grasp.duration)
+                left_q = list(joints_now[:7])
+                right_q = list(joints_now[:7])
+                if arm_side == "left":
+                    left_q = list(step.pose.get("left") or joints_now[:7])
+                    right_q = list(step.pose.get("right") or other_joints)
+                else:
+                    right_q = list(step.pose.get("right") or joints_now[:7])
+                    left_q = list(step.pose.get("left") or other_joints)
+                segments.append(
+                    Segment(
+                        type=SegmentType.ARM,
+                        label=step.label or step.id,
+                        start_time=cursor,
+                        duration=dur,
+                        end_joints=JointState(left=left_q, right=right_q),
+                        interpolation="cubic",
+                    )
+                )
+                cursor += dur
+                sources.append(step.id)
+                steps_detail.append({
+                    "step": step.id, "type": "arm", "label": step.label,
+                    "pose": "explicit", "start": round(cursor - dur, 3),
+                    "end": round(cursor, 3),
+                })
+                continue
+
+            if step.type == "arm":
+                # 引用具名点 -> 逆解
+                result = _resolve(step)
+                if result is None:
+                    raise ControllerError(
+                        f"步骤 {step.id!r} ({step.label}) 的目标点逆解失败，"
+                        f"不能合成动作序列"
+                    )
+                left_q, right_q = result
+                dur = float(step.duration or grasp.duration)
+                segments.append(
+                    Segment(
+                        type=SegmentType.ARM,
+                        label=step.label or step.id,
+                        start_time=cursor,
+                        duration=dur,
+                        end_joints=JointState(left=list(left_q), right=list(right_q)),
+                        interpolation="cubic",
+                    )
+                )
+                cursor += dur
+                sources.append(step.id)
+                steps_detail.append({
+                    "step": step.id, "type": "arm", "label": step.label,
+                    "pose": list(step.pos), "start": round(cursor - dur, 3),
+                    "end": round(cursor, 3),
+                })
+                continue
+
+            if step.type == "hand":
+                # ---- 手部片段: 手位进时间轴, 触发时刻记一个时间点 ----
+                h = self.arm_cfg.hand
+                duration = float(step.duration or 1.0)
+                pose = _pose_for(step)
+                if pose is None:
+                    # 没给手位 -> 按方向取配置的默认手位
+                    direction = step.direction or "close"
+                    pose = list(
+                        h.close_pose if direction == "close" else h.open_pose
+                    )
+                segments.append(
+                    Segment(
+                        type=SegmentType.HAND,
+                        label=step.label or step.id,
+                        start_time=cursor,
+                        duration=duration,
+                        end_joints=JointState(left=list(other_joints),
+                                              right=list(joints_now[:7])),
+                        interpolation="linear",
+                        left_hand=list(pose),
+                        right_hand=list(pose),
+                        hand_sides=["left", "right"],
+                    )
+                )
+                cues.append(
+                    HandCue(
+                        time=cursor,
+                        left=list(pose),
+                        right=list(pose),
+                        label=step.label or step.id,
+                        source=step.id,
+                    )
+                )
+                cursor += duration
+                sources.append(step.id)
+                steps_detail.append({
+                    "step": step.id, "type": "hand", "label": step.label,
+                    "action": step.action,
+                    "direction": step.direction or (
+                        "open" if step.preset == "open" else "close"
+                    ),
+                    "time": round(cursor - duration, 3),
+                    "end": round(cursor, 3),
+                })
+                continue
+
+        model = TimelineModel(segments)
+        model.set_origin_pose(self._origin_pose())
+        cues.sort(key=lambda c: c.time)
+        composed = ComposedSequence(
+            timeline=model,
+            cues=cues,
+            duration=model.total_duration,
+            sources=sources,
+            steps=steps_detail,
+        )
+        logger.info(
+            "[序列] 流程 %s 合成完成: %d 段, 时长 %.2fs, 夹爪指令 %d 个",
+            flow_name, len(segments), composed.duration, len(cues),
+        )
+        return composed, ik_results, name, arm_side
+
+    @staticmethod
+    def _flow_orientation(
+        plan: Sequence[Any], arm_side: str
+    ) -> Dict[str, float]:
+        """从流程的 ``detect`` 片段里取这条臂的拍照姿态。
+
+        流程里 detect 片段声明的 ``orientation`` 规定「拍照时手是什么
+        姿态」—— 也就等于**从那个姿态出发去抓**时的抓取姿态。
+
+        取**第一个**声明了这条臂姿态的 detect 片段 —— 流程里通常只有
+        一个 detect 片段。
+
+        Returns:
+            ``{"a":.., "b":.., "c":..}``; 没声明则返回空 dict
+        """
+        for step in plan or []:
+            if getattr(step, "type", "") != "hold":
+                continue
+            orientation = getattr(step, "orientation", None) or {}
+            abc = orientation.get(arm_side)
+            if abc:
+                return dict(abc)
+        return {}
+
+    def _resolve_arm_for(self, side: str) -> Tuple[str, str]:
+        """``left`` / ``right`` -> (控制器里的真实臂名, 左右)。"""
+        ctl = self._controller
+        key = (side or "right").strip().lower()
+        if key == "left":
+            return ctl.left_arm_name, "left"
+        if key == "right":
+            return ctl.right_arm_name, "right"
+        return "", ""
+
+    def play_sequence(
+        self,
+        action_names: Sequence[str],
+        *,
+        wait: bool = True,
+        gap: float = 0.0,
+    ) -> Dict[str, Any]:
+        """把几个动作合成**一条**时间轴, 一次入控播完。
+
+        **为什么合成而不是排队播**: 排队播 (``play_many``) 每换一个动作
+        就重新构造时间轴, 虽然不重新入控, 但每个动作的起点都取当前
+        实测姿态 —— 中间会有「重新对齐」的空隙。合成一条时间轴则完全
+        连续。
+
+        夹爪片段不在这条时间轴上直接下发 (实时指令包里没有手部字段),
+        而是记成**时间点**, 播放到那个时刻再单独走 ``rs485/*`` 透传。
+        语义与 ActionPlanner 的 ``segmentEntered`` 一致。
+
+        Args:
+            action_names: 动作名, 按执行顺序
+            wait:         等播完再返回 (默认 True)
+            gap:          相邻动作之间的停顿 (秒)
+
+        Returns:
+            ``{"ok":..., "finished":..., "sequence": {...}}``
+        """
+        from sequence import compose_from_names
+
+        names = [str(x).strip() for x in (action_names or []) if str(x).strip()]
+        if not names:
+            raise ActionNotFound("动作名为空")
+
+        if not self.control_enabled:
+            logger.warning("[服务] 控制指令总闸已关闭: 拒绝播放 %s", ", ".join(names))
+            raise ControllerError("机械臂控制已关闭，机械臂没有动")
+
+        try:
+            composed = compose_from_names(
+                self.library, names, self._origin_pose(), gap=gap
+            )
+        except LookupError as exc:
+            raise ActionNotFound(str(exc)) from exc
+
+        result: Dict[str, Any] = {"ok": True, "sequence": composed.to_dict()}
+        if not wait:
+            self._enqueue_sequence(composed)
+            return result
+
+        self._play_composed(composed)
+        result["finished"] = True
+        return result
+
+    def _enqueue_sequence(self, composed: Any) -> None:
+        """把合成好的序列丢进播放队列 (异步播放)。"""
+        with self._lock:
+            if self._play_thread is not None and self._play_thread.is_alive():
+                raise ControllerError("已有动作正在播放, 请先停止")
+            self._stop_requested = False
+            self._loop = False
+            self._speed = 1.0
+            self._current_action = "+".join(composed.sources)
+            self._current_duration = composed.duration
+            self._queue = []
+            self._queue_all = list(composed.sources)
+            self._queue_duration = composed.duration
+            self._queue_started = False
+            self._pending_composed = composed
+            thread = threading.Thread(
+                target=self._play_loop, name="arm-play", daemon=True
+            )
+            self._play_thread = thread
+        thread.start()
+
+    def _play_composed(self, composed: Any) -> None:
+        """执行一条合成好的时间轴 (阻塞到播完)。"""
+        if not self._conn.connected:
+            self._controller._set_phase(Phase.CONNECTING, "正在连接控制器")
+            if not run_blocking(self._conn.connect):
+                raise ControllerError(f"无法连接控制器: {self.arm_cfg.controller_ws}")
+            self._on_connected()
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not self._controller.active_arms():
+                time.sleep(0.05)
+
+        if not self._controller.active_arms():
+            raise ControllerError("尚未识别到机器人, 无法播放")
+
+        self._controller._set_phase(Phase.ENTERING, "正在检查机械臂状态")
+        report = self.check_safety()
+        if not report.ok:
+            logger.warning("[门阀] 拒绝执行序列: %s", report.reason)
+            self._speak_reject(report)
+            raise ControllerError(f"安全门阀拒绝执行: {report.reason}")
+
+        if self._controller.disabled_arms():
+            self._controller._set_phase(Phase.ENTERING, "正在给机械臂上使能")
+            self._controller.enable_arms()
+            deadline = time.time() + 3.0
+            while time.time() < deadline and self._controller.disabled_arms():
+                time.sleep(0.05)
+
+        if not self._controller.has_actual_joints():
+            for arm_name in self._controller.active_arms():
+                self._query_robot_status(arm_name)
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not self._controller.has_actual_joints():
+                time.sleep(0.05)
+
+        # ---- 构造引擎 (夹爪指令挂在时间点上) ----
+        engine = PlaybackEngine(
+            composed.timeline,
+            on_frame=self._on_frame,
+            on_finished=self._on_playback_finished,
+            on_segment=self._on_segment_entered,
+        )
+        with self._lock:
+            self._engine = engine
+            #: 合成序列里的夹爪指令是**时间点** —— 到了才由后台线程下发
+            #: (见 `_dispatch_hand_cues`)。
+            self._pending_cues = list(composed.cues)
+
+        self._conn.get_realtime_status()
+        time.sleep(0.3)
+        self._controller.enter_control()
+
+        start_frame = engine.prime_start_frame()
+        self._controller.push_frame(start_frame)
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if self._controller.advance_lead_in():
+                break
+            if self._stop_requested:
+                return
+            if self._controller.failed:
+                raise ControllerError(self._controller.last_error or "入控失败")
+            time.sleep(TICK_MS / 1000.0)
+
+        if not self._controller.playback_active:
+            if self._stop_requested:
+                return
+            if self._controller.failed:
+                raise ControllerError(self._controller.last_error or "入控失败")
+            raise ControllerError("起点对齐超时")
+
+        engine.start()
+        self._run_engine(engine)
+
+        # ---- 收尾: 停控交还通道 ----
+        #
+        # 播完必须显式停控, 否则控制器会话一直挂着 (phase 停在 playing,
+        # streaming 一直是 true), 下一次指令会因为「已有动作在播放」被拒。
+        #
+        # 只在没被 stop() 打断时收尾 —— 被打断时 stop() 已经停过了。
+        if not self._stop_requested:
+            self._stop_playback(silent=True)
+            self._controller._set_phase(Phase.IDLE, "序列播放完成")
+
     def _do_play(self, unit: ActionUnit) -> None:
         """播放一个动作 (队列里的第一个)。
 
@@ -1077,9 +1675,13 @@ class ArmService:
             model,
             on_frame=self._on_frame,
             on_finished=self._on_playback_finished,
+            on_segment=self._on_segment_entered,
         )
         with self._lock:
             self._engine = engine
+            #: 普通动作播放没有「时间点上的夹爪指令」—— 清掉上一轮残留,
+            #: 否则会串到这次播放里误触发。
+            self._pending_cues = []
 
         # ---- 5. 清理残留会话 + 入控 ----
         #
@@ -1095,11 +1697,7 @@ class ArmService:
         # prime_start_frame 冻结出发姿态并算出时间轴 0 时刻的那一帧。
         # 把这一帧推给控制器, 它会启动 700ms 的 S 曲线对齐。
         start_frame = engine.prime_start_frame()
-        self._controller.push_frame(
-            start_frame,
-            engine.evaluate_hand_at(0.0, "left"),
-            engine.evaluate_hand_at(0.0, "right"),
-        )
+        self._controller.push_frame(start_frame)
 
         # 等对齐完成
         deadline = time.time() + 5.0
@@ -1198,20 +1796,20 @@ class ArmService:
             model,
             on_frame=self._on_frame,
             on_finished=self._on_playback_finished,
+            on_segment=self._on_segment_entered,
         )
         with self._lock:
             self._engine = engine
+            #: 普通动作播放没有「时间点上的夹爪指令」—— 清掉上一轮残留,
+            #: 否则会串到这次播放里误触发。
+            self._pending_cues = []
 
         # ---- 冻结起点 -> 对齐 -> 播放 ----
         #
         # 这里仍然要对齐 —— 控制器要求第一帧必须贴近实测角, 否则拒收
         # (firstFrameJumpRejected)。对齐期间机器人平滑过渡到新轨迹起点。
         start_frame = engine.prime_start_frame()
-        self._controller.push_frame(
-            start_frame,
-            engine.evaluate_hand_at(0.0, "left"),
-            engine.evaluate_hand_at(0.0, "right"),
-        )
+        self._controller.push_frame(start_frame)
 
         deadline = time.time() + 5.0
         while time.time() < deadline:
@@ -1257,16 +1855,119 @@ class ArmService:
     def _on_frame(self, t: float, state: JointState) -> None:
         """播放引擎送来一帧目标。
 
-        手部值**同时**送过去 —— 手部片段不产生关节插值, 但手部指令
-        跟关节指令在同一个 UDP 包里发, 所以得在同一帧里一起给。
+        **手位不在这里下发** —— 手部指令走控制器 ``rs485/*`` 透传 (Modbus
+        RTU), 一次写+读是两次控制面往返, 比臂控慢得多。塞进臂控循环里会
+        把关节流拖死。
+
+        手位在两个时机下发:
+
+        - **片段进入时** (见 :meth:`_on_segment_entered`) —— 时间轴里带
+          手部片段时 (动作库里的「闭合夹爪」), 语义与 ActionPlanner 的
+          ``segmentEntered`` 一致;
+        - **时间点到达时** (见 :meth:`_dispatch_hand_cues`) —— 合成序列里
+          的夹爪指令不进时间轴, 只记时间点。
+        """
+        self._controller.push_frame(state)
+        self._dispatch_hand_cues(t)
+        self._record_stream(t, state)
+
+    def _record_stream(self, t: float, state: JointState) -> None:
+        """记录一帧下发的关节目标 (诊断用)。
+
+        只在 ``_stream_trace_on`` 为真时记录 —— 长期开着会把内存吃满。
+        """
+        if not self._stream_trace_on:
+            return
+        with self._lock:
+            self._stream_trace.append({
+                "t": round(t, 4),
+                "left": [round(v, 6) for v in state.left],
+                "right": [round(v, 6) for v in state.right],
+            })
+
+    def _dispatch_hand_cues(self, t: float) -> None:
+        """到点了就把夹爪指令丢给后台线程下发。
+
+        **下发本身是阻塞的** (两次控制面往返), 所以只把指令**入队**,
+        真正下发由独立线程做 —— 臂控循环不能被手部通信拖住。
+        """
+        with self._lock:
+            cues = self._pending_cues
+            if not cues:
+                return
+            due = [c for c in cues if c.time <= t]
+            if not due:
+                return
+            self._pending_cues = [c for c in cues if c.time > t]
+
+        for cue in due:
+            self._hand_queue.put(cue)
+
+    def _hand_worker(self) -> None:
+        """灵巧手下发线程。
+
+        一次「写+读」要两次控制面往返, 还要等通信板发送、等手应答 ——
+        远慢于 90 Hz 的臂控循环。所以手部指令走这个独立线程, 臂控线程
+        只管入队。
+        """
+        while not self._hand_stop.is_set():
+            try:
+                cue = self._hand_queue.get(timeout=0.2)
+            except Exception:
+                continue
+            try:
+                ok = self.send_hand_positions(
+                    left=cue.left, right=cue.right, connect=True
+                )
+                if not ok:
+                    logger.warning(
+                        "[灵巧手] 时间点 %.2fs 的手位只下了一半 (%s)",
+                        cue.time, cue.label,
+                    )
+                else:
+                    logger.info(
+                        "[灵巧手] 时间点 %.2fs 下发手位 (%s): left=%s right=%s",
+                        cue.time, cue.label,
+                        cue.left if cue.left is not None else "-",
+                        cue.right if cue.right is not None else "-",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[灵巧手] 时间点 %.2fs 的手位下发失败: %s", cue.time, exc
+                )
+            finally:
+                self._hand_queue.task_done()
+
+    def _on_segment_entered(self, index: int) -> None:
+        """播放引擎进入了一个新片段。
+
+        **只有手部片段会下发手位** —— 机械臂片段完全不含手部信息, 两类
+        片段各自独立, 互不触发对方的动作。
+
+        下发是**一次性的**, 不做插值 —— 驱动器的 ``write_time_ms`` 决定
+        到位过程。
         """
         engine = self._engine
-        left_hand: Optional[List[int]] = None
-        right_hand: Optional[List[int]] = None
-        if engine is not None:
-            left_hand = engine.evaluate_hand_at(t, "left")
-            right_hand = engine.evaluate_hand_at(t, "right")
-        self._controller.push_frame(state, left_hand, right_hand)
+        if engine is None:
+            return
+        model = engine._model
+        if model is None or index < 0 or index >= model.segment_count:
+            return
+        seg = model.get_segment(index)
+        if seg is None or seg.is_arm:
+            return
+
+        # 只控制**这个片段声明要管**的那只手
+        left = seg.hand_for("left")
+        right = seg.hand_for("right")
+        if left is None and right is None:
+            return
+
+        cue = HandCue(
+            time=0.0, left=left, right=right,
+            label=seg.label, source="timeline",
+        )
+        self._hand_queue.put(cue)
 
     def _on_playback_finished(self) -> None:
         self._broadcast({"type": "finished"})
@@ -1442,6 +2143,229 @@ class ArmService:
         return self._joint_mover.move_to(
             arm, x, y, z, a, b, c, duration, speak
         )
+
+    def move_joints(
+        self,
+        arm: str,
+        joints: Sequence[float],
+        duration: Optional[float] = None,
+        speak: bool = True,
+    ) -> Dict[str, Any]:
+        """按给定的关节角移动 —— **不走逆解**。
+
+        给 ``arm`` + ``pose`` 的流程片段用: 目标关节角是配置里写死的,
+        没必要再解一遍。实现走本地关节流 (pinocchio 只用来核对, 不参与
+        求解)。
+        """
+        return self._joint_mover.move_joints(arm, joints, duration, speak)
+
+    # ------------------------------------------------------------ 灵巧手
+
+    def hand_controller(self) -> Optional[Any]:
+        """灵巧手客户端 (懒创建)。"""
+        if not self.arm_cfg.hand.enabled:
+            return None
+        if self._hand is None:
+            from robot.hand import HandController
+
+            h = self.arm_cfg.hand
+            self._hand = HandController(
+                self._conn,
+                left_slave=h.left_slave,
+                right_slave=h.right_slave,
+                left_addr=h.left_addr,
+                right_addr=h.right_addr,
+                baud_rate=h.baud_rate,
+                write_time_ms=h.write_time_ms,
+                enabled=True,
+            )
+        return self._hand
+
+    def connect_hand(self, force: bool = False) -> Dict[str, Any]:
+        """连接灵巧手 (解析通道 + 初始化串口)。
+
+        **幂等** —— 已经连上就直接返回状态, 除非 ``force=True``。
+        """
+        hc = self.hand_controller()
+        if hc is None:
+            raise ControllerError(
+                "灵巧手未启用 (configs/arm.yaml 的 arm.hand.enabled)"
+            )
+        if hc.is_ready() and not force:
+            return hc.status()
+        if self._hand_connecting:
+            return hc.status()
+        self._hand_connecting = True
+        try:
+            return hc.connect()
+        finally:
+            self._hand_connecting = False
+
+    def hand_status(self) -> Dict[str, Any]:
+        """灵巧手状态。"""
+        hc = self.hand_controller()
+        if hc is None:
+            return {"enabled": False, "ready": False}
+        return hc.status()
+
+    def send_hand_positions(
+        self,
+        left: Optional[Sequence[int]] = None,
+        right: Optional[Sequence[int]] = None,
+        *,
+        connect: bool = True,
+    ) -> bool:
+        """下发一组手位 (归一化 0~1000)。
+
+        Args:
+            left:  左手 6 个值; None = 不动左手
+            right: 右手 6 个值; None = 不动右手
+            connect: 没连上时先试着连一次
+
+        Returns:
+            是否全部下发成功
+        """
+        hc = self.hand_controller()
+        if hc is None:
+            logger.info("[灵巧手] 未启用, 跳过手位下发")
+            return False
+        if not hc.is_ready():
+            if not connect:
+                return False
+            try:
+                self.connect_hand()
+            except Exception as exc:
+                logger.warning("[灵巧手] 连接失败: %s", exc)
+                return False
+        if not hc.is_ready():
+            return False
+        return hc.send_both(left=left, right=right)
+
+    def send_hand_preset(
+        self, name: str, side: Optional[str] = None
+    ) -> bool:
+        """下发一个预设手势 (如「一把抓」「释放」)。"""
+        hc = self.hand_controller()
+        if hc is None:
+            raise ControllerError(
+                "灵巧手未启用 (configs/arm.yaml 的 arm.hand.enabled)"
+            )
+        if not hc.is_ready():
+            self.connect_hand()
+        if side in ("left", "right"):
+            return hc.send_preset(name, side)
+        return hc.send_preset(name)
+
+    def send_hand_open(self, side: Optional[str] = None) -> bool:
+        """张开手 (``open_pose``)。"""
+        hc = self.hand_controller()
+        if hc is None:
+            raise ControllerError("灵巧手未启用")
+        pose = list(self.arm_cfg.hand.open_pose)
+        if side == "left":
+            return self.send_hand_positions(left=pose, right=None)
+        if side == "right":
+            return self.send_hand_positions(left=None, right=pose)
+        return self.send_hand_positions(left=pose, right=pose)
+
+    def send_hand_close(self, side: Optional[str] = None) -> bool:
+        """握紧手 (``close_pose``)。"""
+        hc = self.hand_controller()
+        if hc is None:
+            raise ControllerError("灵巧手未启用")
+        pose = list(self.arm_cfg.hand.close_pose)
+        if side == "left":
+            return self.send_hand_positions(left=pose, right=None)
+        if side == "right":
+            return self.send_hand_positions(left=None, right=pose)
+        return self.send_hand_positions(left=pose, right=pose)
+
+    # ------------------------------------------------------------ 流程定义
+
+    def load_flows(self, force: bool = False) -> Dict[str, Any]:
+        """载入流程定义 (configs/flows/*.yaml)。
+
+        **懒加载 + 缓存 + 热重载** —— 流程文件很少改, 不必每次请求都
+        扫目录; 但改了以后要**立刻生效**, 不能靠重启服务。
+
+        缓存命中的判断方式是**比对目录指纹** (每个 yaml 的 mtime + 大小,
+        见 :func:`arm.flow.flows_signature`) —— 指纹变了就重读, 没变就
+        直接返回缓存。
+
+        **为什么不用「脏标记」**: 脏标记得有人去设它 —— 而 yaml 是人
+        在外面直接改的, 服务根本不知道什么时候该清标记。结果就是
+        「改完 yaml 不重启就不生效」, 而且没有任何提示。
+
+        Args:
+            force: True = 无条件重读 (忽略指纹)
+        """
+        from flow import (
+            DEFAULT_FLOW,
+            flow_from_legacy,
+            flows_signature,
+            load_flows as _load_flows,
+        )
+
+        directory = Path(self.arm_cfg.flows_dir)
+        signature = flows_signature(directory)
+
+        if not force and self._flows and signature == self._flows_signature:
+            return self._flows
+
+        # 指纹变了 (或者还没载入过) -> 重读
+        if self._flows and signature != self._flows_signature:
+            logger.info(
+                "[流程] 目录有变动 (%s -> %s), 重新载入",
+                self._flows_signature, signature,
+            )
+
+        flows = _load_flows(directory)
+        self._flows = flows
+        self._flows_signature = signature
+
+        if DEFAULT_FLOW not in flows:
+            legacy = flow_from_legacy(self.arm_cfg.flow)
+            flows[DEFAULT_FLOW] = legacy
+            logger.info(
+                "[流程] %s 里没有 %s, 用 arm.yaml 的 grasp.flow 合成兜底",
+                directory, DEFAULT_FLOW,
+            )
+        logger.info(
+            "[流程] 共 %d 条: %s", len(flows), ", ".join(sorted(flows))
+        )
+        return self._flows
+
+    def flow_names(self) -> List[str]:
+        """所有流程名。"""
+        return sorted(self.load_flows().keys())
+
+    def flows_signature(self) -> Tuple[Tuple[str, int, int], ...]:
+        """流程目录的当前指纹 (mtime + 大小)。
+
+        跟缓存里存的那份对比就知道 yaml 有没有变。
+        """
+        from flow import flows_signature as _signature
+
+        return _signature(Path(self.arm_cfg.flows_dir))
+
+    def get_flow(self, name: str) -> Optional[Any]:
+        """拿一条流程。拿不到返回 ``None``。"""
+        flows = self.load_flows()
+        return flows.get(name)
+
+    def default_flow(self) -> Any:
+        """默认流程 (``grasp``)。
+
+        一定拿得到 —— 缺文件时已经用旧配置合成了。
+        """
+        from flow import DEFAULT_FLOW
+
+        flows = self.load_flows()
+        flow = flows.get(DEFAULT_FLOW)
+        if flow is None:  # pragma: no cover - load_flows 保证会补上
+            flow = flow_from_legacy(self.arm_cfg.flow)
+            flows[DEFAULT_FLOW] = flow
+        return flow
 
     def kinematics_for(self, arm: str) -> Any:
         """拿某条臂的本地运动学对象 (pinocchio)。拿不到返回 ``None``。

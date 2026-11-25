@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[2]
 ARM_CONFIG_PATH = ROOT / "configs" / "arm.yaml"
 #: 动作库默认目录 (services/arm_service/data)
 DEFAULT_ACTION_DIR = Path(__file__).resolve().parent / "data"
+#: 流程定义目录 (configs/flows) —— 一条流程一个 yaml
+DEFAULT_FLOWS_DIR = ROOT / "configs" / "flows"
 
 DEFAULTS: Dict[str, Any] = {
     "arm": {
@@ -150,23 +152,70 @@ class GraspConfig:
 
 @dataclass
 class HandConfig:
-    """灵巧手 (夹爪) 配置。
+    """灵巧手 (Revo2) 配置。
 
-    **enabled 默认 false** —— 控制器认不认 UDP 报文里的手部字段还没在
-    真机上验证过 (``tools/probe_hand.py`` 就是干这个的)。没验证就发,
-    万一格式不对, 控制器会**整包丢弃** (invalidDatagram) —— 那时候
-    连手臂都不动了, 比不发手部指令糟得多。
+    灵巧手**不走 UDP 实时指令包** —— 它接在末端通信板的 RS485 口, 要经
+    控制器的 ``rs485/*`` 接口透传 Modbus RTU 帧。详见
+    :mod:`robot.hand`。
 
-    探针确认控制器接受之后, 把这个打开即可, 不用改代码。
+    .. note::
+       **控制器文档 §21.9 里实时指令包没有 ``hand`` 字段** —— 往那个包里
+       多塞字段会被整包判 ``invalidDatagram``, 连手臂都不动。所以这里
+       没有「UDP 手部字段开关」这个概念。
     """
 
-    #: 是否在报文里带手部字段
+    #: 是否启用灵巧手控制
     enabled: bool = False
+
+    #: 串口波特率 (RS485 透传)
+    baud_rate: int = 115200
+
+    #: 写动作时长 (毫秒) —— 驱动器按这个时间走完目标, 避免瞬间打到
+    write_time_ms: int = 100
+
+    #: 左手: 通信板从站名 + Modbus 从站地址
+    left_slave: str = "EtherCAT485L"
+    left_addr: int = 126
+
+    #: 右手: 通信板从站名 + Modbus 从站地址
+    right_slave: str = "EtherCAT485R"
+    right_addr: int = 127
+
+    #: 「开」的手位 (归一化 0~1000) —— 6 个自由度
+    #:
+    #: Revo2 的「释放」: 拇指侧摆保持 0, 其余全开。
+    open_pose: List[int] = field(default_factory=lambda: [0, 0, 0, 0, 0, 0])
+
+    #: 「合」的手位 (归一化 0~1000) —— 6 个自由度
+    #:
+    #: Revo2 的「一把抓」: 拇指弯曲拉满、侧摆保持 0、四指弯曲拉满。
+    close_pose: List[int] = field(
+        default_factory=lambda: [1000, 0, 1000, 1000, 1000, 1000]
+    )
+
+    def validate(self) -> None:
+        """检查配置是否合法。"""
+        for name in ("open_pose", "close_pose"):
+            pose = getattr(self, name)
+            if len(pose) != 6:
+                raise ValueError(f"hand.{name} 须为 6 个值, 得到 {len(pose)} 个")
+            for v in pose:
+                if not 0 <= int(v) <= 1000:
+                    raise ValueError(f"hand.{name} 的值须在 0~1000, 得到 {v}")
+        if not 1 <= int(self.write_time_ms) <= 2000:
+            raise ValueError(
+                f"hand.write_time_ms 须在 1~2000 ms, 得到 {self.write_time_ms}"
+            )
 
 
 @dataclass
 class GraspFlowConfig:
-    """抓取流程 (5 步) 配置。
+    """抓取流程的**兜底**配置。
+
+    .. deprecated::
+        现在流程定义在 ``configs/flows/*.yaml`` 里 (见
+        :mod:`arm.flow`)。这个类只在 ``configs/flows/`` 里缺默认流程
+        时, 被用来**合成**一条等价流程 —— 保证升级过程不破。
 
     流程: 回准备点 -> 拍照识别 -> 移到上方点 -> 移到抓取点 -> 回安全点。
     """
@@ -188,6 +237,11 @@ class GraspFlowConfig:
     above_duration: float = 3.0
     #: 移到抓取点的运动时长 (秒)
     grasp_duration: float = 2.0
+    #: 拍照姿态 (各臂 a/b/c) —— 兜底流程的 detect 片段用它。
+    #:
+    #: **拍照姿态 = 抓取姿态** —— 机械臂从拍照时的姿态直接抓。
+    #: 取自 ``grasp.orientation`` (configs/arm.yaml)。
+    orientation: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -218,8 +272,10 @@ class ArmConfig:
     connect_timeout: float = 5.0
     play_timeout_ms: int = 15000
     grasp: GraspConfig = field(default_factory=GraspConfig)
-    #: 抓取流程 (5 步) 配置
+    #: 抓取流程的**兜底**配置 (由 configs/flows/ 里的流程文件取代)
     flow: GraspFlowConfig = field(default_factory=GraspFlowConfig)
+    #: 流程定义目录 (configs/flows) —— 一条流程一个 yaml
+    flows_dir: str = str(DEFAULT_FLOWS_DIR)
     #: 灵巧手 (夹爪) 配置
     hand: HandConfig = field(default_factory=HandConfig)
     #: 笛卡尔移动走哪条路
@@ -392,19 +448,50 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         open_action=str(fl.get("open_action", "张开夹爪") or ""),
         above_duration=_num(durations.get("above"), 3.0),
         grasp_duration=_num(durations.get("grasp"), 2.0),
+        orientation={
+            side: dict(abc) for side, abc in grasp.orientation.items() if abc
+        },
     )
 
     # ---- 灵巧手 ----
     hd = (a.get("hand") or {})
     if not isinstance(hd, dict):
         hd = {}
+
+    def _pose(key: str, default: List[int]) -> List[int]:
+        """读一组 6 个 0~1000 的手位。"""
+        raw = hd.get(key)
+        if not isinstance(raw, (list, tuple)) or len(raw) != 6:
+            return list(default)
+        try:
+            return [max(0, min(1000, int(v))) for v in raw]
+        except (TypeError, ValueError):
+            return list(default)
+
     hand = HandConfig(
         enabled=bool(
             hd.get("enabled", os.environ.get("ARM_HAND_ENABLED", False))
-        )
+        ),
+        baud_rate=int(hd.get("baud_rate", 115200)),
+        write_time_ms=int(hd.get("write_time_ms", 100)),
+        left_slave=str(hd.get("left_slave", "EtherCAT485L")),
+        left_addr=int(hd.get("left_addr", 126)),
+        right_slave=str(hd.get("right_slave", "EtherCAT485R")),
+        right_addr=int(hd.get("right_addr", 127)),
+        open_pose=_pose("open_pose", [0, 0, 0, 0, 0, 0]),
+        close_pose=_pose("close_pose", [1000, 0, 1000, 1000, 1000, 1000]),
     )
+    try:
+        hand.validate()
+    except ValueError as exc:
+        logger.error("[灵巧手] 配置不合法, 灵巧手将被禁用: %s", exc)
+        hand.enabled = False
     if hand.enabled:
-        logger.info("灵巧手通道已启用 (报文里会带 hand 字段)")
+        logger.info(
+            "[灵巧手] 已启用 (RS485 透传, %d baud, 左 %s/%d, 右 %s/%d)",
+            hand.baud_rate, hand.left_slave, hand.left_addr,
+            hand.right_slave, hand.right_addr,
+        )
 
     # 控制指令总闸: 环境变量优先 (ARM_ENABLED), 否则用 yaml。
     # 空字符串当作「没设置」 -> 用 yaml 的值。
@@ -438,6 +525,9 @@ def load_config(path: Path = ARM_CONFIG_PATH) -> Config:
         play_timeout_ms=int(a.get("play_timeout_ms", 15000)),
         grasp=grasp,
         flow=flow,
+        flows_dir=os.environ.get(
+            "ARM_FLOWS_DIR", a.get("flows_dir", str(DEFAULT_FLOWS_DIR))
+        ),
         hand=hand,
         move_mode=os.environ.get(
             "ARM_MOVE_MODE", a.get("move_mode", "local_ik")

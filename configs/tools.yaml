@@ -173,8 +173,9 @@ tools:
     # vision.grasp, 这个 tool 会跟着一起被剔掉
     skill: vision.grasp
     description: >-
-      用相机找到某个物体 (多个时取离机器人最近的), 然后走完 5 步抓取流程:
-      回准备点 -> 拍照识别 -> 移到上方点 -> 移到抓取点并闭合夹爪 -> 回安全点。
+      用相机找到某个物体 (多个时取离机器人最近的), 然后按流程定义抓取它。
+      默认流程是: 回准备点 -> 拍照识别 -> 移到上方点 -> 移到抓取点并闭合夹爪
+      -> 回安全点。流程定义在 configs/flows/ 里, 改流程不用改代码。
       只有用户明确要求「抓」「拿」「取」某个物体时使用; 只问位置或有没有时用
       find_object。
       动不动由机械臂服务的控制总闸决定 (configs/arm.yaml 的 arm.enabled),
@@ -191,6 +192,9 @@ tools:
           type: string
           enum: ["left", "right"]
           description: 用哪条臂, 用户没说就用 right
+        flow:
+          type: string
+          description: 用哪条流程 (configs/flows/ 里的流程名), 用户没说就用默认的 grasp
       required: ["name"]
 
 # ---------------------------------------------------------------------

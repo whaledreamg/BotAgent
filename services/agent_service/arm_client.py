@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import httpx
 
@@ -280,11 +280,49 @@ class ArmClient:
             raise ArmError(f"移动请求失败 (HTTP {resp.status_code}): {resp.text[:200]}")
         return resp.json()
 
+    async def move_joints(
+        self,
+        arm: str,
+        joints: Sequence[float],
+        duration: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """把某条臂**直接**移到给定的关节角。**同步等到走完**。
+
+        **不走逆解** —— 目标关节角是调用方直接给的。给流程里的
+        ``arm`` + ``pose`` 片段用。
+
+        被门阀拒绝时不抛异常, 返回 ``ok=false`` 和可播报的 ``message``;
+        只有服务不可达这类传输错误才抛 ArmError。
+        """
+        payload: Dict[str, Any] = {
+            "arm": arm,
+            "joints": [float(v) for v in joints],
+            "speak": False,
+        }
+        if duration is not None:
+            payload["duration"] = float(duration)
+        timeout = float(duration or 3.0) + 20.0
+        try:
+            resp = await self._client.post(
+                "/v1/move_joints", json=payload, timeout=timeout
+            )
+        except Exception as exc:
+            raise ArmError(f"机械臂服务不可达 ({self.base_url}): {exc}") from exc
+        if resp.status_code >= 400:
+            raise ArmError(
+                f"按关节角移动请求失败 (HTTP {resp.status_code}): {resp.text[:200]}"
+            )
+        return resp.json()
+
     async def flow_config(self) -> Dict[str, Any]:
         """抓取流程 (5 步) 的配置。
 
         来自机械臂服务的 ``configs/arm.yaml`` —— agent 那边不自己读
         yaml, 两处配置不同步很麻烦。
+
+        .. note::
+            这是**旧接口**, 只给扁平参数。流程的完整定义 (步骤列表)
+            用 :meth:`flow_definition`。
         """
         try:
             resp = await self._client.get("/v1/flow", timeout=6.0)
@@ -292,6 +330,146 @@ class ArmClient:
             return resp.json()
         except Exception as exc:
             raise ArmError(f"查询抓取流程配置失败: {exc}") from exc
+
+    async def flow_definition(self, name: str = "grasp") -> Dict[str, Any]:
+        """拿一条流程的**完整定义** (步骤列表 + 每步的参数)。
+
+        流程定义在机械臂服务的 ``configs/flows/*.yaml`` 里 —— agent
+        那边不自己读 yaml, 两处配置不同步很麻烦。
+
+        Args:
+            name: 流程名 (默认 "grasp")
+
+        Returns:
+            ``{"name", "description", "steps": [...], "defaults": {...},
+            "recovery_action": "..."}``
+        """
+        try:
+            resp = await self._client.get(
+                f"/v1/flows/{name}", timeout=6.0
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"查询流程 {name!r} 定义失败: {exc}") from exc
+
+    async def flow_names(self) -> List[str]:
+        """所有可用的流程名。"""
+        try:
+            resp = await self._client.get("/v1/flows", timeout=6.0)
+            resp.raise_for_status()
+            body = resp.json()
+            return [str(f.get("name")) for f in (body.get("flows") or [])]
+        except Exception as exc:
+            raise ArmError(f"查询流程列表失败: {exc}") from exc
+
+    async def grasp_sequence(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        *,
+        side: str = "right",
+        flow: str = "grasp",
+        approach_distance: Optional[float] = None,
+        duration: Optional[float] = None,
+        plan_only: bool = False,
+    ) -> Dict[str, Any]:
+        """识别之后, 让机械臂把流程合成成一条动作序列并执行。
+
+        **这是「先识别, 再执行」的后半段** —— 目标位置由 agent 侧的视觉
+        skill 算好传进来。
+
+        机械臂服务那边做的事: 流程定义 -> 步骤清单 (移动步用**本地
+        pinocchio 逆解**算成关节角) -> 一条时间轴 (关节片段) + 若干夹爪
+        时间点。关节片段一次入控连续播完; 夹爪片段到点了再走
+        ``rs485/*`` 透传。
+
+        Args:
+            x, y, z:           目标位置 (世界系, 米)
+            side:              用哪条臂 ("left" / "right")
+            flow:              流程名 (configs/flows/ 里的)
+            approach_distance: 上方点的高度 (米); 不给用配置值
+            duration:          统一覆盖所有移动步的时长 (秒)
+            plan_only:         只合成不执行
+
+        Returns:
+            ``{"ok":..., "sequence": {...}, "ik": [...]}``
+        """
+        payload: Dict[str, Any] = {
+            "x": float(x), "y": float(y), "z": float(z),
+            "side": side, "flow": flow, "plan_only": bool(plan_only),
+        }
+        if approach_distance is not None:
+            payload["approach_distance"] = float(approach_distance)
+        if duration is not None:
+            payload["duration"] = float(duration)
+        try:
+            resp = await self._client.post(
+                "/v1/grasp_sequence", json=payload, timeout=180.0
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"合成抓取动作序列失败: {exc}") from exc
+
+    async def play_sequence(
+        self,
+        actions: List[str],
+        *,
+        gap: float = 0.0,
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        """把几个动作合成**一条**时间轴, 一次入控播完。
+
+        夹爪片段不在这条时间轴上直接下发 (实时指令包里没有手部字段),
+        而是记成时间点, 播放到那个时刻再走 ``rs485/*`` 透传。
+        """
+        try:
+            resp = await self._client.post(
+                "/v1/sequence",
+                json={"actions": list(actions), "gap": float(gap),
+                      "wait": bool(wait)},
+                timeout=180.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"播放动作序列失败: {exc}") from exc
+
+    async def hand_status(self) -> Dict[str, Any]:
+        """灵巧手状态。"""
+        try:
+            resp = await self._client.get("/v1/hand/status", timeout=6.0)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"查询灵巧手状态失败: {exc}") from exc
+
+    async def hand_command(
+        self,
+        action: str,
+        *,
+        side: Optional[str] = None,
+        preset: Optional[str] = None,
+        positions: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """给灵巧手下发指令 (``open`` / ``close`` / ``preset``)。"""
+        payload: Dict[str, Any] = {"action": action}
+        if side:
+            payload["side"] = side
+        if preset:
+            payload["preset"] = preset
+        if positions:
+            payload["positions"] = list(positions)
+        try:
+            resp = await self._client.post(
+                f"/v1/hand/{action}", json=payload, timeout=20.0
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            raise ArmError(f"灵巧手指令失败: {exc}") from exc
 
     async def check_safety(self) -> Dict[str, Any]:
         """跑一次安全门阀检查 (不执行动作)。

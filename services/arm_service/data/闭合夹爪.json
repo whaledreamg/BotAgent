@@ -3,7 +3,8 @@
         {
             "duration": 1.0,
             "hand": {
-                "rightHand": [1000, 1000, 1000, 1000, 1000, 1000]
+                "leftHand": [1000, 0, 1000, 1000, 1000, 1000],
+                "rightHand": [1000, 0, 1000, 1000, 1000, 1000]
             },
             "interpolation": "linear",
             "label": "手1",

@@ -62,7 +62,6 @@ class ArmController:
         lead_in_ms: int = 700,
         joint_limit: Optional[Dict[str, Any]] = None,
         idle_stop_ms: int = 1000,
-        hand_enabled: bool = False,
         on_phase: Optional[Callable[[str, str], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -76,13 +75,11 @@ class ArmController:
         self._on_phase = on_phase
         self._on_error = on_error
 
-        # hand_enabled 默认 false —— 控制器认不认报文里的手部字段还没在
-        # 真机上验证过 (tools/probe_hand.py)。没验证就发, 万一格式不对,
-        # 控制器会整包丢弃 (invalidDatagram) —— 那时连手臂都不动了。
+        # 灵巧手不走报文里的手部字段 (控制器 §21.9 的实时指令包没有
+        # 这个字段), 它走 rs485/* 透传。见 robot/hand.py。
         self._streamer = JointStreamer(
             port=command_port,
             frequency=frequency,
-            hand_enabled=hand_enabled,
         )
         self._streamer.set_idle_stop_ms(idle_stop_ms)
 
@@ -411,13 +408,12 @@ class ArmController:
 
     # ------------------------------------------------------------ 帧
 
-    def push_frame(
-        self,
-        state: JointState,
-        left_hand: Optional[List[int]] = None,
-        right_hand: Optional[List[int]] = None,
-    ) -> None:
-        """播放引擎送来的一帧目标关节角 (以及可选的手部目标)。"""
+    def push_frame(self, state: JointState) -> None:
+        """播放引擎送来的一帧目标关节角。
+
+        **手位不在这里** —— 灵巧手走控制器 ``rs485/*`` 透传 (Modbus RTU),
+        不在 UDP 关节包里。见 :mod:`robot.hand`。
+        """
         with self._lock:
             if not self._streaming:
                 return
@@ -443,10 +439,10 @@ class ArmController:
             # 正常播放: 更新目标即可, 发送线程按自己的频率发最新值
             if self._left_name:
                 self._left_latest = left
-                self._streamer.set_target(self._left_name, left, left_hand)
+                self._streamer.set_target(self._left_name, left)
             if self._right_name:
                 self._right_latest = right
-                self._streamer.set_target(self._right_name, right, right_hand)
+                self._streamer.set_target(self._right_name, right)
 
     def advance_lead_in(self) -> bool:
         """推进对齐过渡。返回 True 表示对齐已完成。
