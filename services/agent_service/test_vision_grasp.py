@@ -277,7 +277,8 @@ async def main():
     check(not res.ok, "第 4 步失败 -> 报失败")
     check("安全点" in plays, f"失败后回安全点: {plays}")
     check("够不着" in res.reply, f"原因原样念出: {res.reply}")
-    check("X 0.50" in res.reply, f"失败时也播报位姿: {res.reply}")
+    # 失败时**不念坐标** —— 坐标在 payload/追溯里, 排查时看那里
+    check("X 0.50" not in res.reply, f"失败时不播报位姿: {res.reply}")
 
     print("门阀/可达性拒绝:")
     deny = FakeArm({"ok": False, "code": "ops_mode", "stage": "safety",
@@ -297,8 +298,9 @@ async def main():
     res, _, arm, tr = await run_steps([obj(0.5, 0, -0.3)], arm=disabled)
     check(len(arm.moves) == 2, "确实请求了两次移动 (由机械臂服务决定动不动)")
     check(res.ok and tr[0]["outcome"] == "planned_only", "总闸关着 -> 只算不动")
-    check("目标点" in res.reply and "机械臂没有动" in res.reply,
-          f"报出算好的位置: {res.reply}")
+    # 总闸关着**不能**说「抓取完成」—— 根本没抓
+    check("抓取完成" not in res.reply, f"没说抓取完成: {res.reply}")
+    check("机械臂没有动" in res.reply, f"说明了没动: {res.reply}")
     # 5 步要**全走完** —— 用户要看的正是完整的位置序列
     plays = [c[1] for c in arm.calls if isinstance(c, tuple) and c[0] == "play"]
     check(plays == ["准备点", "闭合夹爪", "安全点"],
@@ -316,30 +318,31 @@ async def main():
     check(vision.fresh is True, "向视觉请求时带 fresh=True")
     check(vision.fresh_calls == 1, "确实要求重新检测")
 
-    print("播报里带每个点的坐标:")
+    print("播报只报结论, 坐标进 payload 不进播报:")
     res, _, _, tr = await run_steps([obj(0.5, 0.02, -0.3)])
-    check("X 0.50" in res.reply and "Y 0.02" in res.reply and "Z -0.30" in res.reply,
-          f"播报里含目标点坐标: {res.reply}")
-    check("上方点" in res.reply and "Z -0.20" in res.reply,
-          f"播报里含上方点坐标: {res.reply}")
-    check("抓取点" in res.reply, f"播报里含抓取点: {res.reply}")
+    check(res.reply == "抓取鼠标完成", f"播报是简短结论: {res.reply!r}")
+    for noise in ("X 0.50", "Y 0.02", "Z -0.30", "目标点", "上方点", "抓取点"):
+        check(noise not in res.reply, f"播报里没有 {noise!r}: {res.reply!r}")
+    # 坐标**仍然保留**在 payload 里 —— 排查问题要看它
+    check(res.payload.get("target_pose"), "payload 里保留了目标位置")
+    check(res.payload.get("approach_pose"), "payload 里保留了上方点位置")
+    check(res.payload.get("grasp_pose"), "payload 里保留了抓取点位置")
 
     disabled = FakeArm({
         "ok": False, "code": "disabled", "stage": "gate",
         "message": "机械臂控制已关闭，只计算了位置，机械臂没有动",
     })
     res, _, _, tr = await run_steps([obj(0.5, 0.02, -0.3)], arm=disabled)
-    check("目标点" in res.reply and "X 0.50" in res.reply,
-          f"总闸关着也播报目标点: {res.reply}")
-    check("上方点" in res.reply and "Z -0.20" in res.reply,
-          f"总闸关着也播报上方点: {res.reply}")
-    check("抓取点" in res.reply, f"总闸关着也播报抓取点: {res.reply}")
+    check("机械臂没有动" in res.reply, f"总闸关着也说明没动: {res.reply}")
+    check("抓取完成" not in res.reply, f"总闸关着不说抓取完成: {res.reply}")
+    # 位置照样在 payload 里
+    check(res.payload.get("target_pose"), "总闸关着时 payload 仍有目标位置")
 
     deny = FakeArm({"ok": False, "code": "unreachable", "stage": "done",
                      "message": "够不着"})
     res, _, _, tr = await run_steps([obj(0.5, 0.02, -0.3)], arm=deny)
-    check("够不着" in res.reply and "X 0.50" in res.reply,
-          f"失败时也播报位姿: {res.reply}")
+    check("够不着" in res.reply, f"说明了失败原因: {res.reply}")
+    check("X 0.50" not in res.reply, f"失败时不播报位姿: {res.reply}")
 
     print("第 5 步失败: 抓到了但回安全点失败:")
     arm3 = FakeArm()
@@ -406,7 +409,9 @@ async def main():
           f"上方点 = 目标 + 流程距离 + 步骤偏移: {arm5.moves[0][3]}")
 
     print("自定义流程里的 open 步骤 (open_action 不再是死配置):")
-    check("夹爪已张开" in res.reply, f"播报里含张开夹爪: {res.reply}")
+    # open 步骤**照样执行**了 (plays 里有「张开夹爪」), 只是不逐步播报
+    check("张开夹爪" in plays, f"播了张开夹爪: {plays}")
+    check(res.reply == "抓取鼠标完成", f"播报仍是简短结论: {res.reply!r}")
 
     print("未知步骤类型 -> 报错, 不静默跳过:")
     bad = dict(custom)
@@ -482,11 +487,15 @@ async def main():
     check("above" in names and "grasp" in names,
           f"追溯里有移动步骤: {names}")
 
-    print("序列模式: 播报里含识别结果和移动结果:")
-    check("识别到鼠标" in res.reply, f"播报含识别结果: {res.reply}")
-    check("已到移到上方点" in res.reply, f"播报含上方点: {res.reply}")
-    check("已到移到抓取点" in res.reply, f"播报含抓取点: {res.reply}")
-    check("手已合拢" in res.reply, f"播报含夹爪动作: {res.reply}")
+    print("序列模式: 播报只报结论, 不报过程细节:")
+    check(res.reply == "抓取鼠标完成", f"播报是简短结论: {res.reply!r}")
+    # 过程细节**不播出来** —— 用户要的是「做完了没」, 不是坐标和每一步
+    for noise in ("目标点", "已到", "手已合拢", "置信度", "X ", "已回准备点"):
+        check(noise not in res.reply, f"播报里没有 {noise!r}: {res.reply!r}")
+    # 但过程细节**仍然保留**在 payload 里 (排查问题要用)
+    steps_in_payload = res.payload.get("steps") or []
+    check(len(steps_in_payload) >= 3, f"payload 里保留了各步明细: {len(steps_in_payload)}")
+    check(res.payload.get("target_pose"), "payload 里保留了目标位置")
 
     print("序列模式: 识别失败 -> 不合成序列, 直接报失败:")
     res, vision, arm, tr = await run([])

@@ -463,9 +463,9 @@ class VisionGraspSkill(Skill):
                     # no_valid_candidate), 这样事后看追溯一眼就知道是
                     # 「没找到」还是「测不准」—— 跟旧版一致。
                     trace["outcome"] = result.code
+                    # 播报只说「为什么失败」, 坐标不念出来 (太吵) ——
+                    # 位置细节在 payload / 追溯记录里, 排查时看那里。
                     msg = result.message
-                    if context.target_pos is not None:
-                        msg = f"{msg}。{self._describe_pose(context.target_pos, '目标点')}"
                     self._write_trace(trace, started)
                     return SkillResult(
                         ok=False, output=msg, error=msg, reply=msg, speak=True,
@@ -475,8 +475,22 @@ class VisionGraspSkill(Skill):
 
                 # 最后一步失败: 前面的步骤已成功 —— 如实说「抓到了但收尾失败」
                 if is_last:
-                    reply = self._build_reply(context, flow)
-                    reply = f"{reply}。{result.message}"
+                    # 前面都成功了, 只是**最后这一步**没成。
+                    #
+                    # 「已抓到」只在**抓取那步真的成了**时才敢说 ——
+                    # 最后一步可能是回安全点 (抓到了但收尾失败), 也可能
+                    # 压根没抓到 (比如最后一步是个配错的片段类型)。
+                    grasp_step = next(
+                        (s for s in context.steps if s.name == "grasp"), None
+                    )
+                    grabbed = grasp_step is not None and grasp_step.ok
+                    if grabbed:
+                        reply = (
+                            f"抓取{context.target or '物体'}已抓到, "
+                            f"但收尾失败: {result.message}"
+                        )
+                    else:
+                        reply = f"抓取{context.target or '物体'}失败: {result.message}"
                     trace["outcome"] = f"grasp_ok_safe_failed:{result.code}"
                     self._write_trace(trace, started)
                     return SkillResult(
@@ -502,9 +516,8 @@ class VisionGraspSkill(Skill):
                     )
                 )
                 trace["outcome"] = f"failed:{result.code}"
+                # 同上: 播报只说失败原因, 坐标不念出来
                 msg = result.message
-                if context.target_pos is not None:
-                    msg = f"{msg}。{self._describe_pose(context.target_pos, '目标点')}"
                 if recovery and moved:
                     recover = await self._play_step(
                         recovery, recovery_label, name="recovery"
@@ -520,12 +533,8 @@ class VisionGraspSkill(Skill):
 
             # ================= 全走完了 =================
             reply = self._build_reply(context, flow)
-            only_planned = context.disabled
-            if only_planned:
-                reply = f"{reply}。机械臂没有动"
-                trace["outcome"] = "planned_only"
-            else:
-                trace["outcome"] = "grasp_ok"
+            # 「机械臂没有动」已经在 _build_success_reply 里说过了, 别再追加
+            trace["outcome"] = "planned_only" if context.disabled else "grasp_ok"
 
             payload: Dict[str, Any] = {
                 "target": target,
@@ -1125,9 +1134,8 @@ class VisionGraspSkill(Skill):
         if not detect_result.ok and detect_result.code != "disabled":
             # 识别失败: 直接返回, 不回安全点 (此时手还在准备点, 那是安全的)
             trace["outcome"] = detect_result.code
+            # 播报只说失败原因, 坐标不念出来 (位置细节在 payload/追溯里)
             msg = detect_result.message
-            if context.target_pos is not None:
-                msg = f"{msg}。{self._describe_pose(context.target_pos, '目标点')}"
             self._write_trace(trace, started)
             return SkillResult(
                 ok=False, output=msg, error=msg, reply=msg, speak=True,
@@ -1214,40 +1222,51 @@ class VisionGraspSkill(Skill):
     def _build_sequence_reply(
         self, context: FlowContext, sequence: Dict[str, Any]
     ) -> str:
-        """把序列执行结果拼成一句能念的话。"""
-        parts: List[str] = []
-        for step in context.steps:
-            if step.name == "detect" and step.ok:
-                conf = step.detail.get("confidence")
-                if conf is None:
-                    parts.append(f"识别到{context.target}")
-                else:
-                    parts.append(
-                        f"识别到{context.target}，置信度 {float(conf) * 100:.0f}%"
-                    )
-                if context.target_pos is not None:
-                    parts.append(
-                        self._describe_pose(context.target_pos, "目标点")
-                    )
-                break
+        """把序列执行结果拼成一句能念的话。
 
-        for step_info in sequence.get("steps") or []:
-            stype = str(step_info.get("type") or "")
-            label = str(step_info.get("label") or "")
-            if stype == "arm":
-                parts.append(f"已到{label}")
-            elif stype == "hand":
-                # 手部片段: 按方向说「合拢」还是「张开」
-                direction = str(step_info.get("direction") or "").lower()
-                if direction == "open":
-                    parts.append("手已张开")
-                else:
-                    parts.append("手已合拢")
-            elif stype == "hold":
-                if label:
-                    parts.append(f"已{label}")
+        **只报结论, 不报过程** —— 播的是「抓取杯子完成」, 而不是
+        「目标点 X 0.55, Y -0.09, Z -0.28。已到回准备点。已拍照识别。
+        已到移到上方点。已到移到抓取点。手已合拢。已到回安全点」。
 
-        return "。".join(p for p in parts if p)
+        那些逐步的坐标和动作播出来又长又吵, 用户要的是**做完了没**。
+        详细过程仍然进 ``payload`` / 追溯记录 —— 排查问题时看那里。
+
+        只有**失败**时才带细节 (哪一步失败、为什么), 因为那时候
+        用户需要知道出什么问题。
+        """
+        return self._build_success_reply(context)
+
+    def _build_success_reply(self, context: FlowContext) -> str:
+        """成功时的一句话结论。"""
+        target = context.target or "物体"
+        if context.disabled:
+            # 总闸关着 —— 只算不动, 不能说「抓取完成」
+            return f"{target}的位置已算好, 机械臂没有动"
+        return f"抓取{target}完成"
+
+    def _build_reply(
+        self, context: FlowContext, flow: Dict[str, Any]
+    ) -> str:
+        """把各步结果拼成一句能念的话。
+
+        播报用 —— **只报结论** (「抓取杯子完成」), 逐步的坐标和动作
+        不念出来 (太长太吵), 详细过程进 ``payload`` / 追溯记录。
+
+        失败时例外: 那时要带上失败原因, 用户需要知道出什么问题。
+        """
+        if context.disabled:
+            return self._build_success_reply(context)
+
+        # 失败的那一步 —— 如实说明是哪一步出了问题
+        failed = next(
+            (s for s in context.steps if not s.ok and s.code != "disabled"),
+            None,
+        )
+        if failed is not None:
+            detail = failed.message or f"{failed.label or failed.name}失败"
+            return f"抓取{context.target or '物体'}失败: {detail}"
+
+        return self._build_success_reply(context)
 
     # ------------------------------------------------------------ 播报
 
@@ -1289,56 +1308,6 @@ class VisionGraspSkill(Skill):
         """
         text = str(exc)
         return ("控制已关闭" in text) or ("没有动" in text and "关闭" in text)
-
-    def _build_reply(
-        self, context: FlowContext, flow: Dict[str, Any]
-    ) -> str:
-        """把各步结果拼成一句能念的话。
-
-        播报用 —— 用户要看的正是「它算出来在哪」。
-
-        顺序跟旧版一致: 准备点 -> 识别到 -> 目标点 -> 各移动点 -> 夹爪
-        -> 收尾。
-        """
-        only_planned = context.disabled
-        parts: List[str] = []
-
-        for step in context.steps:
-            name = step.name
-            detail = step.detail
-
-            if name == "ready" and detail.get("action"):
-                parts.append(
-                    f"准备点已就位" if only_planned else "已回准备点"
-                )
-            elif name == "detect" and step.ok:
-                conf = detail.get("confidence")
-                if conf is None:
-                    parts.append(f"识别到{context.target}")
-                else:
-                    parts.append(
-                        f"识别到{context.target}，置信度 {float(conf) * 100:.0f}%"
-                    )
-                # 目标点紧跟着播 —— 用户要看的正是「它算出来在哪」
-                if context.target_pos is not None:
-                    parts.append(
-                        self._describe_pose(context.target_pos, "目标点")
-                    )
-            elif detail.get("pose") and detail.get("move"):
-                # arm 片段: 报出它去了哪
-                pose = tuple(detail["pose"])
-                parts.append(
-                    f"{self._describe_pose(pose, step.label or '目标点')}"
-                    + ("，已到达" if not only_planned else "")
-                )
-            elif name == "close" and detail.get("action"):
-                parts.append("夹爪已闭合" if not only_planned else "夹爪将闭合")
-            elif name == "open" and detail.get("action"):
-                parts.append("夹爪已张开" if not only_planned else "夹爪将张开")
-            elif name == "safe" and detail.get("action"):
-                parts.append("已回安全点" if not only_planned else "将回安全点")
-
-        return "。".join(parts)
 
     def _pose_payload(self, context: FlowContext) -> Dict[str, Any]:
         """把各步的位置整理进 payload。
@@ -1382,25 +1351,6 @@ class VisionGraspSkill(Skill):
         }
 
     # ------------------------------------------------------------ 辅助
-
-    @staticmethod
-    def _describe_pose(
-        pos: Tuple[float, float, float], label: str
-    ) -> str:
-        """把一个位姿念成一句人话。
-
-        播报用 —— 机械臂到底要去哪, 得让人听得出来。
-
-        坐标是世界系 (米)。念成「X 零点五八, Y 零点零三, Z 负零点三六」
-        这种比念数字好懂一点, 尤其 Z 常常是负的 (物体在基座下方)。
-
-        Args:
-            pos:   (x, y, z)
-            label: 这句话的开头, 如「目标点」
-        """
-        return (
-            f"{label} X {pos[0]:.2f}, Y {pos[1]:.2f}, Z {pos[2]:.2f}"
-        )
 
     def _fail(self, message: str, trace: Dict[str, Any], started: float) -> SkillResult:
         """失败收尾: 落盘追溯并返回要念出来的原因。"""
