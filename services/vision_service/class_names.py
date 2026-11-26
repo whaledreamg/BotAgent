@@ -174,6 +174,13 @@ _EXTRA_ALIASES: Dict[str, str] = {
     "时钟": "clock", "挂钟": "clock", "牙刷": "toothbrush",
     "吹风机": "hair drier", "电吹风": "hair drier",
     "手套": "baseball glove", "熊": "bear", "棕熊": "bear",
+    # 自定义模型 (snacks) 的类别 —— 见 configs/vision.yaml 的 detector.weights
+    #
+    # 训练时的类名是英文 ("bottle" / "sugar"), 用户说的是中文,
+    # 所以必须在这里补映射, 否则 find_object 查不到。
+    "棒棒糖": "sugar", "糖果": "sugar", "糖": "sugar",
+    "棒糖": "sugar", "糖纸": "sugar",
+    "矿泉水": "bottle", "矿泉水瓶": "bottle", "水瓶": "bottle",
 }
 
 def _build_reverse() -> Dict[str, str]:

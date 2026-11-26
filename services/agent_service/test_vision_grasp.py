@@ -115,6 +115,11 @@ class FakeArm:
             raise RuntimeError(f"没有流程 {name!r}")
         return self.flows[name]
 
+    async def flow_names(self):
+        """所有可用的流程名 (分流时用来校验目标流程存不存在)。"""
+        self.calls.append("flow_names")
+        return sorted(self.flows.keys())
+
     async def grasp_sequence(self, x, y, z, *, side="right", flow="grasp",
                              approach_distance=None, duration=None,
                              plan_only=False):
@@ -540,6 +545,82 @@ async def main():
                 if isinstance(c, tuple) and c[0] == "grasp_sequence"]
     check(res.ok and seq_call and seq_call[0][2] == "custom",
           f"流程名传对了: {seq_call[0][2] if seq_call else '?'}")
+
+    # ================= 按物品分流 =================
+
+    print()
+    print("按物品分流:")
+
+    # 分流依据用真实的 routing.yaml (configs/flows/routing.yaml)
+    from skill.builtin import vision_grasp as vg
+
+    mapping, default_flow = vg._load_routing()
+    check(mapping, f"routing.yaml 读到了映射: {mapping}")
+    check(default_flow == "grasp", f"默认流程是 grasp: {default_flow}")
+
+    skill = VisionGraspSkill(VisionGraspSkill.spec(), None)
+
+    # ---- 映射命中 ----
+    flow, reason = skill._resolve_flow_name("瓶子", {})
+    check(flow == "grasp_bottle", f"「瓶子」-> grasp_bottle: {flow}")
+    check(reason == "routing:瓶子", f"依据是 routing: {reason}")
+
+    # ---- 修饰词要先剥掉 ----
+    flow, reason = skill._resolve_flow_name("那个瓶子", {})
+    check(flow == "grasp_bottle", f"「那个瓶子」-> grasp_bottle: {flow}")
+    check(reason == "routing:瓶子", f"依据记的是剥掉修饰词后的名: {reason}")
+
+    # ---- 空格也要剥掉 ----
+    flow, reason = skill._resolve_flow_name(" 瓶子 ", {})
+    check(flow == "grasp_bottle", f"「 瓶子 」-> grasp_bottle: {flow}")
+
+    # ---- 没配过的物体 -> 默认流程 ----
+    flow, reason = skill._resolve_flow_name("某个没配过的物体", {})
+    check(flow == "grasp", f"没配过的物体 -> 默认流程: {flow}")
+    check(reason == "default", f"依据是 default: {reason}")
+
+    # ---- 显式 flow 参数优先 ----
+    flow, reason = skill._resolve_flow_name("瓶子", {"flow": "grasp_cup"})
+    check(flow == "grasp_cup", f"显式 flow 优先于映射: {flow}")
+    check(reason == "explicit", f"依据是 explicit: {reason}")
+
+    # ---- 显式 flow 参数优先于默认流程 ----
+    flow, reason = skill._resolve_flow_name("没配过的", {"flow": "grasp_cup"})
+    check(flow == "grasp_cup", f"显式 flow 优先于默认流程: {flow}")
+
+    print("分流: 选中的流程真的跑了:")
+    # 服务端有 grasp_bottle 流程 -> 走它
+    arm16 = FakeArm(flows={"grasp": DEFAULT_FLOW, "grasp_bottle": DEFAULT_FLOW})
+    res, _, arm16, tr = await run([obj(0.5, 0.02, -0.3)], arm=arm16,
+                                  target="瓶子")
+    seq_call = [c for c in arm16.calls
+                if isinstance(c, tuple) and c[0] == "grasp_sequence"]
+    check(res.ok and seq_call and seq_call[0][2] == "grasp_bottle",
+          f"「瓶子」走的是 grasp_bottle: {seq_call[0][2] if seq_call else '?'}")
+    check(tr[0].get("flow") == "grasp_bottle",
+          f"追溯记的是 grasp_bottle: {tr[0].get('flow')}")
+    check(tr[0].get("flow_reason") == "routing:瓶子",
+          f"追溯记了分流依据: {tr[0].get('flow_reason')}")
+
+    print("分流: 映射指向不存在的流程 -> 回落到默认流程:")
+    # 服务端**没有** grasp_bottle (比如流程文件还没建就先把映射写上了)
+    arm17 = FakeArm(flows={"grasp": DEFAULT_FLOW})
+    res, _, arm17, tr = await run([obj(0.5, 0.02, -0.3)], arm=arm17,
+                                  target="瓶子")
+    seq_call = [c for c in arm17.calls
+                if isinstance(c, tuple) and c[0] == "grasp_sequence"]
+    check(res.ok, f"没报错, 正常跑完了: {res.error or ''}")
+    check(seq_call and seq_call[0][2] == "grasp",
+          f"回落到默认流程: {seq_call[0][2] if seq_call else '?'}")
+
+    print("分流: 显式指定的流程不存在 -> 不悄悄换 (如实由服务端报错):")
+    arm18 = FakeArm(flows={"grasp": DEFAULT_FLOW})
+    res, _, arm18, tr = await run([obj(0.5, 0.02, -0.3)], arm=arm18,
+                                  flow="不存在的流程")
+    seq_call = [c for c in arm18.calls
+                if isinstance(c, tuple) and c[0] == "grasp_sequence"]
+    check(not seq_call or seq_call[0][2] != "grasp",
+          "没有偷偷换成默认流程")
 
 
 asyncio.run(main())

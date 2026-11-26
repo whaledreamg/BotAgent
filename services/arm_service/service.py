@@ -2256,24 +2256,46 @@ class ArmService:
             return hc.send_preset(name, side)
         return hc.send_preset(name)
 
-    def send_hand_open(self, side: Optional[str] = None) -> bool:
-        """张开手 (``open_pose``)。"""
+    def send_hand_open(
+        self, side: Optional[str] = None,
+        positions: Optional[Sequence[int]] = None,
+    ) -> bool:
+        """张开手。
+
+        Args:
+            side:       只动哪只手; None = 两只都动
+            positions:  显式手位 (6 个 0~1000); None = 用配置的 ``open_pose``
+
+        **显式手位优先于配置** —— 流程里可以指定张开到什么角度, 不受
+        ``configs/arm.yaml`` 的 ``open_pose`` 限制。
+        """
         hc = self.hand_controller()
         if hc is None:
             raise ControllerError("灵巧手未启用")
-        pose = list(self.arm_cfg.hand.open_pose)
+        pose = list(positions) if positions else list(self.arm_cfg.hand.open_pose)
         if side == "left":
             return self.send_hand_positions(left=pose, right=None)
         if side == "right":
             return self.send_hand_positions(left=None, right=pose)
         return self.send_hand_positions(left=pose, right=pose)
 
-    def send_hand_close(self, side: Optional[str] = None) -> bool:
-        """握紧手 (``close_pose``)。"""
+    def send_hand_close(
+        self, side: Optional[str] = None,
+        positions: Optional[Sequence[int]] = None,
+    ) -> bool:
+        """握紧手。
+
+        Args:
+            side:       只动哪只手; None = 两只都动
+            positions:  显式手位 (6 个 0~1000); None = 用配置的 ``close_pose``
+
+        **显式手位优先于配置** —— 流程里可以指定握到什么角度, 不受
+        ``configs/arm.yaml`` 的 ``close_pose`` 限制。
+        """
         hc = self.hand_controller()
         if hc is None:
             raise ControllerError("灵巧手未启用")
-        pose = list(self.arm_cfg.hand.close_pose)
+        pose = list(positions) if positions else list(self.arm_cfg.hand.close_pose)
         if side == "left":
             return self.send_hand_positions(left=pose, right=None)
         if side == "right":

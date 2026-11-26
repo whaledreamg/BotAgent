@@ -1,0 +1,102 @@
+# 抓瓶子的流程
+#
+# 瓶子比杯子细长 —— 上方点要停得更高一点 (免得手臂撞到瓶盖),
+# 抓取点往下压一点 (抓瓶身而不是瓶口)。
+#
+# 流程文件格式见同目录的 README.md。
+#
+# **orientation 必须跟 grasp.yaml 一样** —— 拍照姿态 = 抓取姿态,
+# 换了姿态在目标点可能根本不可达 (历史上每次抓瓶子都报 unreachable
+# 就是这个原因)。换准备点动作后要重新算这两个值:
+#   python3 services/arm_service/tools/check_grasp_reachable.py --scan
+
+name: grasp_bottle
+description: "抓瓶子: 回准备点 -> 拍照识别 -> 移到上方点 -> 移到抓取点 -> 闭合夹爪 -> 回安全点"
+
+# 某一步失败时的收尾动作 —— 先播它, 再报失败。
+recovery_action: 安全点
+recovery_label: 回安全点
+
+steps:
+  # ---- 第 1 段: 回准备点 ----
+  #
+  # 拍照前把手臂摆到固定姿态, 保证每次拍的视角一致 (标定才对得上)。
+  - id: ready
+    type: arm
+    action: 准备点
+    label: 回准备点
+
+  # ---- 第 2 段: 拍照识别 ----
+  #
+  # 产出「识别结果」。后面的 target 片段从它取值。
+  - id: detect
+    type: detect
+    duration: 1.5
+    label: 拍照识别
+    orientation:
+      right:
+        a: 1.6683
+        b: 0.6821
+        c: 1.9317
+      left:
+        a: -1.6900
+        b: 0.5548
+        c: -1.9033
+
+  # ---- 具名点声明 (纯声明, 不产生运动) ----
+  #
+  # object = 这次识别到的那个东西。**不假设它是什么类型** ——
+  # 物体名由 skill 的 target 参数 (用户说「抓瓶子」) 决定。
+  - id: object
+    type: target
+    source: detect
+    label: 目标物体
+
+  # above_point = object 正上方
+  #
+  # distance: approach 表示「上方点的高度」取流程级的 approach_distance
+  # (即 configs/arm.yaml 的 grasp.flow.above_distance) —— 这样调用参数
+  # approach_distance 能覆盖它, 不用把高度写死在 YAML 里。
+  - id: above_point
+    type: target
+    base: object
+    distance: approach
+    offset:
+      x: -0.1
+      y: -0.07
+      z: 0.0
+    label: 目标上方
+
+  # ---- 第 3 段: 移到上方点 ----
+  #
+  # 瓶子高 -> 这一段给足时间 (4.5s), 别跟 grasp.yaml 抢时间。
+  - id: above
+    type: arm
+    point: above_point
+    duration: 4.5
+    label: 移到上方点
+
+  # ---- 第 4 段: 移到抓取点 ----
+  #
+  # z 往下压 0.08 (比杯子深) —— 抓瓶身, 不是瓶口。
+  - id: grasp
+    type: arm
+    point: object
+    offset:
+      x: -0.1
+      y: -0.07
+      z: -0.08
+    duration: 2.0
+    label: 移到抓取点
+
+  # ---- 第 4 段的后半: 闭夹爪 ----
+  - id: close
+    type: hand
+    action: 闭合夹爪
+    label: 闭合夹爪
+
+  # ---- 第 5 段: 回安全点 ----
+  - id: safe
+    type: arm
+    action: 安全点
+    label: 回安全点

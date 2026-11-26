@@ -59,6 +59,15 @@ HAND_DIRECTIONS = ("close", "open")
 #: 默认流程名 (缺省用哪个)
 DEFAULT_FLOW = "grasp"
 
+#: 流程目录里**不是流程**的文件名 (跳过)
+#:
+#: ``routing.yaml`` 是「物品名 -> 流程名」的**分流表** —— 它跟流程
+#: 文件放在一起 (一眼能看到有哪些流程、怎么分流), 但它本身不是流程。
+#:
+#: 不排除它的话, ``load_flows()`` 扫目录时会把它当流程解析, 然后因为
+#: 「steps 必须是非空列表」而报错 —— 虽��被跳过, 但日志里天天刷错误。
+NON_FLOW_FILES = ("routing.yaml",)
+
 #: 关节数
 NDOF = 7
 
@@ -907,6 +916,8 @@ def flows_signature(directory: Path) -> Tuple[Tuple[str, int, int], ...]:
     out: List[Tuple[str, int, int]] = []
     try:
         for path in sorted(directory.glob("*.yaml")):
+            if path.name in NON_FLOW_FILES:
+                continue
             try:
                 stat = path.stat()
             except OSError:
@@ -924,6 +935,9 @@ def load_flows(directory: Path) -> Dict[str, FlowDef]:
 
     **一个文件坏了不影响别的** —— 出错的流程跳过并记日志, 但会记下
     错误, 让调用方能报出来。
+
+    ``NON_FLOW_FILES`` 里的文件 (分流表 ``routing.yaml``) 直接跳过 ——
+    它不是流程。
     """
     import yaml
 
@@ -933,6 +947,8 @@ def load_flows(directory: Path) -> Dict[str, FlowDef]:
         return flows
 
     for path in sorted(directory.glob("*.yaml")):
+        if path.name in NON_FLOW_FILES:
+            continue
         try:
             flow = load_flow_file(path)
         except FlowError as exc:

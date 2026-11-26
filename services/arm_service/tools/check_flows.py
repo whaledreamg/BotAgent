@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """流程定义自检 (离线, 不碰硬件)。
 
-验六件事:
+验七件事:
   1. **格式合法** —— ``configs/flows/*.yaml`` 每个都能解析, 片段 id 不重复;
   2. **类型已知** —— 片段的 ``type`` 在已知的类型表里 (未知类型会**报错**,
      不能静默跳过 —— 跳过的话流程会「少做一段」而没人知道);
@@ -10,7 +10,9 @@
   4. **引用合法** —— 引用的具名点存在、是 ``target`` 类型、顺序对、无循环;
   5. **与旧配置等价** —— ``configs/flows/grasp.yaml`` 与
      ``configs/arm.yaml`` 的 ``grasp.flow`` 行为一致 (防止迁移时手抖改错);
-  6. **错误格式必须报错** —— 每种非法写法都要被拦住。
+  6. **分流表一致** —— ``configs/flows/routing.yaml`` 里映射到的流程
+     真的存在 (映射写错会在抓取时静默走默认流程, 很难查);
+  7. **错误格式必须报错** —— 每种非法写法都要被拦住。
 
 用法:
     python3 services/arm_service/tools/check_flows.py
@@ -26,6 +28,7 @@ sys.path.insert(0, str(ROOT / "services" / "arm_service"))
 from config import load_config  # noqa: E402
 from flow import (  # noqa: E402
     DEFAULT_FLOW,
+    NON_FLOW_FILES,
     STEP_TYPES,
     FlowError,
     flow_from_legacy,
@@ -373,6 +376,62 @@ def check_hot_reload(flows_dir: Path) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_routing(flows_dir: Path, flows: dict) -> None:
+    """检查 ``configs/flows/routing.yaml`` (物品名 -> 流程名 的映射)。
+
+    **这是分流表的一致性检查** —— 映射里指向不存在的流程, 抓取时会
+    静默回落到默认流程 (能跑, 但走错了流程)。这种错在运行时才暴露,
+    所以在这里静态查出来。
+
+    查三件事:
+    1. 文件格式对 (是字典, routing 段是字典)
+    2. 每条映射的目标流程在 ``configs/flows/`` 里存在
+    3. ``default_flow`` 存在
+    """
+    routing_path = flows_dir / "routing.yaml"
+    print("\n[分流表 routing.yaml]")
+    if not routing_path.is_file():
+        # 没有分流表 = 一律走默认流程 —— 合法状态, 不是错误
+        check(True, "没有 routing.yaml (一律走默认流程)")
+        return
+
+    try:
+        import yaml
+
+        raw = yaml.safe_load(routing_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        check(False, f"routing.yaml 读不了: {exc}")
+        return
+
+    if not isinstance(raw, dict):
+        check(False, f"routing.yaml 必须是字典, 实际是 {type(raw).__name__}")
+        return
+
+    routing = raw.get("routing") or {}
+    if not isinstance(routing, dict):
+        check(False, f"routing.yaml 的 routing 段必须是字典, 实际是 {type(routing).__name__}")
+        return
+
+    default_flow = str(raw.get("default_flow") or "").strip()
+    check(bool(default_flow), "default_flow 写了 (留空 = 用服务端默认)")
+    if default_flow:
+        check(default_flow in flows,
+              f"default_flow {default_flow!r} 在流程目录里存在")
+
+    if not routing:
+        check(True, "routing 段是空的 (所有物品都走默认流程)")
+        return
+
+    for item, flow_name in sorted(routing.items()):
+        name = str(item or "").strip()
+        flow = str(flow_name or "").strip()
+        if not name or not flow:
+            check(False, f"映射 {item!r} -> {flow_name!r} 不完整 (物品名/流程名不能为空)")
+            continue
+        check(flow in flows,
+              f"「{name}」-> {flow!r} 在流程目录里存在")
+
+
 def main() -> int:
     print("=" * 62)
     print("流程定义自检 (离线, 不需要真机)")
@@ -392,6 +451,7 @@ def main() -> int:
 
     # ---- 逐个文件检查 ----
     yaml_files = sorted(flows_dir.glob("*.yaml")) if flows_dir.is_dir() else []
+    yaml_files = [p for p in yaml_files if p.name not in NON_FLOW_FILES]
     if not yaml_files:
         check(False, f"{flows_dir} 里没有流程文件")
     for path in yaml_files:
@@ -407,6 +467,9 @@ def main() -> int:
         return 1
 
     check(DEFAULT_FLOW in flows, f"默认流程 {DEFAULT_FLOW!r} 存在")
+
+    # ---- 分流表 ----
+    check_routing(flows_dir, flows)
 
     # ---- 与旧配置对比 ----
     if DEFAULT_FLOW in flows:

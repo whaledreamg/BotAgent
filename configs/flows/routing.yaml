@@ -1,0 +1,22 @@
+# 按物品名分流到不同流程
+#
+# 键 = grasp_object 的 target 参数 (用户说的那个词, 如「抓瓶子」-> 瓶子)
+# 值 = configs/flows/ 里的流程名 (文件名, 不带 .yaml)
+#
+# 优先级 (高 -> 低):
+#   1. grasp_object 的 flow 参数 (显式指定)
+#   2. 本文件的 routing 映射
+#   3. 本文件的 default_flow (全局兜底)
+#
+# 目标流程文件必须存在, 否则这条映射被跳过并记警告 ——
+# 宁可回落到默认流程, 也不拿不存在的流程去跑。
+routing:
+  瓶子: grasp_bottle
+  矿泉水: grasp_bottle
+  棒棒糖: grasp_sugar
+  糖: grasp_sugar
+  糖果: grasp_sugar
+
+# 全局兜底流程。必须是 configs/flows/ 里存在的流程名。
+# 留空 = 用服务端的默认流程 (grasp)。
+default_flow: grasp

@@ -4,10 +4,15 @@
 ``configs/flows/README.md``)。这个 skill **不硬编码任何步骤** ——
 它拉流程定义, 按步骤类型分派执行, 收集每一步的结果。
 
+**按物品分流**: 不同物品走不同流程 (``configs/flows/routing.yaml``
+里配映射) —— 「抓瓶子」走 ``grasp_bottle``, 没配过的走默认流程
+``grasp``。
+
 扩展边界:
 
 - 步骤**内容**与**参数** -> 只改 YAML, 不用动这里
 - 步骤**类型** -> 要改这里的 ``_HANDLERS`` 注册表
+- 物品到流程的**映射** -> 只改 YAML, 不用动这里
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from config import ROOT
 from skill.base import Skill, SkillError
 from skill.result import SkillResult
 from skill.spec import SkillSpec
@@ -27,6 +33,103 @@ logger = logging.getLogger("skill.vision_grasp")
 
 #: 抓取追溯记录 (JSONL, 每次抓取一行)。logs/ 已被 .gitignore 忽略
 GRASP_TRACE_PATH = Path(__file__).resolve().parents[2] / "logs" / "grasp_trace.jsonl"
+
+#: 物品名 -> 流程名 的映射 (configs/flows/routing.yaml)
+#:
+#: 路径从**项目根**算 —— 用 ``config.ROOT`` 而不是 ``parents[N]``:
+#: 本模块在不同导入方式下深度不同 (``skill.builtin.vision_grasp`` vs
+#: 直接当顶层模块), 写死 ``parents[N]`` 会在某种导入方式下指错地方。
+ROUTING_CONFIG_PATH = ROOT / "configs" / "flows" / "routing.yaml"
+
+#: 兜底的默认流程名 —— routing.yaml 没写 / 读不到时用它
+DEFAULT_FLOW_NAME = "grasp"
+
+#: 查映射前先剥掉的中文修饰词
+#:
+#: LLM 传的 target 可能带修饰词 (「那个瓶子」「一个瓶子」), 查表前
+#: 剥掉才能对上表里的裸词。
+#:
+#: **只剥这些确定的词** —— 不做模糊匹配。猜错了比不猜更糟:
+#: 走错流程可能抓不稳, 而走默认流程至少是「能用的通用流程」。
+_TARGET_MODIFIERS = (
+    "那个", "这个", "一个", "一只", "一张", "一把",
+    "一根", "一颗", "一条", "一块",
+    "那", "这", "的",
+)
+
+#: routing.yaml 里 routing 段下面的「物品名 -> 流程名」映射 (读一次就缓存)
+_ROUTING_CACHE: Optional[Dict[str, str]] = None
+#: routing.yaml 里的 default_flow (读一次就缓存)
+_DEFAULT_FLOW_CACHE: Optional[str] = None
+
+
+def _strip_modifiers(name: str) -> str:
+    """剥掉中文修饰词, 留下裸词。
+
+    「那个瓶子」-> 「瓶子」, 「一个杯子」-> 「杯子」。
+
+    剥完还是空 (比如 target 就是「那个」) -> 返回原样。
+    """
+    text = (name or "").strip()
+    if not text:
+        return text
+    changed = True
+    while changed:
+        changed = False
+        for mod in _TARGET_MODIFIERS:
+            if len(text) > len(mod) and text.startswith(mod):
+                text = text[len(mod):].strip()
+                changed = True
+    return text or (name or "").strip()
+
+
+def _load_routing() -> Tuple[Dict[str, str], str]:
+    """读 routing.yaml, 返回 (映射, 默认流程名)。
+
+    **读不到不算错误** —— 返回空映射 + 默认流程名, 抓取照常走默认流程。
+    (配置文件缺失不该让整个服务起不来)
+
+    读一次就缓存 —— 流程映射很少改, 每次抓取都读一遍文件太浪费。
+    """
+    global _ROUTING_CACHE, _DEFAULT_FLOW_CACHE
+    if _ROUTING_CACHE is not None and _DEFAULT_FLOW_CACHE is not None:
+        return _ROUTING_CACHE, _DEFAULT_FLOW_CACHE
+
+    mapping: Dict[str, str] = {}
+    default_flow = DEFAULT_FLOW_NAME
+    try:
+        import yaml
+
+        raw = yaml.safe_load(
+            ROUTING_CONFIG_PATH.read_text(encoding="utf-8")
+        ) or {}
+        if not isinstance(raw, dict):
+            logger.warning(
+                "[抓取] routing.yaml 格式不对 (期望字典), 忽略分流: %r",
+                type(raw).__name__,
+            )
+        else:
+            routing = raw.get("routing") or {}
+            if isinstance(routing, dict):
+                for key, value in routing.items():
+                    name = str(key or "").strip()
+                    flow = str(value or "").strip()
+                    if name and flow:
+                        mapping[name] = flow
+            configured_default = str(raw.get("default_flow") or "").strip()
+            if configured_default:
+                default_flow = configured_default
+    except FileNotFoundError:
+        logger.info(
+            "[抓取] 没有 routing.yaml, 一律走默认流程 %r", default_flow
+        )
+    except Exception as exc:
+        logger.warning("[抓取] 读 routing.yaml 失败, 走默认流程: %s", exc)
+
+    _ROUTING_CACHE = mapping
+    _DEFAULT_FLOW_CACHE = default_flow
+    return mapping, default_flow
+
 
 #: 兜底的片段类型 —— 服务不可达时连流程定义都拉不到时的最小流程
 #:
@@ -257,6 +360,17 @@ class VisionGraspSkill(Skill):
 
 各流程文件的格式见 `configs/flows/README.md`。
 
+## 按物品分流
+不同物品可以走不同的流程 —— 分流表是 `configs/flows/routing.yaml`。
+「抓瓶子」走 `grasp_bottle.yaml`, 没配过的走默认的 `grasp.yaml`。
+
+选流程的优先级 (高的覆盖低的):
+1. `flow` 参数 (显式指定)
+2. `routing.yaml` 的物品名映射
+3. `routing.yaml` 的 `default_flow` (全局兜底)
+
+**分流在拍照之前就决定** —— 拿物品名查表, 不用等拍完照才知道抓什么。
+
 ## 职责边界
 - ✓ 识别指定物体 (世界系)
 - ✓ 多个同类物体时取离机器人最近的一个
@@ -324,7 +438,12 @@ class VisionGraspSkill(Skill):
                     },
                     "flow": {
                         "type": "string",
-                        "description": "用哪条流程（configs/flows/ 里的流程名），默认 grasp",
+                        "description": (
+                            "用哪条流程（configs/flows/ 里的流程名）。"
+                            "不给就按物品名自动分流"
+                            "（configs/flows/routing.yaml），"
+                            "没配过的物品走默认流程 grasp。"
+                        ),
                     },
                     "sequence": {
                         "type": "boolean",
@@ -380,7 +499,6 @@ class VisionGraspSkill(Skill):
         side = str(args.get("arm", "right") or "right").strip().lower()
         if side not in ("left", "right"):
             side = "right"
-        flow_name = str(args.get("flow", "") or "").strip() or "grasp"
 
         if not target:
             return SkillResult(
@@ -388,6 +506,15 @@ class VisionGraspSkill(Skill):
                 error="目标物体名不能为空",
                 elapsed_ms=(time.time() - started) * 1000,
             )
+
+        #: 按物品名选流程 —— 「抓瓶子」-> grasp_bottle, 没配过的走默认流程
+        flow_name, flow_reason = self._resolve_flow_name(target, args)
+        logger.info(
+            "[抓取] 流程分流: %s -> %s (%s)", target, flow_name, flow_reason
+        )
+
+        #: 这条流程真的存在吗 —— 不存在就用默认流程
+        flow_name = await self._ensure_flow_exists(flow_name, flow_reason)
 
         #: 这次用哪条臂 —— detect 步骤挑基座要用
         self._side = side
@@ -400,6 +527,7 @@ class VisionGraspSkill(Skill):
             "target": target,
             "arm": side,
             "flow": flow_name,
+            "flow_reason": flow_reason,
             "steps": [],
         }
         context = FlowContext(side=side, target=target)
@@ -586,6 +714,107 @@ class VisionGraspSkill(Skill):
                 trace["above_pose"] = list(pose)
             elif step.name == "grasp":
                 trace["grasp_pose"] = list(pose)
+
+    # ------------------------------------------------------------ 流程分流
+
+    def _resolve_flow_name(
+        self, target: str, args: Dict[str, Any]
+    ) -> Tuple[str, str]:
+        """按物品名选流程。
+
+        优先级 (高 -> 低):
+
+        1. **显式 ``flow`` 参数** —— 用户/LLM 明确指定了就用它
+           (「用 grasp_cup 流程抓」这种说法必须被尊重)
+        2. **routing 映射** —— 查 ``configs/flows/routing.yaml``,
+           用 ``target`` (用户说的那个词) 当键
+        3. **默认流程** —— 上面都没命中就用 ``default_flow``
+
+        Args:
+            target: 要抓的物品名 (LLM 传的 ``target`` 参数)
+            args:   工具参数 (里面有 ``flow``)
+
+        Returns:
+            ``(流程名, 依据)`` —— 依据是给日志和追溯记录看的:
+            ``"explicit"`` / ``"routing:<物品名>"`` / ``"default"``
+
+        **分流在拍照之前就决定** —— 不用等拍完照才知道抓的是什么。
+        """
+        # 1) 显式指定
+        explicit = str(args.get("flow", "") or "").strip()
+        if explicit:
+            return explicit, "explicit"
+
+        # 2) 查映射
+        mapping, default_flow = _load_routing()
+        if mapping:
+            key = (target or "").strip()
+            flow = mapping.get(key)
+            if flow is None:
+                # 剥掉修饰词再试一次 (「那个瓶子」-> 「瓶子」)
+                bare = _strip_modifiers(key)
+                if bare != key:
+                    flow = mapping.get(bare)
+                    if flow:
+                        key = bare
+            if flow:
+                return flow, f"routing:{key}"
+
+        # 3) 默认流程
+        return default_flow, "default"
+
+    async def _ensure_flow_exists(
+        self, flow_name: str, reason: str
+    ) -> str:
+        """确认这条流程真的存在, 不存在就回落到默认流程。
+
+        **为什么要有这一步**: routing.yaml 是人手写的, 里面的流程名可能
+        写错 (文件还没建就先把映射写上), 或者流程文件被删了。
+        拿不存在的流程去跑 -> 机械臂服务直接报错, 用户听到的是
+        「流程 xxx 不存在」这种没头没尾的话。
+
+        宁可回落到默认流程 (那是条一定能跑的通用流程), 也不让用户
+        卡在这儿。
+
+        **显式指定的流程不回落到默认** —— 用户/LLM 明确要的那条流程
+        没了, 就该如实报错, 而不是悄悄换成别的流程 (「我让你抓杯子,
+        你怎么抓成别的了」比报错更糟)。
+        """
+        if reason == "explicit":
+            # 显式指定的流程存不存在, 由 _load_flow 报错 —— 不悄悄替换
+            return flow_name
+
+        if not self.arm_client:
+            return flow_name
+
+        try:
+            names = await self.arm_client.flow_names()
+        except Exception as exc:
+            # 拉不到清单 = 服务不可达 —— 后面 _load_flow 会用兜底流程
+            logger.warning("[抓取] 拉流程清单失败, 暂不校验流程名: %s", exc)
+            return flow_name
+
+        if not names:
+            # 服务返回空清单 (没配任何流程) —— 不做判断
+            return flow_name
+
+        if flow_name in names:
+            return flow_name
+
+        # 不存在 -> 回落到默认流程
+        _, default_flow = _load_routing()
+        if default_flow in names:
+            logger.warning(
+                "[抓取] 流程 %r 不存在 (依据 %s), 回落到默认流程 %r",
+                flow_name, reason, default_flow,
+            )
+            return default_flow
+
+        logger.warning(
+            "[抓取] 流程 %r 不存在 (依据 %s), 且默认流程 %r 也不存在",
+            flow_name, reason, default_flow,
+        )
+        return flow_name
 
     # ------------------------------------------------------------ 流程加载
 

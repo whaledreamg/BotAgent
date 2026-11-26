@@ -176,6 +176,9 @@ tools:
       用相机找到某个物体 (多个时取离机器人最近的), 然后按流程定义抓取它。
       默认流程是: 回准备点 -> 拍照识别 -> 移到上方点 -> 移到抓取点并闭合夹爪
       -> 回安全点。流程定义在 configs/flows/ 里, 改流程不用改代码。
+      不同物体会自动分流到各自的流程 (configs/flows/routing.yaml),
+      没配过的走默认流程 grasp —— 所以不用指定流程, 除非用户明确说了
+      要用哪条流程。
       只有用户明确要求「抓」「拿」「取」某个物体时使用; 只问位置或有没有时用
       find_object。
       动不动由机械臂服务的控制总闸决定 (configs/arm.yaml 的 arm.enabled),
@@ -194,7 +197,9 @@ tools:
           description: 用哪条臂, 用户没说就用 right
         flow:
           type: string
-          description: 用哪条流程 (configs/flows/ 里的流程名), 用户没说就用默认的 grasp
+          description: >-
+            指定用哪条流程 (configs/flows/ 里的流程名)。不给就按物体名
+            自动分流 (configs/flows/routing.yaml), 没配过的走默认流程 grasp。
       required: ["name"]
 
 # ---------------------------------------------------------------------

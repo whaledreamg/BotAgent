@@ -15,9 +15,31 @@
 ```
 models/
 └── yolo/
-    └── yolo26n.pt          # 检测模型
+    └── snacks.pt           # 自定义检测模型 (snacks 数据集)
+    └── yolo26n.pt          # 通用检测模型 (COCO 80 类)
     └── yolo26n-pose.pt     # 姿态模型 (可选)
 ```
+
+### snacks.pt —— snacks 数据集自定义模型
+
+`services/vision_service/class_names.py` 里补了中文别名。
+
+| 类 id | 类名 | 中文别名 |
+|---|---|---|
+| 0 | `bottle` | 矿泉水 / 矿泉水瓶 / 水瓶 |
+| 1 | `sugar` | 棒棒糖 / 糖果 / 糖 / 棒糖 |
+
+**它是从哪来的** —— 用 `configs/vision.yaml` 的 `training` 段训练：
+
+```bash
+cd services/vision_service && python tools/train_model.py
+```
+
+训练产物在 `training.project/training.name` 指定的目录下，
+`weights/best.pt` 就是这个文件（拷到 `models/yolo/snacks.pt`）。
+
+**换回通用模型** —— 把 `detector.weights` 改回 `@models/yolo/yolo26n.pt` 即可，
+两个文件可以共存。
 
 ## 怎么配
 
@@ -25,8 +47,8 @@ models/
 
 ```yaml
 detector:
-  weights: '@models/yolo/yolo26n.pt'    # @ = 相对仓库根
-  pose_weights: ''                       # 留空 = 不用姿态
+  weights: '@models/yolo/snacks.pt'   # @ = 相对仓库根
+  pose_weights: ''                    # 留空 = 不用姿态
 ```
 
 大文件不想进仓库就指到外面：

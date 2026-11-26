@@ -21,7 +21,9 @@ vision:
       width: 1280
       height: 800
   detector:
-    weights: '@models/yolo/yolo26n.pt'
+    # 自定义检测模型 (snacks 数据集训练, 100 epoch, mAP50=0.91)
+    # 类名: 0=bottle 1=sugar
+    weights: '@models/yolo/snacks.pt'
     pose_weights: ''
     conf: 0.15
     find_conf: 0.15
@@ -41,15 +43,15 @@ vision:
     frames: 5
     output_dir: logs
   training:
-    data: '@datasets/myobjects/data.yaml'
+    data: '/home/whale/workspace/project/datasets/snacks/data.yaml'
     base_weights: '@models/yolo/yolo26n.pt'
     epochs: 100
     imgsz: 640
     batch: 16
     patience: 30
     device: '0'
-    project: '@datasets/runs'
-    name: myobjects
+    project: '/home/whale/workspace/project/datasets/snacks/runs'
+    name: snacks
     hsv_h: 0.01
     hsv_s: 0.4
     hsv_v: 0.4

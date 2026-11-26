@@ -468,24 +468,43 @@ async def hand_connect() -> Dict[str, Any]:
 
 @app.post("/v1/hand/open")
 async def hand_open(req: HandRequest) -> Dict[str, Any]:
-    """张开手 (``configs/arm.yaml`` 的 ``arm.hand.open_pose``)。"""
+    """张开手。
+
+    默认用 ``configs/arm.yaml`` 的 ``arm.hand.open_pose``; 给了
+    ``positions`` 就用给的那组 (6 个 0~1000)。
+
+    ```bash
+    curl -X POST localhost:8802/v1/hand/open -d '{"positions": [0,0,300,300,300,300]}'
+    ```
+    """
     svc = _svc()
     try:
-        ok = await await_run(svc.send_hand_open, req.side)
+        ok = await await_run(svc.send_hand_open, req.side, req.positions)
     except Exception as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"ok": bool(ok), "action": "open", "side": req.side}
+    return {"ok": bool(ok), "action": "open", "side": req.side,
+            "positions": req.positions}
 
 
 @app.post("/v1/hand/close")
 async def hand_close(req: HandRequest) -> Dict[str, Any]:
-    """握紧手 (``configs/arm.yaml`` 的 ``arm.hand.close_pose``)。"""
+    """握紧手。
+
+    默认用 ``configs/arm.yaml`` 的 ``arm.hand.close_pose``; 给了
+    ``positions`` 就用给的那组 (6 个 0~1000)。
+
+    ```bash
+    curl -X POST localhost:8802/v1/hand/close \\
+        -d '{"positions": [800,0,700,700,700,700]}'
+    ```
+    """
     svc = _svc()
     try:
-        ok = await await_run(svc.send_hand_close, req.side)
+        ok = await await_run(svc.send_hand_close, req.side, req.positions)
     except Exception as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"ok": bool(ok), "action": "close", "side": req.side}
+    return {"ok": bool(ok), "action": "close", "side": req.side,
+            "positions": req.positions}
 
 
 @app.post("/v1/hand/preset")
