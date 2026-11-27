@@ -99,6 +99,8 @@ class VoiceASR(wakeup_asr.WakeupASR):
         self.echo_quiet_timeout = float(
             getattr(args, "echo_quiet_timeout", 2.0) or 0.0
         )
+        #: 结束词命中时的收尾播报文案。留空 = 不播报, 只结束会话。
+        self.end_prompt = str(getattr(args, "end_prompt", "") or "")
         super().__init__(args)
 
     # 不落盘: 禁止保存识别音频
@@ -220,6 +222,10 @@ class VoiceASR(wakeup_asr.WakeupASR):
             print(f"\n[连续对话] 窗口内 (剩 {remaining:.0f}s), 请继续说话...")
             self._start_continuous_recording(ts)
             return
+
+        # **新的唤醒** = 新的会话 —— 清掉「已被结束词关闭」的标记,
+        # 否则这一轮结束后不会重新开启连续对话窗口。
+        self.pipeline.resume_session()
         super().start_recording(ts, wake)
 
     def _start_continuous_recording(self, ts) -> None:
@@ -415,13 +421,55 @@ class VoiceASR(wakeup_asr.WakeupASR):
             self.stop_recording("回放结束")
 
     def on_recording_complete(self, text, wav_path=None, words=None):
-        """识别结束后交给编排器: Agent 分流 -> (必要时) TTS 播放。"""
+        """识别结束后交给编排器: Agent 分流 -> (必要时) TTS 播放。
+
+        **结束词**在这里生效: 命中结束词说明用户要结束对话了 ——
+        连续对话窗口必须关掉 (否则窗口内还能继续说话, 就不是「结束」),
+        而且结束词本身不是问题, 不该发给 Agent。
+
+        命中结束词时, 收尾话 («好的，我走了») 作为 ``after_prompt``
+        传给编排器 —— **正文先播, 播完再说这句告别**。
+        用户问「查下天气再见」时, 顺序必须是 天气 -> 告别, 反了就显得敷衍。
+        """
         # 录音阶段耗时: 从开始录音到识别结束 (不含用户说话本身的时间)
         record_ms = 0
         if getattr(self, "rec_start_ts", None):
             record_ms = int((time.time() - self.rec_start_ts) * 1000)
+
+        end_word = getattr(self, "ended_by_word", None)
+        after_prompt = ""
+        if end_word:
+            # 结束会话: 关闭连续对话窗口, 回到「必须重新唤醒」
+            self.close_session()
+            self.pipeline.end_session(f"结束词 [{end_word}]")
+            logger.info(
+                "[结束词] 命中 [%s], 会话已结束, 需要重新唤醒",
+                end_word,
+            )
+            # 结束词已经不在 text 里了 (stop_recording 摘掉了)。
+            # 如果还剩下正文 (「查一下天气, 再见」), 那部分照常处理;
+            # 如果只剩空白, 就别打扰 Agent 了。
+            if not (text or "").strip():
+                self._speak_end_prompt()
+                return
+            # 还有正文 -> 正文播完之后再播收尾话
+            after_prompt = (self.end_prompt or "").strip()
+
         logger.info("[计时] ASR 录音+识别阶段 %dms, 识别文本长度 %d", record_ms, len(text or ""))
-        self.pipeline.on_recording_complete(text, record_ms=record_ms, words=words)
+        self.pipeline.on_recording_complete(
+            text, record_ms=record_ms, words=words, after_prompt=after_prompt
+        )
+
+    def _speak_end_prompt(self) -> None:
+        """结束会话时播一句收尾话 (如「好的，我走了」)。
+
+        只在**没有正文**时用 —— 有正文的话收尾话由编排器在正文之后播
+        (走 ``after_prompt``), 这样顺序才是对的。
+        """
+        prompt = (self.end_prompt or "").strip()
+        if not prompt:
+            return
+        self.pipeline.speak_direct(prompt)
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -517,6 +565,23 @@ def parse_args(argv=None):
                         "(默认取 configs/pipeline.yaml)")
     p.add_argument("--highpass-order", type=int, default=None,
                    help="高通滤波阶数 (默认取 configs/pipeline.yaml)")
+    p.add_argument("--end", default=None,
+                   help="结束词, 多个用逗号分隔, 例如: --end '再见,拜拜'。"
+                        "说完结束词后立即结束对话, 需要重新唤醒 "
+                        "(默认取 configs/pipeline.yaml)")
+    p.add_argument("--end-aliases", default=None,
+                   help="结束词别名, 多个用逗号分隔, 例如: --end-aliases '白白,百拜'。"
+                        "命中任意一个都算结束 "
+                        "(默认取 configs/pipeline.yaml)")
+    p.add_argument("--no-end-fuzzy", action="store_true",
+                   help="关闭结束词的拼音模糊兜底匹配 "
+                        "(默认开启, 见 configs/pipeline.yaml)")
+    p.add_argument("--end-match-threshold", type=float, default=None,
+                   help="结束词拼音模糊匹配的相似度阈值 (0~1) "
+                        "(默认取 configs/pipeline.yaml)")
+    p.add_argument("--end-prompt", default=None,
+                   help="命中结束词时的收尾播报文案, 留空 = 不播报 "
+                        "(默认取 configs/pipeline.yaml)")
     p.add_argument("--host", default=None, help="健康检查监听地址")
     p.add_argument("--port", type=int, default=None, help="健康检查监听端口")
     return p.parse_args(argv)
@@ -531,8 +596,43 @@ def build_wakeup_args(args, cfg):
         words = cfg.asr.wake_word_list
         wake = ",".join(words) if words else "你好助手"
 
+    # 结束词: 命令行 > 配置(字符串或列表) > 空 (不启用)
+    if args.end is not None:
+        end = args.end
+    else:
+        end = ",".join(cfg.asr.end_word_list)
+
+    # 结束词命中时的收尾播报文案
+    if args.end_prompt is not None:
+        end_prompt = args.end_prompt
+    else:
+        end_prompt = cfg.asr.end_prompt or ""
+
+    # 结束词别名 (命中任意一个都算结束)
+    if args.end_aliases is not None:
+        end_aliases = args.end_aliases
+    else:
+        end_aliases = ",".join(cfg.asr.end_alias_list)
+
+    # 拼音模糊兜底 —— --no-end-fuzzy 显式关闭
+    if args.no_end_fuzzy:
+        end_match_fuzzy = False
+    else:
+        end_match_fuzzy = bool(cfg.asr.end_match_fuzzy)
+
+    # 拼音模糊匹配的阈值
+    if args.end_match_threshold is not None:
+        end_match_threshold = args.end_match_threshold
+    else:
+        end_match_threshold = cfg.asr.end_match_threshold
+
     ns = argparse.Namespace(
         wake=wake,
+        end=end,
+        end_aliases=end_aliases,
+        end_match_fuzzy=end_match_fuzzy,
+        end_match_threshold=end_match_threshold,
+        end_prompt=end_prompt,
         model=args.model or cfg.asr.model_path or None,
         device=args.device or (cfg.asr.device or None),
         duration=args.duration if args.duration is not None else cfg.asr.max_duration,

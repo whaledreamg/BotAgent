@@ -102,7 +102,20 @@ router:
     # 这里只在 llm.roles.tool **没显式配置模型**时才作为兜底生效。
     model: ""
     # 超时直接回落默认分支 (语音场景对延迟敏感)
-    timeout: 5.0
+    #
+    # **原来 5s 太短了** —— tool calling 默认开着 thinking
+    # (budget_tokens 8000), 思考本身就要好几秒, 5s 根本不够,
+    # 表现为「工具调用总是超时, 回落默认分支」。
+    #
+    # 参考耗时:
+    #   thinking 关闭 -> 单次工具选择 ~1s
+    #   thinking 开启 -> 推理模型要生成几百个 reasoning token, ~3-8s
+    #   复合查询 (天气+时间) -> 编排器实测 ~6-7s (见 docs/agent-orchestration.md)
+    #
+    # 12s 的依据: 覆盖 thinking 的最坏情况, 又留得下 llm.timeout (20s)
+    # 的余量 —— 超时链路要一致, 这里的值必须**小于** HTTP 层的 20s,
+    # 否则先撞上的是 httpx 而不是这里, 超时日志会指错地方。
+    timeout: 12.0
     temperature: 0.0
     max_tokens: 256
     # auto | none | required
@@ -118,7 +131,17 @@ router:
     thinking:
       enabled: true
       budget_tokens: 8000
-      # 最少任务数才启用 thinking (简单查询不用，节省成本)
+      # **注意: min_complexity 在 tool calling 路径上不生效**。
+      #
+      # 那一层是「先问出有哪些任务, 再决定要不要思考」; 而 tool calling 是
+      # **一次调用同时决定工具和参数**, 拿不到任务数。真正按任务数判断的
+      # 是 task_parser.should_use_thinking(), 只在编排路径上用。
+      #
+      # 所以 enabled: true 意味着**每一次** tool calling 都带 thinking,
+      # 包括「打开空调」这种最简单的指令 —— 这是 tool calling 延迟的主要
+      # 来源, 也是超时必须给到 12s 的原因 (见上)。
+      #
+      # 关掉它 (enabled: false) 延迟立刻回到 ~1s, 代价是复合意图理解变差。
       min_complexity: 2
     
     # tool calling 专用的系统提示词。

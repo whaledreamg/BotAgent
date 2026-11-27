@@ -16,10 +16,13 @@ import collections
 import json
 import os
 import queue
+import re
 import sys
 import time
 import wave
+from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import sounddevice as sd
@@ -96,6 +99,94 @@ def rms_db(data):
 def norm(text):
     """去掉所有空白, 便于匹配中文短语。"""
     return "".join(text.split())
+
+
+def _split_syllable(syllable: str) -> tuple:
+    """把一个拼音音节拆成 (声母, 韵母)。
+
+    例: ``"zai"`` -> ``("z", "ai")``, ``"jian"`` -> ``("j", "ian")``。
+
+    拆不出来 (比如整音节 ``"a"``) 时声母为空串, 韵母就是整个音节。
+    """
+    s = (syllable or "").strip().lower()
+    if not s:
+        return ("", "")
+    # 声母表 —— 按长度降序匹配 (``zh``/``ch``/``sh`` 要先于 ``z``/``c``/``s``)
+    for initial in ("zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n",
+                    "l", "g", "k", "h", "j", "q", "x", "r", "z", "c", "s",
+                    "y", "w"):
+        if s.startswith(initial) and len(s) > len(initial):
+            return (initial, s[len(initial):])
+    return ("", s)
+
+
+def _syllable_similarity(a: str, b: str) -> float:
+    """两个拼音音节的相似度 (0~1)。
+
+    分三档:
+
+    - **完全相同** -> 1.0
+    - **声母相同 + 韵母完全相同** -> 0.95
+      (读音确实一样, 只是写法不同 —— 如「白」bai / 「拜」bai)
+    - **声母相同 + 韵母相近** -> 0.9
+      (韵母长且只差一处 —— 如「ian」/「iao」)
+    - 其余 -> 0.0 (差太多, 不算命中)
+
+    **短韵母必须完全一致** —— 这是防误伤的关键。「几」(ji) 与
+    「见」(jian) 声母相同, 但读音差得远, 不该算相近。所以
+    韵母长度 <= 2 时不做任何模糊比较。
+
+    用「韵母是对方的子串」来判断相近是不行的: 「i」是「ian」的子串,
+    按那条规则「几」会被判成和「见」一样 —— 而这正是「现在几点」
+    被误判成「再见」的根源。
+    """
+    if a == b:
+        return 1.0
+    ini_a, fin_a = _split_syllable(a)
+    ini_b, fin_b = _split_syllable(b)
+    if not ini_a or not ini_b or ini_a != ini_b:
+        return 0.0
+    if fin_a == fin_b:
+        return 0.95
+    # 短韵母必须完全一致 —— 不做模糊比较
+    if len(fin_a) <= 2 or len(fin_b) <= 2:
+        return 0.0
+    # 长韵母允许一处差异 (「ian」/「iao」这类)
+    ratio = SequenceMatcher(None, fin_a, fin_b).ratio()
+    return 0.9 if ratio >= 0.7 else 0.0
+
+
+def _pinyin_syllable_similarity(win_sylls, target_sylls) -> float:
+    """两个**音节序列**的相似度 (0~1) —— 逐音节比对后取平均。
+
+    **每个音节都必须相近** (分数 >= 0.9) 才算命中 —— 这是防误伤的
+    第二道闸。逐字符比对会让「在几」和「再见」拿到 0.86 (前缀字符
+    碰巧相同), 而逐音节比对里「几」和「见」的韵母差得太远, 分数
+    会被拉下来。
+
+    要求「每个音节都相近」而不是「平均分够高」, 是为了防住另一种
+    情况: 三音节的结束词里两个音节完全对上、第三个差很远, 平均分
+    仍然可能超过阈值。
+
+    Args:
+        win_sylls: 识别文本窗口的音节列表。
+        target_sylls: 结束词的音节列表。
+
+    Returns:
+        0~1 的相似度; 有任何音节不相近时返回 0.0。
+    """
+    if not win_sylls or not target_sylls:
+        return 0.0
+    if len(win_sylls) != len(target_sylls):
+        return 0.0
+    scores = [
+        _syllable_similarity(w, t)
+        for w, t in zip(win_sylls, target_sylls)
+    ]
+    # 任一音节不相近 -> 整体不成立
+    if any(s < 0.9 for s in scores):
+        return 0.0
+    return sum(scores) / len(scores)
 
 
 # --------------------------------------------------------------- 唤醒词分词
@@ -212,6 +303,56 @@ class WakeupASR:
         if not self.tokens:
             raise SystemExit("没有可用的唤醒词")
 
+        # 结束词 -> 触发词集合
+        #
+        # **不再依赖 vosk 词表切分** —— 这是「结束词识别不上」的根因:
+        # 切分失败的那个结束词会被直接忽略, 于是它永远匹配不上。
+        # 而且即使切分成功, 要求「整句的结尾正好等于切分结果」也太严:
+        # 「再见」被听成「在见」就废了。
+        #
+        # 现在改成**纯文本子串匹配**: 句子里**含有**结束词就结束。
+        # 结束词分三类, 任意一类命中都算:
+        #
+        #   1. end_words      —— 主结束词 (如「再见」)
+        #   2. end_aliases    —— 同义/近形的告别词 (如「拜拜」「回头见」)
+        #   3. 拼音模糊兜底   —— 读音相近就算 (如「白白」「百拜」)
+        self.end_words = [
+            w.strip() for w in str(getattr(args, "end", "") or "").split(",") if w.strip()
+        ]
+        self.end_aliases = [
+            w.strip()
+            for w in str(getattr(args, "end_aliases", "") or "").split(",")
+            if w.strip()
+        ]
+        #: 结束词的**完整触发词集合** —— 主结束词 + 别名
+        self.end_triggers: list = list(self.end_words) + list(self.end_aliases)
+        #: 结束词是否启用 (有触发词就行)
+        self.end_enabled = bool(self.end_triggers)
+        #: 拼音模糊兜底是否启用
+        self.end_match_fuzzy = bool(getattr(args, "end_match_fuzzy", True))
+        #: 拼音模糊兜底的相似度阈值
+        self.end_match_threshold = float(
+            getattr(args, "end_match_threshold", 0.6) or 0.0
+        )
+
+        if self.end_enabled:
+            print(f"[结束词] {self.end_triggers}")
+            if self.end_match_fuzzy:
+                print(f"[结束词] 拼音兜底已启用 (阈值 {self.end_match_threshold:.2f})")
+        else:
+            print("[结束词] 没有可用的结束词, 功能未启用")
+
+        # 兼容旧字段: 结束词的词表切分 (只用于日志, 匹配不再依赖它)
+        self.end_tokens: dict = {}
+        for w in self.end_triggers:
+            toks = segment_wake_word(self.model, w)
+            if toks:
+                self.end_tokens[w] = toks
+        if self.end_words and self.end_tokens:
+            failed_end = [w for w in self.end_triggers if w not in self.end_tokens]
+            if failed_end:
+                print(f"[结束词] 这些词不在模型词表里 (仍可用, 走文本匹配): {failed_end}")
+
         # 语法受限识别器: 所有切分后的词作为一个词袋, 灵敏度最高
         grammar_tokens = []
         for toks in self.tokens.values():
@@ -260,6 +401,11 @@ class WakeupASR:
         self.gen_text = ""
         #: 词级识别结果 (词 + 置信度), 供热词纠错打分用
         self.final_words = []
+        #: 本轮是否因为命中**结束词**而结束。None = 不是被结束词结束的。
+        #:
+        #: 子类 (server.VoiceASR) 靠它知道「要关闭连续对话窗口,
+        #: 需要重新唤醒」。
+        self.ended_by_word: Optional[str] = None
 
         #: **回声屏蔽** 相关的状态 (子类用)。
         #:
@@ -468,6 +614,164 @@ class WakeupASR:
                     pass
             self.final_words.append(entry)
 
+    # ------------------------------------------------------------ 结束词
+
+    def _match_end(self, text: Optional[str] = None) -> Optional[str]:
+        """在已识别的文本里找结束词。
+
+        结束词要匹配**累积文本**而不是只匹配最后一块 —— 用户说
+        「今天天气怎么样, 再见」时, 「再见」和前半句通常在不同的
+        识别片段里, 只看最后一块会漏掉。
+
+        匹配用的是**累积的识别结果** (已确认的 final 片段 + 当前的
+        partial 片段)。partial 也要看 —— vosk 往往在静音前不会把
+        最后一段定稿, 只等 final 的话要白等到静音超时才收尾, 显得
+        反应很慢。
+
+        ## 匹配规则: **含有即命中**
+
+        只要句子里**含有**结束词就结束 —— 不要求它在末尾。
+
+        为什么放宽: 结束词在识别文本里的位置很不稳定。vosk 可能把
+        「再见」切成两块 (「再」+「见」), 也可能后面还跟着语气词
+        (「再见吧」)。要求「结尾正好等于结束词」会把这些全都漏掉,
+        表现为「说了再见但机器人不反应」。
+
+        ## 三层匹配
+
+        1. **精确子串** —— 主结束词 + 别名, 归一化后直接找
+        2. **拼音模糊兜底** —— 读音相近就算 (如「白白」「百拜」)
+
+        Args:
+            text: 要检查的文本。None = 用累积的识别结果。
+
+        Returns:
+            命中的结束词; 没命中返回 None。
+        """
+        if not getattr(self, "end_enabled", False):
+            return None
+
+        if text is None:
+            # 已定稿的片段 + 当前未定稿的片段
+            text = norm("".join(self.final_texts)) + norm(self.partial_text or "")
+        else:
+            text = norm(text)
+        if not text:
+            return None
+
+        # ---- 1. 精确子串 ----
+        for w in self.end_triggers:
+            key = norm(w)
+            if key and key in text:
+                return w
+
+        # ---- 2. 拼音模糊兜底 ----
+        if self.end_match_fuzzy:
+            hit = self._match_end_by_pinyin(text)
+            if hit:
+                return hit
+
+        return None
+
+    def _match_end_by_pinyin(self, text: str) -> Optional[str]:
+        """用**拼音相似度**找结束词。
+
+        解决「结束词识别不上」: Vosk 常把「拜拜」听成「白白」「百拜」,
+        把「再见」听成「在见」。纯文本子串匹配对这种情况无能为力,
+        但读音是接近的 —— 按拼音比对就能兜住。
+
+        ## 比对的是**音节**, 不是拼音字符串
+
+        早期版本用 ``SequenceMatcher`` 直接比拼音**字符串**,
+        误伤极其严重:
+
+        | 识别文本 | 命中窗口 | 结束词 | 相似度 |
+        | --- | --- | --- | --- |
+        | 现在几点 | 在几 | 再见 | 0.86 |
+        | 查一下天气 | 下天 | 再见 | 0.62 |
+        | 音量调大一点 | 一点 | 再见 | 0.67 |
+
+        原因: ``SequenceMatcher`` 比的是**字符**, 而「在几」(zai ji) 与
+        「再见」(zai jian) 的字符前 5 个完全一样 —— 前缀碰巧相同就被
+        判成 0.86 的相似度。这**不是读音相近**, 只是巧合。
+
+        现在改成**逐音节**比对: 两个音节算「相近」的条件是
+
+        1. **完全相同** —— 直接算 1.0 分
+        2. **声母相同且韵母相近** —— 如「拜」(bai) vs「白」(bai)、
+           「再」(zai) vs「在」(zai) —— 算 0.9 分
+        3. **整体编辑距离相近** —— 兜住「jiàn」vs「jiǎn」这类声调差异
+           (pypinyin 默认不带声调, 所以这条覆盖了大部分情况)
+
+        只有**每个音节都相近**才算命中。
+
+        Args:
+            text: 已归一化的文本。
+
+        Returns:
+            命中的结束词; 没命中返回 None。
+        """
+        try:
+            from hotwords import to_pinyin
+        except Exception:  # pragma: no cover - 缺 pypinyin 就跳过
+            return None
+
+        threshold = float(self.end_match_threshold or 0.0)
+        if threshold <= 0:
+            return None
+
+        for w in self.end_triggers:
+            key = norm(w)
+            if not key:
+                continue
+            target_sylls = to_pinyin(key).split()
+            if not target_sylls:
+                continue
+
+            # 窗口长度 = 音节数 (中文 1 汉字 ≈ 1 音节)
+            n_syll = len(target_sylls)
+            for start in range(0, max(0, len(text) - n_syll + 1)):
+                window = text[start : start + n_syll]
+                if not window:
+                    break
+                win_sylls = to_pinyin(window).split()
+                if len(win_sylls) != n_syll:
+                    continue
+                ratio = _pinyin_syllable_similarity(win_sylls, target_sylls)
+                if ratio >= threshold:
+                    print(
+                        f"[结束词] 拼音兜底命中: {window!r} ~ {key!r} ({ratio:.2f})"
+                    )
+                    return w
+        return None
+
+    def _strip_end_word(self, text: str, end_word: str) -> str:
+        """把结束词从文本里去掉。
+
+        结束词不是用户的问题, 不该交给 Agent —— 去掉之后如果还剩下
+        正文 (「查一下天气, 再见」-> 「查一下天气」), 那部分照常处理。
+
+        结束词可能在句子的**任意位置** (包含即匹配), 所以这里不是只
+        剥结尾, 而是把**所有**出现的结束词都摘掉。
+        """
+        stripped = norm(text)
+        if not stripped:
+            return stripped
+
+        # 摘掉所有触发词 (长的优先 —— 「再见」要在「见」之前摘)
+        triggers = sorted(
+            (norm(w) for w in self.end_triggers if norm(w)),
+            key=len,
+            reverse=True,
+        )
+        for key in triggers:
+            if key and key in stripped:
+                stripped = stripped.replace(key, "")
+
+        # 摘掉后可能留下多余的标点/空格
+        stripped = re.sub(r"[\s,，。!！?？、]+", "", stripped)
+        return stripped
+
     def stop_recording(self, reason):
         if self.state != "RECORDING":
             return
@@ -484,6 +788,9 @@ class WakeupASR:
         except Exception:
             pass
         self.asr_rec = None
+        # partial 先留一份 —— 结束词的判定要用它 (见下)。
+        # 万一 vosk 把结束词留在 partial 里没定稿, 也不能漏判。
+        last_partial = self.partial_text
         self.partial_text = ""
         self._print_line("", newline=True)
 
@@ -493,6 +800,18 @@ class WakeupASR:
             if full.startswith(norm(w)):
                 full = full[len(norm(w)):]
                 break
+
+        # 结束词: 命中就把会话结束掉, 并把结束词从正文里摘掉
+        # (结束词不是用户的问题, 不该交给 Agent)
+        self.ended_by_word = None
+        end_word = self._match_end(full) or self._match_end(
+            norm("".join(self.final_texts)) + norm(last_partial)
+        )
+        if end_word:
+            self.ended_by_word = end_word
+            full = self._strip_end_word(full, end_word)
+            print(f"\n[结束词] 命中 [{end_word}] —— 会话结束, 需要重新唤醒")
+
         dur = max(0.0, time.time() - self.rec_start_ts)
         print(f"\n[结束] 原因: {reason}   时长: {dur:.1f}s")
         print(f"[完整文本] {full if full else '(未识别到内容)'}")
@@ -563,6 +882,15 @@ class WakeupASR:
             return False
 
         self.feed_asr(data, ts)
+
+        # 结束词: 命中就**立刻**结束录音, 不等静音超时。
+        #
+        # 「再见」说出口之后还继续录着, 用户会以为机器人没听见, 或者
+        # 把后面的环境噪声也录进去 —— 所以必须第一时间收尾。
+        if getattr(self, "end_tokens", None) and self._match_end():
+            self.stop_recording("命中结束词")
+            return False
+
         db = rms_db(data)
         thresh = max(self.noise_floor + 10.0, self.args.vad_threshold)
         if db > thresh:
@@ -649,6 +977,9 @@ def parse_args(argv=None):
     )
     p.add_argument("--wake", default="你好助手",
                    help="唤醒词, 多个用逗号分隔, 例如: --wake '你好助手,小助手'")
+    p.add_argument("--end", default="",
+                   help="结束词, 多个用逗号分隔, 例如: --end '再见,拜拜'。"
+                        "说完结束词后立即结束对话, 需要重新唤醒。留空 = 不启用")
     p.add_argument("--model", default=None,
                    help="模型目录, 默认自动查找 ~/.cache/vosk 下的中文模型")
     p.add_argument("--device", default=None,

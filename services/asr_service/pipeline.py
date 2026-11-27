@@ -89,6 +89,14 @@ class Pipeline:
         self.errors: List[str] = []
         self.turn_count = 0
         self._lock = threading.Lock()
+        #: **会话已被结束词关闭**的标记。
+        #:
+        #: 用户说了「再见」之后, 这一轮结束后**不能**再开启连续对话窗口
+        #: —— 否则「再见」就白说了, 窗口内还能直接说话。
+        #:
+        #: ASR 侧命中结束词时调 :meth:`end_session` 置位; 下次用唤醒词
+        #: 开启新会话时, ASR 侧调 :meth:`resume_session` 清掉。
+        self.session_ended = False
         #: 一轮完全结束 (Agent + TTS 播完) 时的回调。
         #: ASR 侧用它来开启连续对话窗口。
         self.on_turn_complete: Optional[Callable[[], None]] = None
@@ -162,11 +170,44 @@ class Pipeline:
             }
             self.rec_state = RecState.WAITING
 
+    def end_session(self, reason: str = "") -> None:
+        """**结束会话** —— 用户说了结束词, 这一轮之后必须重新唤醒。
+
+        置位 ``session_ended`` 之后, ``on_turn_complete`` 回调会被
+        跳过 —— 那个回调是用来开启连续对话窗口的, 结束词之后不能开。
+
+        Args:
+            reason: 结束原因 (写进日志, 便于排查)。
+        """
+        with self._lock:
+            already = self.session_ended
+            self.session_ended = True
+        if not already:
+            logger.info("[会话] 已结束 (%s), 需要重新唤醒", reason or "结束词")
+
+    def resume_session(self) -> None:
+        """**恢复会话** —— 用户重新说了唤醒词, 连续对话窗口可以再开了。
+
+        上一轮是被结束词关掉的, 这一轮是新的唤醒, 所以把
+        ``session_ended`` 清掉。
+        """
+        with self._lock:
+            if not self.session_ended:
+                return
+            self.session_ended = False
+        logger.info("[会话] 已重新唤醒, 恢复连续对话")
+
     def _notify_turn_complete(self) -> None:
         """通知外部「这一轮彻底结束了」。
 
         放在锁外调用, 避免回调里再取锁造成死锁。
+
+        **会话已被结束词关闭时跳过** —— 这个回调用来开启连续对话窗口,
+        结束词之后不能再开, 否则「再见」就白说了。
         """
+        with self._lock:
+            if self.session_ended:
+                return
         cb = self.on_turn_complete
         if cb is None:
             return
@@ -222,6 +263,16 @@ class Pipeline:
             #: 识别完成的那一瞬间就写进来了 —— 不等 Agent/TTS。
             "rec_result": rec_result,
             "wake_words": self.cfg.asr.wake_words,
+            #: 结束词 (会话结束语)。为空 = 未启用结束词。
+            "end_words": self.cfg.asr.end_word_list,
+            #: 结束词的别名。命中任意一个都算结束。
+            "end_aliases": self.cfg.asr.end_alias_list,
+            #: 是否启用结束词的拼音模糊兜底匹配。
+            "end_match_fuzzy": self.cfg.asr.end_match_fuzzy,
+            #: 拼音模糊匹配的相似度阈值 (0~1)。
+            "end_match_threshold": self.cfg.asr.end_match_threshold,
+            #: 命中结束词时的收尾播报文案。留空 = 不播报。
+            "end_prompt": self.cfg.asr.end_prompt or "",
             "asr_model": self.cfg.asr.model_path or "(自动查找)",
             "agent_url": self.cfg.agent.dispatch_url,
             "tts_url": self.cfg.tts.ws_url,
@@ -246,7 +297,13 @@ class Pipeline:
 
     # ------------------------------------------------------------ 主流程
 
-    def submit(self, text: str, record_ms: int = 0, words: Optional[List[Dict[str, Any]]] = None) -> None:
+    def submit(
+        self,
+        text: str,
+        record_ms: int = 0,
+        words: Optional[List[Dict[str, Any]]] = None,
+        after_prompt: str = "",
+    ) -> None:
         """提交一轮识别结果, 在后台线程里跑完整条链路。
 
         立刻置 THINK 状态, 主循环随即停止识别 (避免把自己说的话再识别一遍),
@@ -257,6 +314,12 @@ class Pipeline:
             record_ms: 录音+识别阶段耗时 (毫秒)。
             words: 词级识别结果 (``[{"word":..., "conf":...}]``),
                 用于热词纠错的置信度打分。
+            after_prompt: **正文播完之后**再播的一段话 (如「好的，我走了」)。
+
+                用于结束词场景: 用户说「查下天气再见」, 先播天气,
+                再播这句告别 —— 顺序不能反, 反了就显得机器人在敷衍。
+
+                留空 = 不播。
         """
         text = (text or "").strip()
         if not text:
@@ -283,7 +346,7 @@ class Pipeline:
         self.mark_rec_result(text)
         worker = threading.Thread(
             target=self._run_turn,
-            args=(text, record_ms),
+            args=(text, record_ms, after_prompt),
             name="pipeline-turn",
             daemon=True,
         )
@@ -346,8 +409,52 @@ class Pipeline:
         self._set_state(State.IDLE)
         # 没听清也算一轮结束, 连续对话窗口继续开着 (用户可以马上再说一次)
         self._notify_turn_complete()
-    def _run_turn(self, text: str, record_ms: int = 0) -> None:
-        """后台线程: Agent 分流 -> (必要时) TTS 播放。"""
+
+    def speak_direct(self, text: str) -> None:
+        """直接播一段文字 (不经过 Agent 分流)。
+
+        用于**结束词**的收尾话 —— 用户说「再见」之后回一句「再见」,
+        这不是一次问答, 不该走 Agent (那会多一次 LLM 往返的延迟)。
+
+        播完**不会**开启连续对话窗口 —— 结束词意味着会话已经结束,
+        需要重新唤醒。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+
+        self._set_state(State.SAY)
+        # **播报前**架回声守卫 —— 挡住收尾话被自己听到
+        self._notify_before_speak()
+        try:
+            result = self.tts.speak(text)
+            logger.info(
+                "[播报] 已播报 %r (%dms, %d 帧)",
+                text,
+                result.duration_ms,
+                result.frames,
+            )
+        except TTSError as exc:
+            self._record_error(f"TTS 播报失败: {exc}")
+        except Exception as exc:  # pragma: no cover - 兜底
+            self._record_error(f"TTS 播报异常: {exc}")
+        finally:
+            # 播完了 (不管成功还是失败) —— 把回声守卫延伸到沉降期
+            self._notify_after_speak()
+
+        self._set_state(State.IDLE)
+        # 故意**不**调 _notify_turn_complete(): 结束词之后不该重开
+        # 连续对话窗口, 否则「再见」就白说了。
+
+    def _run_turn(self, text: str, record_ms: int = 0, after_prompt: str = "") -> None:
+        """后台线程: Agent 分流 -> (必要时) TTS 播放。
+
+        Args:
+            text: 识别出的文本。
+            record_ms: 录音+识别阶段耗时 (毫秒)。
+            after_prompt: 正文播完之后**再播**的一段话 (如「好的，我走了」)。
+                留空 = 不播。
+        """
         logger.info("[识别] %s", text)
 
         turn_start = time.time()
@@ -361,6 +468,8 @@ class Pipeline:
             self._set_state(State.IDLE)
             # Agent 挂了也结束这一轮, 让用户可以重新说
             self._notify_turn_complete()
+            # 收尾话还是要说的 —— 用户说了「再见」, 机器人一声不吭很突兀
+            self._speak_after_prompt(after_prompt)
             return
         agent_ms = int((time.time() - t_agent) * 1000)
 
@@ -392,12 +501,15 @@ class Pipeline:
             self._set_state(State.IDLE)
             # 工具分支不朗读, 这一轮立即结束
             self._notify_turn_complete()
+            # 收尾话还是要说的 —— 用户说了「再见」, 机器人一声不吭很突兀
+            self._speak_after_prompt(after_prompt)
             return
 
         if not reply.reply.strip():
             logger.info("[分流] intent=%s 但回复为空, 跳过朗读", reply.intent)
             self._set_state(State.IDLE)
             self._notify_turn_complete()
+            self._speak_after_prompt(after_prompt)
             return
 
         # 3) 需要朗读: 进 TTS 合成并直接播放 (不落盘)
@@ -458,14 +570,47 @@ class Pipeline:
         # 让机器人自己说话的时间不占用用户的 30 秒。
         self._notify_turn_complete()
 
+        # ---- 收尾话: 正文播完之后才说 ----
+        #
+        # 「查下天气再见」-> 先播天气, 再播「好的，我走了」。
+        # 顺序不能反 —— 反了就显得机器人在敷衍。
+        self._speak_after_prompt(after_prompt)
+
+    def _speak_after_prompt(self, prompt: str) -> None:
+        """正文播完之后再播一段收尾话 (如「好的，我走了」)。
+
+        走 :meth:`speak_direct` 而不是普通分支 —— 它**不会**重开连续
+        对话窗口。结束词意味着会话已经结束, 说完了告别就该回到「等待
+        唤醒词」, 不能再听下一句。
+
+        播失败也不该把整轮拖垮 —— 收尾话是锦上添花, 正文才是正事。
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        try:
+            self.speak_direct(prompt)
+        except Exception as exc:  # pragma: no cover - 兜底
+            self._record_error(f"收尾话播报异常: {exc}")
+
     def on_recording_complete(
         self,
         text: str,
         record_ms: int = 0,
         words: Optional[List[Dict[str, Any]]] = None,
+        after_prompt: str = "",
     ) -> None:
-        """识别完成后的编排入口。由 WakeupASR 子类调用。"""
-        self.submit(text, record_ms=record_ms, words=words)
+        """识别完成后的编排入口。由 WakeupASR 子类调用。
+
+        Args:
+            text: 识别出的文本。
+            record_ms: 录音+识别阶段耗时 (毫秒)。
+            words: 词级识别结果, 供热词纠错打分。
+            after_prompt: 正文播完之后**再播**的一段话 (如「好的，我走了」)。
+        """
+        self.submit(
+            text, record_ms=record_ms, words=words, after_prompt=after_prompt
+        )
 
     def wait_idle(self, timeout: float = 300.0, turn: int = 0) -> bool:
         """等待指定的那一轮 (Agent + TTS) 跑完。

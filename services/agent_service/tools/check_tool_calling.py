@@ -728,6 +728,51 @@ def test_live(cfg: Any) -> None:
         )
 
 
+# ------------------------------------------------------- 超时一致性
+
+def test_timeout(cfg: Any) -> None:
+    """tool calling 的超时必须够用, 且和 HTTP 层的超时保持一致。
+
+    **曾经的坑**: ``router.tool_calling.timeout`` 是 5 秒, 而 tool calling
+    默认开着 thinking (budget_tokens 8000) —— 思考本身就要好几秒, 5 秒
+    根本不够, 表现为「工具调用总是超时, 回落默认分支」。
+
+    这里把两条约束固化成断言:
+    1. 超时**不小于** thinking 开启时的实测耗时 (~8s)
+    2. 超时**小于** ``llm.timeout`` —— 否则先撞上的是 httpx 而不是
+       ``asyncio.wait_for``, 超时日志会指错地方
+    """
+    print("\n[6] tool calling 超时")
+
+    router = _make_router(cfg, FakeLLM())
+    timeout = router._tool_calling_timeout()
+
+    check(
+        "超时够 thinking 用 (>=8s)",
+        timeout >= 8.0,
+        f"timeout={timeout}, thinking 开启时实测 3-8s",
+    )
+    llm_timeout = float(getattr(cfg.llm, "timeout", 0) or 0)
+    check(
+        "超时小于 HTTP 层 (llm.timeout)",
+        0 < llm_timeout and timeout <= llm_timeout,
+        f"tool_calling={timeout} llm={llm_timeout}",
+    )
+
+    # 三个调用点必须用同一个值 —— 改配置只生效一半是很坑的
+    src = Path(__file__).resolve().parents[1] / "router.py"
+    text = src.read_text(encoding="utf-8")
+    check(
+        "没有硬编码的旧超时 5.0",
+        'getattr(tc, "timeout", 5.0)' not in text,
+    )
+    check(
+        "三个调用点都走统一方法",
+        text.count("timeout = self._tool_calling_timeout()") == 3,
+        f"找到 {text.count('timeout = self._tool_calling_timeout()')} 处",
+    )
+
+
 # ------------------------------------------------------------ main
 
 
@@ -745,6 +790,7 @@ def main() -> int:
     test_validation(cfg)
     test_routing(cfg)
     test_execution(cfg)
+    test_timeout(cfg)
     if args.live:
         test_live(cfg)
 

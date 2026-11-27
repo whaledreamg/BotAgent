@@ -259,7 +259,13 @@ class ToolCallingConfig:
     #: 用哪个模型 (留空则用 llm.model)
     model: str = ""
     #: 超时秒数; 超时直接回落默认分支 (语音场景必须快)
-    timeout: float = 5.0
+    #:
+    #: **默认 12s 而不是 5s** —— tool calling 常开着 thinking
+    #: (budget_tokens 8000), 思考本身就要好几秒, 5s 根本不够,
+    #: 表现为「工具调用总是超时」。
+    #:
+    #: 依据: thinking 关闭 ~1s / 开启 ~3-8s / 复合查询 ~6-7s。
+    timeout: float = 12.0
     #: 工具选择是确定性的, 温度设 0
     temperature: float = 0.0
     #: 工具选择不需要长输出
@@ -778,7 +784,7 @@ def load_config(path: Path = AGENT_CONFIG_PATH) -> Config:
     tool_calling = ToolCallingConfig(
         enabled=bool(tc_raw.get("enabled", False)),
         model=str(tc_raw.get("model") or ""),
-        timeout=float(tc_raw.get("timeout", 5.0)),
+        timeout=float(tc_raw.get("timeout", 12.0)),
         temperature=float(tc_raw.get("temperature", 0.0)),
         max_tokens=int(tc_raw.get("max_tokens", 256)),
         tool_choice=str(tc_raw.get("tool_choice", "auto")),

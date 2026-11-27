@@ -643,6 +643,24 @@ class Router:
         intent, _ = self._default(trace)
         return Decision(intent=intent, by="default", trace=trace)
 
+    def _tool_calling_timeout(self) -> float:
+        """tool calling 的**统一**超时秒数。
+
+        三个调用点 (主路径 / 假确认重试 / 分支内决定) 必须用同一个值 ——
+        否则改了配置只生效一半, 排查时很费劲。
+
+        **上限是 llm.timeout** —— HTTP 层的 httpx 超时必须**大于**这里,
+        否则先撞上的是 httpx, 超时日志会指错地方 (变成 LLMError 而不是
+        asyncio.TimeoutError), 分不清是「模型慢」还是「网络断」。
+        """
+        tc = self._tool_calling_cfg()
+        timeout = float(getattr(tc, "timeout", 12.0) or 12.0)
+        # llm.timeout 是 HTTP 层的兜底 —— 这里不能比它还长
+        llm_timeout = float(getattr(self.cfg.llm, "timeout", 0) or 0)
+        if llm_timeout > 0:
+            timeout = min(timeout, llm_timeout)
+        return max(0.5, timeout)
+
     async def _decide_by_tools(
         self, req: AgentRequest, trace: List[Dict[str, Any]]
     ) -> Tuple[Optional[Decision], bool]:
@@ -661,7 +679,7 @@ class Router:
         if not tools:
             return None, False
 
-        timeout = max(0.5, float(getattr(tc, "timeout", 5.0)))
+        timeout = self._tool_calling_timeout()
         started = time.time()
         # 思考参数 (与 _decide_by_tools_branch 保持一致)
         thinking_param = None
@@ -879,7 +897,7 @@ class Router:
         只在检测到**假确认**时用 (模型用文字声称动作已完成)。
         纯闲聊不会被重试 —— 闲聊本来就不该调工具。
         """
-        timeout = max(0.5, float(getattr(tc, "timeout", 5.0)))
+        timeout = self._tool_calling_timeout()
         started = time.time()
         # 思考参数 (与主路径保持一致)
         thinking_param = None
@@ -1021,7 +1039,7 @@ class Router:
         else:
             messages.insert(0, {"role": "system", "content": system_prompt})
         
-        timeout = max(0.5, float(getattr(tc, "timeout", 5.0)))
+        timeout = self._tool_calling_timeout()
         started = time.time()
         
         # 准备 thinking 模式参数

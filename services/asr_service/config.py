@@ -26,6 +26,19 @@ DEFAULTS: Dict[str, Any] = {
     "asr": {
         "health_port": 8801,
         "wake_words": "你好助手",
+        # 结束词 (会话结束语)。用户说完结束词后, 这一轮对话立即结束,
+        # 连续对话窗口关闭, 需要重新说唤醒词才能继续。
+        # 留空 = 不启用结束词。
+        "end_words": "",
+        # 结束词的**别名** (同义/近形的告别词), 多个用逗号分隔。
+        # 命中任意一个都算结束 —— 用来兜住「拜拜」被听成「白白」这类情况。
+        "end_aliases": "",
+        # 是否启用**拼音模糊兜底**匹配结束词。true = 读音相近也算命中。
+        "end_match_fuzzy": True,
+        # 拼音模糊匹配的相似度阈值 (0~1)。越高越严格。
+        "end_match_threshold": 0.6,
+        # 识别到结束词时的播报文案。留空 = 不播报, 只结束会话。
+        "end_prompt": "好的，我走了",
         "model_path": "",
         "device": "",
         "max_duration": 30.0,
@@ -81,6 +94,29 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 
+def _as_bool(raw: Any, default: bool = False) -> bool:
+    """把配置值/env 变量解析成布尔。
+
+    YAML 里的 ``true``/``false`` 已经是布尔了, 但 **env 变量都是字符串**
+    —— ``ASR_END_MATCH_FUZZY=false`` 不能靠 ``bool(str)`` 判 (那是 True)。
+
+    认这些写法 (大小写不敏感): ``1/true/yes/on`` -> True,
+    ``0/false/no/off`` -> False。认不出来就用默认值。
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    text = str(raw).strip().lower()
+    if text in ("1", "true", "yes", "on", "y"):
+        return True
+    if text in ("0", "false", "no", "off", "n"):
+        return False
+    return default
+
+
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(base)
     for key, value in (override or {}).items():
@@ -95,6 +131,28 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 class ASRConfig:
     health_port: int = 8801
     wake_words: str = "你好助手"
+    #: 结束词 (会话结束语), 多个用逗号分隔。留空 = 不启用。
+    #:
+    #: 用户说完结束词后, 这一轮对话立即结束 —— 连续对话窗口关闭,
+    #: 需要重新说唤醒词才能继续对话。
+    end_words: str = ""
+    #: 结束词的**别名**, 多个用逗号分隔。
+    #:
+    #: 命中**任意一个**触发词 (主结束词 + 别名) 都算结束。存在的意义是
+    #: 兜住 ASR 的常见误识别 —— 「拜拜」听成「白白」「百拜」这类。
+    end_aliases: str = ""
+    #: 是否启用**拼音模糊兜底**匹配结束词。
+    #:
+    #: 纯文本子串匹配对「白白」「百拜」这种**同音/近音**误识别完全
+    #: 无能为力。打开后, 会把文本切成与结束词等音节数的窗口, 按拼音
+    #: 相似度比对, 超过 ``end_match_threshold`` 就算命中。
+    #:
+    #: 代价是可能误触发 —— 所以留成可关的开关。
+    end_match_fuzzy: bool = True
+    #: 拼音模糊匹配的相似度阈值 (0~1)。越高越严格。
+    end_match_threshold: float = 0.6
+    #: 识别到结束词时的播报文案。留空 = 不播报, 只结束会话。
+    end_prompt: str = "好的，我走了"
     model_path: str = ""
     device: str = ""
     max_duration: float = 30.0
@@ -142,6 +200,47 @@ class ASRConfig:
         else:
             items = [w.strip() for w in str(raw).split(",")]
         return [w for w in items if w]
+
+    @property
+    def end_word_list(self) -> list:
+        """把配置里的结束词解析成列表。
+
+        写法和唤醒词一样 (逗号分隔字符串或 YAML 列表)。
+        空的 = 不启用结束词。
+        """
+        raw = self.end_words
+        if isinstance(raw, (list, tuple)):
+            items = [str(w).strip() for w in raw]
+        else:
+            items = [w.strip() for w in str(raw).split(",")]
+        return [w for w in items if w]
+
+    @property
+    def end_alias_list(self) -> list:
+        """把配置里的结束词**别名**解析成列表。
+
+        写法和结束词一样 (逗号分隔字符串或 YAML 列表)。
+        """
+        raw = self.end_aliases
+        if isinstance(raw, (list, tuple)):
+            items = [str(w).strip() for w in raw]
+        else:
+            items = [w.strip() for w in str(raw).split(",")]
+        return [w for w in items if w]
+
+    @property
+    def end_trigger_list(self) -> list:
+        """结束词的**完整触发词集合** —— 主结束词 + 别名。
+
+        命中任意一个都算结束。顺序: 主结束词在前, 别名在后。
+        """
+        seen = set()
+        out = []
+        for w in self.end_word_list + self.end_alias_list:
+            if w and w not in seen:
+                seen.add(w)
+                out.append(w)
+        return out
 
 
 @dataclass
@@ -225,6 +324,23 @@ def load_config(path: Path = PIPELINE_CONFIG_PATH) -> Config:
     asr = ASRConfig(
         health_port=int(os.environ.get("ASR_HEALTH_PORT", a.get("health_port", 8801))),
         wake_words=os.environ.get("ASR_WAKE_WORDS", a.get("wake_words", "你好助手")),
+        end_words=os.environ.get("ASR_END_WORDS", a.get("end_words", "") or ""),
+        end_aliases=os.environ.get(
+            "ASR_END_ALIASES", a.get("end_aliases", "") or ""
+        ),
+        end_match_fuzzy=_as_bool(
+            os.environ.get("ASR_END_MATCH_FUZZY"),
+            a.get("end_match_fuzzy", True),
+        ),
+        end_match_threshold=float(
+            os.environ.get(
+                "ASR_END_MATCH_THRESHOLD",
+                a.get("end_match_threshold", 0.6),
+            )
+        ),
+        end_prompt=os.environ.get(
+            "ASR_END_PROMPT", a.get("end_prompt", "好的，我走了") or ""
+        ),
         model_path=os.environ.get("ASR_MODEL_PATH", a.get("model_path", "") or ""),
         device=os.environ.get("ASR_DEVICE", a.get("device", "") or ""),
         max_duration=float(a.get("max_duration", 30.0)),

@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import load_config
 from handlers.base import AgentRequest, BranchResult, Handler
+from llm import ChatResult
 from registry import Registry
 from router import Router
 
@@ -63,6 +64,25 @@ class FakeLLM:
     ):
         self.calls += 1
         return self.reply
+
+    async def chat_with_thinking(
+        self,
+        messages,
+        model=None,
+        temperature=None,
+        max_tokens=None,
+        tools=None,
+        tool_choice=None,
+        role=None,
+        thinking=None,
+    ):
+        """带思考的对话 —— 返回 ChatResult (正文 + 思考过程)。
+
+        这个方法是在 chat 之后加的, 之前没同步更新这个替身,
+        导致 selftest 直接 AttributeError 挂掉。
+        """
+        self.calls += 1
+        return ChatResult(content=self.reply)
 
 
 class CustomHandler(Handler):

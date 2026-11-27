@@ -45,11 +45,53 @@ router:
       min_complexity: 2   # 至少 2 个意图才启用
 ```
 
-`router.py` 会把该配置透传给 `llm.tool_call(..., thinking=...)`。简单查询不启用，以节省延迟和成本。
+`router.py` 会把该配置透传给 `llm.tool_call(..., thinking=...)`。
+
+> **`min_complexity` 目前在 tool calling 路径上没有生效** —— 那一层是
+> 「先问出有哪些任务，再决定要不要思考」，而 tool calling 是**一次调用
+> 同时决定工具和参数**，拿不到任务数。`task_parser.should_use_thinking()`
+> 只在编排路径上被调用。
+>
+> 实际效果：`thinking.enabled: true` 意味着**每一次** tool calling 都带
+> thinking，包括「打开空调」这种最简单的指令。这是 tool calling 延迟高的
+> 主要来源，也是 5 秒超时不够用的根因（见下）。
 
 ## 超时
 
-`handlers/tool_handler.py` 中 `timeout_per_task` 为 15 秒（原 5 秒）。
+### tool calling 超时（`router.tool_calling.timeout`）
+
+**默认 12 秒**（原 5 秒）。
+
+5 秒太短的根因不是网络慢，而是 **tool calling 默认开着 thinking**
+（`router.tool_calling.thinking.enabled: true`，`budget_tokens: 8000`）。
+推理模型要生成几百个 reasoning token，光思考就要好几秒，5 秒根本不够 ——
+表现就是「工具调用总是超时，回落默认分支」。
+
+| 场景 | 耗时 |
+| --- | --- |
+| thinking 关闭 | ~1s |
+| thinking 开启（单次工具选择） | ~3-8s |
+| 复合查询（天气 + 时间） | ~6-7s |
+
+12 秒的依据：覆盖 thinking 的最坏情况，又留得下 `llm.timeout`（20 秒）的余量。
+
+> **超时链路必须一致** —— `router.tool_calling.timeout` 要**小于**
+> `llm.timeout`（HTTP 层）。否则先撞上的是 httpx 而不是
+> `asyncio.wait_for`，超时日志会指错地方，分不清是「模型慢」还是「网络断」。
+>
+> `Router._tool_calling_timeout()` 统一处理了这个约束：取两者较小值。
+> 三个调用点（主路径 / 假确认重试 / 分支内决定）都用它，改配置不会只生效一半。
+
+如果仍然超时，按顺序试：
+
+1. 关掉 tool calling 的 thinking（`router.tool_calling.thinking.enabled: false`）——
+   延迟立刻回到 ~1 秒，代价是复合意图理解变差。
+2. 调大 `router.tool_calling.timeout`（同时确认 `llm.timeout` 更大）。
+3. 检查模型服务本身的响应时间（`tools/bench_llm.py`）。
+
+### 编排超时（`handlers/tool_handler.py`）
+
+`timeout_per_task` 为 15 秒（原 5 秒）。
 
 实测天气查询约 6 秒（地理编码 3 到 4 秒，天气接口 1 到 2 秒），时间查询小于 1 秒，所以复合查询总耗时约 6 到 7 秒。仍然超时时：
 
